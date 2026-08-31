@@ -1,4 +1,5 @@
 mod config;
+mod manifest;
 
 use clap::{Parser, Subcommand};
 use config::Config;
