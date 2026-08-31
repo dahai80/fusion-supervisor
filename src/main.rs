@@ -1,16 +1,11 @@
-mod alert;
-mod cli;
-mod config;
-mod manifest;
-mod probe;
-mod rpc;
-mod store;
-mod supervisor;
-
 use clap::{Parser, Subcommand};
-use config::Config;
-use rpc::client::RpcClient;
-use rpc::schema::RpcRequest;
+use fusion_supervisor::cli;
+use fusion_supervisor::config::Config;
+use fusion_supervisor::manifest;
+use fusion_supervisor::rpc;
+use fusion_supervisor::rpc::client::RpcClient;
+use fusion_supervisor::rpc::schema::RpcRequest;
+use fusion_supervisor::supervisor;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -30,6 +25,8 @@ enum Commands {
     Restart { service: String },
     Logs { service: String },
     Top,
+    /// Ping the daemon (alive check)
+    Ping,
 }
 
 #[tokio::main]
@@ -46,10 +43,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Up { .. }) => cli_call(cfg, "up").await,
         Some(Commands::Down { .. }) => cli_call(cfg, "down").await,
         Some(Commands::Restart { service }) => cli_call_param(cfg, "restart", service).await,
-        Some(Commands::Logs { service }) => {
-            cli::print_error(&format!("logs {service}: TODO Task 11 (per-svc log file)"));
-            Ok(())
-        }
+        Some(Commands::Logs { service }) => cli_logs(cfg, service).await,
+        Some(Commands::Ping) => cli_ping(cfg).await,
     }
 }
 
@@ -134,6 +129,39 @@ async fn connect_client(cfg: &Config) -> anyhow::Result<RpcClient> {
         Err(e) => {
             cli::print_error(&format!("{e}"));
             std::process::exit(3);
+        }
+    }
+}
+
+async fn cli_logs(_cfg: Config, service: String) -> anyhow::Result<()> {
+    let log_dir = std::env::var("HOME")
+        .map(|h| format!("{h}/.fusion-sv/logs"))
+        .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
+    let dir = manifest::name_to_dir(&service);
+    let path = std::path::Path::new(&log_dir).join(format!("{dir}.log"));
+    if !path.exists() {
+        cli::print_error(&format!("no log for {service}: {}", path.display()));
+        return Ok(());
+    }
+    tracing::info!(svc = %service, log = %path.display(), "tail logs");
+    let out = std::process::Command::new("tail")
+        .args(["-n", "50"])
+        .arg(&path)
+        .output()?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    Ok(())
+}
+
+async fn cli_ping(cfg: Config) -> anyhow::Result<()> {
+    let mut client = connect_client(&cfg).await?;
+    match client.ping().await {
+        Ok(ok) => {
+            cli::print_pong(ok);
+            Ok(())
+        }
+        Err(e) => {
+            cli::print_error(&format!("{e}"));
+            std::process::exit(1);
         }
     }
 }

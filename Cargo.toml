@@ -5,6 +5,10 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Local-first fusion service supervisor and monitor"
 
+[lib]
+name = "fusion_supervisor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fusion-sv"
 path = "src/main.rs"

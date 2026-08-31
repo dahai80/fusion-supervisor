@@ -4,7 +4,8 @@ pub mod runner;
 use crate::alert::Alerter;
 use crate::config::Config;
 use crate::manifest::{Layer, ServiceDef, ServiceManifest};
-use crate::probe::{ProbeResult, ProbeSpec};
+use crate::probe::{probe, ProbeResult, ProbeSpec};
+use crate::probe_map;
 use crate::store::HistoryStore;
 use anyhow::Result;
 use std::sync::Arc;
@@ -28,23 +29,27 @@ pub struct SupervisorCore {
 }
 
 impl SupervisorCore {
-    // 生产构造: 真 bash start.sh + 真 probe。probe_map 在 Task 11 填。
+    // 生产构造: 真 bash start.sh + 真 probe。probe_map 填 spec + restart_cmd。
     pub fn new(defs: Vec<ServiceDef>, cfg: Config) -> Result<Self> {
         let store = HistoryStore::open(&cfg.db_path)?;
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
         let runners: Vec<_> = defs
             .into_iter()
             .map(|d| {
+                let spec = probe_map::probe_spec_for(&d.name, d.port);
+                let cmd = probe_map::restart_cmd_for(&d.name).to_string();
+                let repo_dir = d.repo_dir.clone();
+                let policy = policy::RestartPolicy::new(
+                    cfg.restart_window_sec,
+                    cfg.restart_max,
+                    cfg.backoff_max_sec,
+                );
                 runner::ServiceRunner::new(
                     d,
-                    "restart",
-                    real_probe,
-                    real_start,
-                    policy::RestartPolicy::new(
-                        cfg.restart_window_sec,
-                        cfg.restart_max,
-                        cfg.backoff_max_sec,
-                    ),
+                    &cmd,
+                    move || real_probe_spec(&spec),
+                    move |c: &str| real_start_pair(&repo_dir, c),
+                    policy,
                 )
             })
             .collect();
@@ -59,14 +64,17 @@ impl SupervisorCore {
     }
 
     // 测试构造: 注入 fake probe + fake start。defs 不经 layer 排序 (测试自带顺序)。
-    #[cfg(test)]
     pub fn new_with_fns(
         defs: Vec<ServiceDef>,
         cfg: Config,
         probe_fn: impl Fn(&ProbeSpec) -> ProbeResult + Send + Sync + 'static,
         start_fn: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
-        let store = HistoryStore::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let db_path = std::env::temp_dir()
+            .join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
+        let store = HistoryStore::open(&db_path).unwrap();
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
         let start_fn = Arc::new(start_fn);
         let probe_fn = Arc::new(probe_fn);
@@ -177,19 +185,45 @@ impl SupervisorCore {
     }
 }
 
-// 生产 probe/start 实现 (Task 11 接 probe_map 后细化)
-fn real_probe() -> ProbeResult {
-    ProbeResult::Unhealthy { reason: crate::probe::UnhealthyReason::ConnectionRefused }
-}
-fn real_start(_cmd: &str) -> Result<()> {
+// 真 start.sh 调用: bash {repo}/start.sh {cmd}, stderr → 每服务日志
+fn real_start_pair(repo_dir: &str, cmd: &str) -> Result<()> {
+    let sh = probe_map::start_sh_path(repo_dir);
+    if !sh.exists() {
+        anyhow::bail!("start.sh 不存在: {}", sh.display());
+    }
+    let log_dir = std::env::var("HOME")
+        .map(|h| format!("{h}/.fusion-sv/logs"))
+        .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
+    std::fs::create_dir_all(&log_dir).ok();
+    let svc_log = format!("{log_dir}/{repo_dir}.log");
+    tracing::info!(sh = %sh.display(), cmd, log = %svc_log, "exec start.sh");
+    let stderr: std::process::Stdio = match std::fs::File::create(&svc_log) {
+        Ok(f) => f.into(),
+        Err(e) => {
+            tracing::warn!(err = %e, log = %svc_log, "open svc log fail, stderr → null");
+            std::process::Stdio::null()
+        }
+    };
+    let status = std::process::Command::new("bash")
+        .arg(&sh)
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn start.sh: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("start.sh {cmd} exit {:?}", status.code());
+    }
     Ok(())
 }
-fn real_start_pair(_repo: &str, _cmd: &str) -> Result<()> {
-    tracing::warn!("real start.sh not wired (Task 11)");
-    Ok(())
-}
-fn real_probe_spec(_s: &ProbeSpec) -> ProbeResult {
-    ProbeResult::Unhealthy { reason: crate::probe::UnhealthyReason::ConnectionRefused }
+
+// 同步壳: tokio runtime 内 block_on probe。ServiceRunner.probe_fn 是同步闭包。
+fn real_probe_spec(s: &ProbeSpec) -> ProbeResult {
+    let s = s.clone();
+    tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(probe(&s))
+    })
 }
 
 #[cfg(test)]
