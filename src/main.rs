@@ -2,6 +2,7 @@ mod alert;
 mod config;
 mod manifest;
 mod probe;
+mod rpc;
 mod store;
 mod supervisor;
 
