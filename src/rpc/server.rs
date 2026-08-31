@@ -91,8 +91,30 @@ async fn dispatch(
                 Err(e) => make_error(-32000, &e.to_string(), req.id),
             }
         }
-        Some(Method::Restart | Method::Top | Method::Shutdown) => {
-            make_error(-32601, "not implemented yet", req.id)
+        Some(Method::Restart) => {
+            let svc = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return make_error(-32602, "invalid params: service required", req.id),
+            };
+            let mut c = core.lock().await;
+            let runner = match c.runners.iter_mut().find(|r| r.def.name == svc) {
+                Some(r) => r,
+                None => return make_error(-32602, &format!("unknown service: {svc}"), req.id),
+            };
+            runner.policy.reset();
+            runner.state = crate::supervisor::runner::State::Stopped;
+            match runner.invoke_start() {
+                Ok(()) => {
+                    runner.state = crate::supervisor::runner::State::Starting;
+                    tracing::info!(svc = %svc, "manual restart ok");
+                    make_result(json!("ok"), req.id)
+                }
+                Err(e) => {
+                    tracing::warn!(svc = %svc, err = %e, "manual restart start.sh fail");
+                    make_error(-32000, &format!("restart fail: {e}"), req.id)
+                }
+            }
         }
+        Some(Method::Top | Method::Shutdown) => make_error(-32601, "not implemented yet", req.id),
     }
 }

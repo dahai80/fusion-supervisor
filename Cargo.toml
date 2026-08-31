@@ -22,12 +22,10 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tabled = "0.17"
 toml = "0.8"
-dirs = "6"
 indexmap = { version = "2", features = ["serde"] }
 
 [dev-dependencies]

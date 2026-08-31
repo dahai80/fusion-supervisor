@@ -126,25 +126,40 @@ impl SupervisorCore {
                 let start_fn = self.start_fn.clone();
                 let probe_fn = self.probe_fn.clone();
                 let timeout = self.cfg.start_timeout_sec;
+                // 返回 (服务名, 是否跳过=已健康), join 后据其写 runner.state
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // 先探活: 已健康跳过 (R11: 用注入 probe_fn, 非真 probe)
                     let spec = ProbeSpec::tcp(d.port);
                     if matches!((probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                         tracing::info!(svc = %d.name, "skip start (already up)");
-                        return;
+                        return (d.name, true);
                     }
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh start");
                     let cmd = async { (start_fn)(&d.repo_dir, "start") };
                     match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!(svc = %d.name, err = %e, "start fail"),
-                        Err(_) => tracing::warn!(svc = %d.name, "start timeout {timeout}s"),
+                        Ok(Ok(())) => (d.name, false),
+                        Ok(Err(e)) => {
+                            tracing::warn!(svc = %d.name, err = %e, "start fail");
+                            (d.name, false)
+                        }
+                        Err(_) => {
+                            tracing::warn!(svc = %d.name, "start timeout {timeout}s");
+                            (d.name, false)
+                        }
                     }
                 }));
             }
             for h in handles {
-                let _ = h.await;
+                if let Ok((name, skipped_healthy)) = h.await
+                    && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
+                {
+                    r.state = if skipped_healthy {
+                        runner::State::Healthy
+                    } else {
+                        runner::State::Starting
+                    };
+                }
             }
         }
         Ok(())
@@ -167,16 +182,22 @@ impl SupervisorCore {
             for d in batch {
                 let sem = sem.clone();
                 let start_fn = self.start_fn.clone();
+                // 返回服务名, join 后写 runner.state = Stopped
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop");
                     if let Err(e) = (start_fn)(&d.repo_dir, "stop") {
                         tracing::warn!(svc = %d.name, err = %e, "stop fail");
                     }
+                    d.name
                 }));
             }
             for h in handles {
-                let _ = h.await;
+                if let Ok(name) = h.await
+                    && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
+                {
+                    r.state = runner::State::Stopped;
+                }
             }
         }
         Ok(())
@@ -191,6 +212,32 @@ impl SupervisorCore {
                 port: r.def.port,
             })
             .collect()
+    }
+
+    // 单轮监督: 遍历所有 runner 调 tick。split-borrow 在 &mut self 方法内合法
+    // (runners &mut / store & / alerter &mut 三字段分借)。tick 内 async, 每轮
+    // 借用在本迭代结束释放, 下一迭代重新借, 编译通过。
+    pub async fn tick_all(&mut self, now_ts: u64) {
+        for r in &mut self.runners {
+            if let Err(e) = r.tick(now_ts, &self.store, &mut self.alerter).await {
+                tracing::warn!(svc = %r.def.name, err = %e, "tick fail (继续下一个)");
+            }
+        }
+    }
+
+    // 探活间隔: 有 down 态服务用 poll_unhealthy_sec, 否则 poll_healthy_sec
+    pub fn poll_interval(&self) -> u64 {
+        let any_down = self.runners.iter().any(|r| {
+            matches!(
+                r.state,
+                runner::State::Unhealthy | runner::State::Restarting | runner::State::Failed
+            )
+        });
+        if any_down {
+            self.cfg.poll_unhealthy_sec
+        } else {
+            self.cfg.poll_healthy_sec
+        }
     }
 }
 
@@ -284,6 +331,13 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "已健康应跳过不调 start.sh"
         );
+        // I4: 跳过=已健康 的 runner 应标 Healthy
+        for r in &core.runners {
+            assert!(
+                matches!(r.state, runner::State::Healthy),
+                "skip 后应 Healthy"
+            );
+        }
     }
 
     #[tokio::test]
@@ -310,6 +364,13 @@ mod tests {
         let o = order.lock().unwrap();
         assert_eq!(o[0], "fusion-mlx", "core 层先起");
         assert_eq!(o[1], "fusion-rag", "app 层后起");
+        // I4: 启动过的 runner 应标 Starting
+        for r in &core.runners {
+            assert!(
+                matches!(r.state, runner::State::Starting),
+                "启动后应 Starting"
+            );
+        }
     }
 
     #[tokio::test]
@@ -333,6 +394,13 @@ mod tests {
         let o = order.lock().unwrap();
         assert_eq!(o[0], "fusion-rag", "逆序: app 先停");
         assert_eq!(o[1], "fusion-mlx", "core 最后停");
+        // I5: 停止过的 runner 应标 Stopped
+        for r in &core.runners {
+            assert!(
+                matches!(r.state, runner::State::Stopped),
+                "停止后应 Stopped"
+            );
+        }
     }
 
     #[tokio::test]
@@ -366,5 +434,55 @@ mod tests {
         core.up_all().await.unwrap();
         let mx = *max_seen.lock().unwrap();
         assert!(mx <= 2, "并发上限 2, 实测峰值 {mx}");
+    }
+
+    // C1: tick_all 驱动状态机 — Unhealthy+ConnectionRefused → 记 crash + 重启 →
+    // 翻探活为 Healthy → tick → 恢复 Healthy。证明 tick_all 接通监督回路。
+    #[tokio::test]
+    async fn test_tick_all_drives_recovery() {
+        let probe_cell: Arc<Mutex<ProbeResult>> = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+            reason: crate::probe::UnhealthyReason::ConnectionRefused,
+        }));
+        let pc = probe_cell.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-rag", Layer::App, 11436)],
+            fake_cfg(),
+            move |_: &ProbeSpec| pc.lock().unwrap().clone(),
+            |_svc, _cmd| Ok(()),
+        );
+        // 起始: 已 Unhealthy (首 tick 进重启流 → Restarting)
+        core.runners[0].state = runner::State::Unhealthy;
+        core.tick_all(1000).await;
+        assert!(
+            matches!(core.runners[0].state, runner::State::Restarting),
+            "tick_all 后应 Restarting"
+        );
+        // 翻探活为健康 → tick_all 应恢复 Healthy
+        *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
+        core.tick_all(1001).await;
+        assert!(
+            matches!(core.runners[0].state, runner::State::Healthy),
+            "探活恢复后 tick_all 应 Healthy"
+        );
+    }
+
+    // C1: poll_interval — 有 down 态返回 poll_unhealthy_sec, 否则 poll_healthy_sec
+    #[test]
+    fn test_poll_interval_switches_on_down_state() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-rag", Layer::App, 11436)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+        );
+        // 全 Healthy → poll_healthy_sec
+        core.runners[0].state = runner::State::Healthy;
+        assert_eq!(core.poll_interval(), core.cfg.poll_healthy_sec);
+        // 有 Unhealthy → poll_unhealthy_sec
+        core.runners[0].state = runner::State::Unhealthy;
+        assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
+        // Failed 也算 down
+        core.runners[0].state = runner::State::Failed;
+        assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
     }
 }

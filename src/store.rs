@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
+// Connection 是 Send 但 !Sync (内含 RefCell)。tick (async) 持 &HistoryStore 跨 .await,
+// 需 &HistoryStore: Send → HistoryStore: Sync。包 std::sync::Mutex 使其 Send+Sync,
+// 解锁 daemon tick 循环的 tokio::spawn (C1)。SQLite 连接本就单线程访问, Mutex 显式化。
 pub struct HistoryStore {
-    pub conn: Connection,
+    pub conn: std::sync::Mutex<Connection>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +52,9 @@ impl HistoryStore {
              CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
         )?;
         tracing::info!(db = %path.display(), "history store open (WAL)");
-        Ok(Self { conn })
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+        })
     }
 
     pub fn record_health(
@@ -59,7 +64,7 @@ impl HistoryStore {
         latency_ms: u64,
         ts: u64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "INSERT INTO health_check(ts, service, status, latency_ms) VALUES (?,?,?,?)",
             params![ts as i64, service, status, latency_ms as i64],
         )?;
@@ -67,7 +72,7 @@ impl HistoryStore {
     }
 
     pub fn record_event(&self, service: &str, kind: &str, detail: &str, ts: u64) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "INSERT INTO event(ts, service, kind, detail) VALUES (?,?,?,?)",
             params![ts as i64, service, kind, detail],
         )?;
@@ -76,19 +81,22 @@ impl HistoryStore {
 
     pub fn cleanup_old(&self, now_ts: u64, retain_days: u32) -> Result<usize> {
         let cutoff = now_ts.saturating_sub((retain_days as u64) * 24 * 3600);
-        let h = self.conn.execute(
+        let h = self.conn.lock().unwrap().execute(
             "DELETE FROM health_check WHERE ts <= ?",
             params![cutoff as i64],
         )?;
         let e = self
             .conn
+            .lock()
+            .unwrap()
             .execute("DELETE FROM event WHERE ts <= ?", params![cutoff as i64])?;
         tracing::info!(cutoff, deleted_health = h, deleted_event = e, "cleanup old");
         Ok(h + e)
     }
 
     pub fn recent_health(&self, service: &str, limit: u32) -> Result<Vec<HealthRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT ts, service, status, latency_ms FROM (
                  SELECT ts, service, status, latency_ms FROM health_check
                  WHERE service = ? ORDER BY ts DESC LIMIT ?
@@ -107,7 +115,8 @@ impl HistoryStore {
     }
 
     pub fn recent_events(&self, service: &str, limit: u32) -> Result<Vec<EventRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT ts, service, kind, detail FROM (
                  SELECT ts, service, kind, detail FROM event
                  WHERE service = ? ORDER BY ts DESC LIMIT ?
@@ -140,6 +149,8 @@ mod tests {
         let s = open_mem();
         let n: i64 = s
             .conn
+            .lock()
+            .unwrap()
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name IN ('health_check','event')",
                 [],

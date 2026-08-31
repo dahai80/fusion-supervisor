@@ -71,8 +71,28 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
     });
     tracing::info!("daemon ready (socket {})", cfg.socket_path);
+    // 监督 tick 循环: 周期探活 + 宕机自动重启 (C1 修复)
+    // 锁纪律: 取锁读 poll_interval → 释放 → sleep → 再取锁 tick_all。
+    // 绝不持锁跨 sleep (否则阻塞 RPC status/up/down)。
+    let core_tick = core.clone();
+    let tick_handle = tokio::spawn(async move {
+        loop {
+            let interval = {
+                let c = core_tick.lock().await;
+                c.poll_interval()
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut c = core_tick.lock().await;
+            c.tick_all(now).await;
+        }
+    });
     tokio::signal::ctrl_c().await?;
     tracing::info!("daemon shutdown (ctrl-c)");
+    tick_handle.abort();
     Ok(())
 }
 
@@ -97,11 +117,12 @@ async fn cli_status(cfg: Config) -> anyhow::Result<()> {
 
 async fn cli_top(cfg: Config) -> anyhow::Result<()> {
     loop {
+        // M6: 先清屏再打印, 避免首帧滞留 1s 再空白
+        print!("\x1b[2J\x1b[H");
         if let Err(e) = cli_status(cfg.clone()).await {
             cli::print_error(&e.to_string());
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        print!("\x1b[2J\x1b[H");
     }
 }
 

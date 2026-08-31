@@ -166,7 +166,7 @@ impl ServiceRunner {
         }
     }
 
-    fn invoke_start(&self) -> Result<()> {
+    pub(crate) fn invoke_start(&self) -> Result<()> {
         if self.restart_cmd == "restart" {
             (self.start_fn)("restart")
         } else {

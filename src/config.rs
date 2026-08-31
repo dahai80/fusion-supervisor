@@ -45,10 +45,15 @@ impl Config {
         let expanded = expand_tilde(&path);
         if !expanded.exists() {
             tracing::info!("config 不存在, 用默认值: {}", expanded.display());
-            return Ok(Config::default());
+            let mut cfg = Config::default();
+            cfg.db_path = expand_tilde(&cfg.db_path);
+            cfg.registry_path = expand_tilde(&cfg.registry_path);
+            return Ok(cfg);
         }
         let text = std::fs::read_to_string(&expanded)?;
-        let cfg: Config = toml::from_str(&text)?;
+        let mut cfg: Config = toml::from_str(&text)?;
+        cfg.db_path = expand_tilde(&cfg.db_path);
+        cfg.registry_path = expand_tilde(&cfg.registry_path);
         Ok(cfg)
     }
 }
@@ -65,4 +70,61 @@ fn expand_tilde(p: &Path) -> PathBuf {
 
 fn dirs_or_home() -> Option<String> {
     std::env::var("HOME").ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RAII 守卫: 设 env, Drop 时恢复原值 (panic 也会跑 Drop, 不污染其他测试)。
+    // edition 2024 起 set_var/remove_var 为 unsafe, 故包 unsafe 块。
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: 测试单线程内设 env, 此处无并发读此 key 的代码。
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上, 测试内恢复 env。
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    // I1: load() 在无配置文件分支应展开 db_path 的 ~ 为 $HOME,
+    // 不留字面 "~" 目录。回归: 之前 load 返回 Default 带 "~/.fusion-sv/history.db"。
+    #[test]
+    fn test_load_expands_tilde_in_db_path() {
+        let nonexistent = std::env::temp_dir().join("fusion-sv-config-noexist-test.toml");
+        let _ = std::fs::remove_file(&nonexistent);
+        let _guard = EnvGuard::set("FUSION_SV_CONFIG", nonexistent.to_str().unwrap());
+        let cfg = Config::load().expect("load 应成功 (无文件用默认)");
+        let home = std::env::var("HOME").expect("HOME 应存在");
+        assert!(
+            !cfg.db_path.starts_with("~"),
+            "db_path 不应保留字面 ~: {:?}",
+            cfg.db_path
+        );
+        assert!(
+            cfg.db_path.starts_with(&home),
+            "db_path 应以 $HOME 开头: {:?} vs {}",
+            cfg.db_path,
+            home
+        );
+        assert!(
+            !cfg.registry_path.starts_with("~") || cfg.registry_path.starts_with(&home),
+            "registry_path 不应保留字面 ~: {:?}",
+            cfg.registry_path
+        );
+        let _ = std::fs::remove_file(&nonexistent);
+    }
 }
