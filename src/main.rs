@@ -1,3 +1,4 @@
+mod alert;
 mod config;
 mod manifest;
 mod probe;
