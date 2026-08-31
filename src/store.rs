@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 pub struct HistoryStore {
     pub conn: Connection,
@@ -23,13 +23,14 @@ pub struct EventRow {
 
 impl HistoryStore {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent).ok();
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("open sqlite {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS health_check (
@@ -52,7 +53,11 @@ impl HistoryStore {
     }
 
     pub fn record_health(
-        &self, service: &str, status: &str, latency_ms: u64, ts: u64,
+        &self,
+        service: &str,
+        status: &str,
+        latency_ms: u64,
+        ts: u64,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO health_check(ts, service, status, latency_ms) VALUES (?,?,?,?)",
@@ -61,9 +66,7 @@ impl HistoryStore {
         Ok(())
     }
 
-    pub fn record_event(
-        &self, service: &str, kind: &str, detail: &str, ts: u64,
-    ) -> Result<()> {
+    pub fn record_event(&self, service: &str, kind: &str, detail: &str, ts: u64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO event(ts, service, kind, detail) VALUES (?,?,?,?)",
             params![ts as i64, service, kind, detail],
@@ -77,10 +80,9 @@ impl HistoryStore {
             "DELETE FROM health_check WHERE ts <= ?",
             params![cutoff as i64],
         )?;
-        let e = self.conn.execute(
-            "DELETE FROM event WHERE ts <= ?",
-            params![cutoff as i64],
-        )?;
+        let e = self
+            .conn
+            .execute("DELETE FROM event WHERE ts <= ?", params![cutoff as i64])?;
         tracing::info!(cutoff, deleted_health = h, deleted_event = e, "cleanup old");
         Ok(h + e)
     }
@@ -100,7 +102,8 @@ impl HistoryStore {
                 latency_ms: r.get::<_, i64>(3)? as u64,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn recent_events(&self, service: &str, limit: u32) -> Result<Vec<EventRow>> {
@@ -118,7 +121,8 @@ impl HistoryStore {
                 detail: r.get(3)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 
@@ -134,8 +138,13 @@ mod tests {
     #[test]
     fn test_create_tables() {
         let s = open_mem();
-        let n: i64 = s.conn
-            .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('health_check','event')", [], |r| r.get(0))
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('health_check','event')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 2);
     }
@@ -155,8 +164,10 @@ mod tests {
     #[test]
     fn test_record_and_query_event() {
         let s = open_mem();
-        s.record_event("fusion-rag", "ServiceDown", "conn refused", 5000).unwrap();
-        s.record_event("fusion-rag", "ServiceBack", "recovered", 5300).unwrap();
+        s.record_event("fusion-rag", "ServiceDown", "conn refused", 5000)
+            .unwrap();
+        s.record_event("fusion-rag", "ServiceBack", "recovered", 5300)
+            .unwrap();
         let rows = s.recent_events("fusion-rag", 10).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, "ServiceDown");
@@ -182,7 +193,8 @@ mod tests {
         let s = open_mem();
         let now = 1_000_000u64;
         let boundary = now - (7 * 24 * 3600);
-        s.record_health("fusion-mlx", "healthy", 9, boundary).unwrap();
+        s.record_health("fusion-mlx", "healthy", 9, boundary)
+            .unwrap();
         let deleted = s.cleanup_old(now, 7).unwrap();
         assert_eq!(deleted, 1);
         let rows = s.recent_health("fusion-mlx", 10).unwrap();

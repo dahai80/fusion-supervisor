@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -53,15 +53,14 @@ impl Config {
     }
 }
 
-fn expand_tilde(p: &PathBuf) -> PathBuf {
-    if let Some(s) = p.to_str() {
-        if s.starts_with("~") {
-            if let Some(home) = dirs_or_home() {
-                return PathBuf::from(s.replacen("~", &home, 1));
-            }
-        }
+fn expand_tilde(p: &Path) -> PathBuf {
+    if let Some(s) = p.to_str()
+        && s.starts_with("~")
+        && let Some(home) = dirs_or_home()
+    {
+        return PathBuf::from(s.replacen("~", &home, 1));
     }
-    p.clone()
+    p.to_path_buf()
 }
 
 fn dirs_or_home() -> Option<String> {

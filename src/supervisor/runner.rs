@@ -1,9 +1,12 @@
 use crate::alert::{Alert, AlertKind, Alerter};
-use crate::manifest::{Layer, ServiceDef};
+use crate::manifest::ServiceDef;
 use crate::probe::ProbeResult;
 use crate::store::HistoryStore;
 use crate::supervisor::policy::RestartPolicy;
 use anyhow::Result;
+
+pub type ProbeFn = Box<dyn Fn() -> ProbeResult + Send + Sync>;
+pub type StartFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 // 状态机: Stopped→Starting→Healthy→(Unhealthy)→Restarting→Healthy|Failed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -21,8 +24,8 @@ pub struct ServiceRunner {
     pub state: State,
     pub policy: RestartPolicy,
     pub restart_cmd: String, // "restart" | "stop+start"
-    probe_fn: Box<dyn Fn() -> ProbeResult + Send + Sync>,
-    start_fn: Box<dyn Fn(&str) -> Result<()> + Send + Sync>,
+    probe_fn: ProbeFn,
+    start_fn: StartFn,
 }
 
 impl ServiceRunner {
@@ -176,20 +179,31 @@ impl ServiceRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Layer;
     use crate::probe::{ProbeResult, UnhealthyReason};
     use std::sync::{Arc, Mutex};
 
     fn def() -> ServiceDef {
         ServiceDef {
-            name: "fusion-rag".into(), port: 11436, repo_dir: "fusion-rag".into(),
-            purpose: "kb".into(), fixed: false, layer: Layer::App,
+            name: "fusion-rag".into(),
+            port: 11436,
+            repo_dir: "fusion-rag".into(),
+            purpose: "kb".into(),
+            fixed: false,
+            layer: Layer::App,
         }
     }
 
     // 可变探活结果 + 记录 start.sh 调用序列, 供断言
+    #[allow(clippy::type_complexity)]
     fn harness(
         probe_results: ProbeResult,
-    ) -> (Arc<Mutex<Vec<String>>>, Arc<Mutex<ProbeResult>>, impl Fn() -> ProbeResult + Send + Sync, impl Fn(&str) -> Result<()> + Send + Sync) {
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<ProbeResult>>,
+        impl Fn() -> ProbeResult + Send + Sync,
+        impl Fn(&str) -> Result<()> + Send + Sync,
+    ) {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let probe_cell: Arc<Mutex<ProbeResult>> = Arc::new(Mutex::new(probe_results));
         let calls_p = calls.clone();
@@ -212,9 +226,9 @@ mod tests {
         let (calls, _, pf, sf) = harness(ProbeResult::Healthy { latency_ms: 5 });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Healthy;
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Healthy));
         assert!(calls.lock().unwrap().is_empty()); // 不调 start.sh
     }
@@ -226,9 +240,9 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Healthy;
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         // 首次宕机: 标 Unhealthy + 告警, 但尚未重启 (重启在下一 tick)
         assert!(matches!(r.state, State::Unhealthy));
         assert!(calls.lock().unwrap().is_empty());
@@ -242,9 +256,9 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy; // 已标 down, 这次进重启流
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Restarting));
         assert_eq!(r.policy.crash_count(), 1);
         assert_eq!(*calls.lock().unwrap(), vec!["restart".to_string()]);
@@ -261,9 +275,9 @@ mod tests {
             r.policy.record_crash(900 + i);
         }
         r.state = State::Unhealthy;
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Failed));
         assert!(calls.lock().unwrap().is_empty()); // 封顶不重启
     }
@@ -276,14 +290,14 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Healthy;
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Unhealthy));
         assert!(calls.lock().unwrap().is_empty()); // 不调 start.sh
         assert_eq!(r.policy.crash_count(), 0); // 不记 crash
         // 再 tick 一次 (state=Unhealthy): BadPath 仍不重启
-        r.tick(1001, &mut s, &mut al).await.unwrap();
+        r.tick(1001, &s, &mut al).await.unwrap();
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(r.policy.crash_count(), 0);
     }
@@ -297,9 +311,9 @@ mod tests {
         r.state = State::Unhealthy;
         // 改探活为健康, tick 应恢复
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 8 };
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Healthy));
         assert!(calls.lock().unwrap().is_empty());
     }
@@ -312,9 +326,9 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "stop+start", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
-        let mut s = store();
+        let s = store();
         let mut al = Alerter::new(300, String::new());
-        r.tick(1000, &mut s, &mut al).await.unwrap();
+        r.tick(1000, &s, &mut al).await.unwrap();
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["stop".to_string(), "start".to_string()]

@@ -40,9 +40,8 @@ struct ServiceEntry {
 // sub-service key (fusion-cowork-ws) → 父 repo (fusion-cowork)。
 pub fn name_to_dir(name: &str) -> &str {
     // 已知拼写差异例外
-    static EXCEPTIONS: &[(&str, &str)] = &[
-        ("fusion-code-modelization", "fusion-code-modenization"),
-    ];
+    static EXCEPTIONS: &[(&str, &str)] =
+        &[("fusion-code-modelization", "fusion-code-modenization")];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
             return dir;
@@ -50,8 +49,12 @@ pub fn name_to_dir(name: &str) -> &str {
     }
     // 子服务 key: fusion-cowork-ws / fusion-security-svc / fusion-multi-node-agent 等 → 父 repo
     for parent in &[
-        "fusion-cowork", "fusion-security", "fusion-multi-node",
-        "fusion-agent-studio", "fusion-simulation", "fusion-bench",
+        "fusion-cowork",
+        "fusion-security",
+        "fusion-multi-node",
+        "fusion-agent-studio",
+        "fusion-simulation",
+        "fusion-bench",
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
             return parent;
@@ -63,8 +66,11 @@ pub fn name_to_dir(name: &str) -> &str {
 pub fn layer_of(name: &str) -> Layer {
     let core = ["fusion-mlx", "fusion-gateway"];
     let platform = [
-        "fusion-rag", "fusion-model-hub", "fusion-artifacts-engine",
-        "fusion-plugins-ecosystem", "fusion-gateway-deploy",
+        "fusion-rag",
+        "fusion-model-hub",
+        "fusion-artifacts-engine",
+        "fusion-plugins-ecosystem",
+        "fusion-gateway-deploy",
     ];
     let cluster_prefix = "fusion-multi-node";
     if core.contains(&name) {
@@ -82,8 +88,14 @@ pub fn layer_of(name: &str) -> Layer {
 
 fn is_domain(name: &str) -> bool {
     let domain = [
-        "fusion-health", "fusion-science", "fusion-finance", "fusion-k12-teacher",
-        "fusion-simulation", "fusion-gupiao", "fusion-smallbusiness", "fusion-store",
+        "fusion-health",
+        "fusion-science",
+        "fusion-finance",
+        "fusion-k12-teacher",
+        "fusion-simulation",
+        "fusion-gupiao",
+        "fusion-smallbusiness",
+        "fusion-store",
         "fusion-bench",
     ];
     domain.iter().any(|d| name == *d || name.starts_with(d))
@@ -97,14 +109,18 @@ impl ServiceManifest {
             .with_context(|| format!("读注册表失败: {}", path.display()))?;
         let reg: RegistryFile = serde_yaml::from_str(&text)
             .with_context(|| format!("解析注册表失败: {}", path.display()))?;
-        let defs = reg.services.into_iter().map(|(name, entry)| ServiceDef {
-            repo_dir: name_to_dir(&name).to_string(),
-            layer: layer_of(&name),
-            name,
-            port: entry.port,
-            purpose: entry.purpose,
-            fixed: entry.fixed,
-        }).collect();
+        let defs = reg
+            .services
+            .into_iter()
+            .map(|(name, entry)| ServiceDef {
+                repo_dir: name_to_dir(&name).to_string(),
+                layer: layer_of(&name),
+                name,
+                port: entry.port,
+                purpose: entry.purpose,
+                fixed: entry.fixed,
+            })
+            .collect();
         Ok(defs)
     }
 
@@ -168,7 +184,10 @@ external_tools: []
 
     #[test]
     fn test_name_to_dir_exception() {
-        assert_eq!(name_to_dir("fusion-code-modelization"), "fusion-code-modenization");
+        assert_eq!(
+            name_to_dir("fusion-code-modelization"),
+            "fusion-code-modenization"
+        );
         assert_eq!(name_to_dir("fusion-mlx"), "fusion-mlx");
         assert_eq!(name_to_dir("fusion-cowork-ws"), "fusion-cowork");
     }
@@ -193,9 +212,22 @@ external_tools: []
         // core first (fixed), then platform, app, cluster
         assert_eq!(names[0], "fusion-mlx");
         assert_eq!(names[1], "fusion-gateway");
-        assert!(names.iter().position(|n| *n == "fusion-rag").unwrap()
-            < names.iter().position(|n| *n == "fusion-code-modelization").unwrap());
-        assert!(names.iter().position(|n| *n == "fusion-code-modelization").unwrap()
-            < names.iter().position(|n| *n == "fusion-multi-node").unwrap());
+        assert!(
+            names.iter().position(|n| *n == "fusion-rag").unwrap()
+                < names
+                    .iter()
+                    .position(|n| *n == "fusion-code-modelization")
+                    .unwrap()
+        );
+        assert!(
+            names
+                .iter()
+                .position(|n| *n == "fusion-code-modelization")
+                .unwrap()
+                < names
+                    .iter()
+                    .position(|n| *n == "fusion-multi-node")
+                    .unwrap()
+        );
     }
 }

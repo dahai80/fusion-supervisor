@@ -19,11 +19,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Daemon,
-    Up { service: Option<String> },
-    Down { service: Option<String> },
+    Up {
+        service: Option<String>,
+    },
+    Down {
+        service: Option<String>,
+    },
     Status,
-    Restart { service: String },
-    Logs { service: String },
+    Restart {
+        service: String,
+    },
+    Logs {
+        service: String,
+    },
     Top,
     /// Ping the daemon (alive check)
     Ping,
@@ -70,16 +78,19 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
 
 async fn cli_status(cfg: Config) -> anyhow::Result<()> {
     let mut client = connect_client(&cfg).await?;
-    let req = RpcRequest { jsonrpc: "2.0".into(), method: "status".into(), params: Value::Null, id: 1 };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        method: "status".into(),
+        params: Value::Null,
+        id: 1,
+    };
     let resp = client.call(req).await?;
     if let Some(err) = resp.error {
         cli::print_error(&err.message);
         std::process::exit(1);
     }
-    let entries: Vec<supervisor::StatusEntry> = serde_json::from_value(
-        resp.result.unwrap_or(Value::Array(vec![])),
-    )
-    .unwrap_or_default();
+    let entries: Vec<supervisor::StatusEntry> =
+        serde_json::from_value(resp.result.unwrap_or(Value::Array(vec![]))).unwrap_or_default();
     cli::print_status(&entries);
     Ok(())
 }
@@ -96,13 +107,23 @@ async fn cli_top(cfg: Config) -> anyhow::Result<()> {
 
 async fn cli_call(cfg: Config, method: &str) -> anyhow::Result<()> {
     let mut client = connect_client(&cfg).await?;
-    let req = RpcRequest { jsonrpc: "2.0".into(), method: method.into(), params: Value::Null, id: 1 };
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        method: method.into(),
+        params: Value::Null,
+        id: 1,
+    };
     let resp = client.call(req).await?;
     if let Some(err) = resp.error {
         cli::print_error(&err.message);
         std::process::exit(1);
     }
-    cli::print_ok(&resp.result.map(|v| v.to_string()).unwrap_or_else(|| "ok".into()));
+    cli::print_ok(
+        &resp
+            .result
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "ok".into()),
+    );
     Ok(())
 }
 
@@ -119,7 +140,12 @@ async fn cli_call_param(cfg: Config, method: &str, service: String) -> anyhow::R
         cli::print_error(&err.message);
         std::process::exit(1);
     }
-    cli::print_ok(&resp.result.map(|v| v.to_string()).unwrap_or_else(|| "ok".into()));
+    cli::print_ok(
+        &resp
+            .result
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "ok".into()),
+    );
     Ok(())
 }
 

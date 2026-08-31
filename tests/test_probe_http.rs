@@ -1,4 +1,4 @@
-use fusion_supervisor::probe::{probe, ProbeResult, ProbeSpec, UnhealthyReason};
+use fusion_supervisor::probe::{ProbeResult, ProbeSpec, UnhealthyReason, probe};
 
 #[tokio::test]
 async fn test_probe_http_healthy() {
@@ -23,7 +23,12 @@ async fn test_probe_http_healthy() {
 #[tokio::test]
 async fn test_probe_http_conn_refused() {
     let r = probe(&ProbeSpec::http(59999, "/health")).await;
-    assert!(matches!(r, ProbeResult::Unhealthy { reason: UnhealthyReason::ConnectionRefused }));
+    assert!(matches!(
+        r,
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused
+        }
+    ));
 }
 
 #[tokio::test]
@@ -43,5 +48,10 @@ async fn test_probe_http_404_badpath() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let r = probe(&ProbeSpec::http(port, "/healthz")).await;
-    assert!(matches!(r, ProbeResult::Unhealthy { reason: UnhealthyReason::BadPath(404) }));
+    assert!(matches!(
+        r,
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::BadPath(404)
+        }
+    ));
 }

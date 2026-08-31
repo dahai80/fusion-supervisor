@@ -1,5 +1,5 @@
 use crate::rpc::schema::{RpcRequest, RpcResponse};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -28,7 +28,12 @@ impl RpcClient {
     }
 
     pub async fn ping(&mut self) -> Result<bool> {
-        let req = RpcRequest { jsonrpc: "2.0".into(), method: "ping".into(), params: Value::Null, id: 1 };
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "ping".into(),
+            params: Value::Null,
+            id: 1,
+        };
         let resp = self.call(req).await?;
         Ok(resp.result.map(|v| v == "pong").unwrap_or(false))
     }

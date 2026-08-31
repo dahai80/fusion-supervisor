@@ -4,12 +4,15 @@ pub mod runner;
 use crate::alert::Alerter;
 use crate::config::Config;
 use crate::manifest::{Layer, ServiceDef, ServiceManifest};
-use crate::probe::{probe, ProbeResult, ProbeSpec};
+use crate::probe::{ProbeResult, ProbeSpec, probe};
 use crate::probe_map;
 use crate::store::HistoryStore;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+pub type ArcStartFn = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+pub type ArcProbeFn = Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusEntry {
@@ -24,8 +27,8 @@ pub struct SupervisorCore {
     pub alerter: Alerter,
     pub cfg: Config,
     // 注入的 start 函数 (生产=bash start.sh, 测试=fake)。签名: (repo_dir, cmd) -> Result
-    start_fn: Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>,
-    probe_fn: Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>,
+    start_fn: ArcStartFn,
+    probe_fn: ArcProbeFn,
 }
 
 impl SupervisorCore {
@@ -72,8 +75,8 @@ impl SupervisorCore {
     ) -> Self {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let db_path = std::env::temp_dir()
-            .join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
+        let db_path =
+            std::env::temp_dir().join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
         let store = HistoryStore::open(&db_path).unwrap();
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
         let start_fn = Arc::new(start_fn);
@@ -95,14 +98,20 @@ impl SupervisorCore {
                 )
             })
             .collect();
-        Self { runners, store, alerter, cfg, start_fn, probe_fn }
+        Self {
+            runners,
+            store,
+            alerter,
+            cfg,
+            start_fn,
+            probe_fn,
+        }
     }
 
     // up: 按 layer 序, 层内并发 cap。先探活, 已健康跳过 (避双启)。
     pub async fn up_all(&mut self) -> Result<()> {
-        let sorted = ServiceManifest::sort_by_layer(
-            self.runners.iter().map(|r| r.def.clone()).collect(),
-        );
+        let sorted =
+            ServiceManifest::sort_by_layer(self.runners.iter().map(|r| r.def.clone()).collect());
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
         // 分层桶: 同 layer 内并发, 层间串行
         let mut by_layer: std::collections::BTreeMap<Layer, Vec<ServiceDef>> =
@@ -235,28 +244,46 @@ mod tests {
 
     fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
         ServiceDef {
-            name: name.into(), port,
-            repo_dir: name.into(), purpose: "x".into(), fixed: false, layer,
+            name: name.into(),
+            port,
+            repo_dir: name.into(),
+            purpose: "x".into(),
+            fixed: false,
+            layer,
         }
     }
 
     fn fake_cfg() -> Config {
-        Config { max_concurrent_start: 2, start_timeout_sec: 5, ..Config::default() }
+        Config {
+            max_concurrent_start: 2,
+            start_timeout_sec: 5,
+            ..Config::default()
+        }
     }
 
     #[tokio::test]
     async fn test_up_all_skips_already_healthy() {
         // 所有服务探活即健康 → 不调 start.sh
-        let defs = vec![def("fusion-mlx", Layer::Core, 11434), def("fusion-rag", Layer::App, 11436)];
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::App, 11436),
+        ];
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_p = calls.clone();
         let mut core = SupervisorCore::new_with_fns(
-            defs, fake_cfg(),
+            defs,
+            fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 }, // 探活恒健康
-            move |svc, cmd| { calls_p.lock().unwrap().push(format!("{svc}/{cmd}")); Ok(()) },
+            move |svc, cmd| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
         );
         core.up_all().await.unwrap();
-        assert!(calls.lock().unwrap().is_empty(), "已健康应跳过不调 start.sh");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "已健康应跳过不调 start.sh"
+        );
     }
 
     #[tokio::test]
@@ -269,8 +296,11 @@ mod tests {
         let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let order_p = order.clone();
         let mut core = SupervisorCore::new_with_fns(
-            defs, fake_cfg(),
-            |_| ProbeResult::Unhealthy { reason: crate::probe::UnhealthyReason::ConnectionRefused },
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
             move |svc, _cmd| {
                 order_p.lock().unwrap().push(svc.to_string());
                 Ok(())
@@ -291,9 +321,13 @@ mod tests {
         let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let order_p = order.clone();
         let mut core = SupervisorCore::new_with_fns(
-            defs, fake_cfg(),
+            defs,
+            fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            move |svc, _cmd| { order_p.lock().unwrap().push(svc.to_string()); Ok(()) },
+            move |svc, _cmd| {
+                order_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
         );
         core.down_all().await.unwrap();
         let o = order.lock().unwrap();
@@ -312,13 +346,18 @@ mod tests {
         let inflight_p = inflight.clone();
         let max_p = max_seen.clone();
         let mut core = SupervisorCore::new_with_fns(
-            defs, fake_cfg(),
-            |_| ProbeResult::Unhealthy { reason: crate::probe::UnhealthyReason::ConnectionRefused },
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
             move |_svc, _cmd| {
                 let mut cur = inflight_p.lock().unwrap();
                 *cur += 1;
                 let mut mx = max_p.lock().unwrap();
-                if *cur > *mx { *mx = *cur; }
+                if *cur > *mx {
+                    *mx = *cur;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 *cur -= 1;
                 Ok(())

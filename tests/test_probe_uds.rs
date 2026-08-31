@@ -1,4 +1,4 @@
-use fusion_supervisor::probe::{probe, ProbeResult, ProbeSpec, UnhealthyReason};
+use fusion_supervisor::probe::{ProbeResult, ProbeSpec, UnhealthyReason, probe};
 
 #[tokio::test]
 async fn test_probe_uds_healthy() {
@@ -10,7 +10,9 @@ async fn test_probe_uds_healthy() {
         loop {
             if let Ok((mut s, _)) = listener.accept().await {
                 use tokio::io::AsyncWriteExt;
-                let _ = s.write_all(br#"{"jsonrpc":"2.0","result":"pong","id":1}"#).await;
+                let _ = s
+                    .write_all(br#"{"jsonrpc":"2.0","result":"pong","id":1}"#)
+                    .await;
             }
         }
     });
@@ -23,5 +25,10 @@ async fn test_probe_uds_healthy() {
 #[tokio::test]
 async fn test_probe_uds_conn_fail() {
     let r = probe(&ProbeSpec::uds("/tmp/fusion-sv-nonexistent.sock")).await;
-    assert!(matches!(r, ProbeResult::Unhealthy { reason: UnhealthyReason::UdsConnectFailed }));
+    assert!(matches!(
+        r,
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::UdsConnectFailed
+        }
+    ));
 }

@@ -73,7 +73,9 @@ impl RestartPolicy {
 mod tests {
     use super::*;
 
-    fn cfg() -> (u64, u32, u64) { (300, 5, 30) }
+    fn cfg() -> (u64, u32, u64) {
+        (300, 5, 30)
+    }
 
     #[test]
     fn test_backoff_sequence_capped() {

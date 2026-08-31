@@ -37,7 +37,11 @@ pub struct Alerter {
 
 impl Alerter {
     pub fn new(dedup_sec: u64, webhook_url: String) -> Self {
-        Self { dedup_sec, last_down: HashMap::new(), webhook_url }
+        Self {
+            dedup_sec,
+            last_down: HashMap::new(),
+            webhook_url,
+        }
     }
 
     // 纯判定: ServiceDown 在去抖窗内 = 抑制, 其余恒放行。
@@ -70,10 +74,10 @@ impl Alerter {
             "ALERT"
         );
         self.record_emitted(&alert.service, &alert.kind, alert.ts);
-        if !self.webhook_url.is_empty() {
-            if let Err(e) = self.send_webhook(&alert).await {
-                tracing::warn!(err = %e, "webhook send fail (退回仅日志, 不影响监督)");
-            }
+        if !self.webhook_url.is_empty()
+            && let Err(e) = self.send_webhook(&alert).await
+        {
+            tracing::warn!(err = %e, "webhook send fail (退回仅日志, 不影响监督)");
         }
         Ok(())
     }

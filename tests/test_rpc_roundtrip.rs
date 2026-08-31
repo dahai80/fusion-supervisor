@@ -1,7 +1,6 @@
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::rpc::client::RpcClient;
 use fusion_supervisor::supervisor::SupervisorCore;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -14,9 +13,11 @@ async fn test_rpc_ping_roundtrip() {
         fixed: true,
         layer: Layer::Core,
     }];
-    let mut cfg = fusion_supervisor::config::Config::default();
-    cfg.db_path = std::env::temp_dir()
-        .join(format!("fusion-sv-rpc-{}.db", std::process::id()));
+    let db_path = std::env::temp_dir().join(format!("fusion-sv-rpc-{}.db", std::process::id()));
+    let cfg = fusion_supervisor::config::Config {
+        db_path: db_path.clone(),
+        ..fusion_supervisor::config::Config::default()
+    };
     let core = SupervisorCore::new(defs, cfg.clone()).unwrap();
     let core = Arc::new(tokio::sync::Mutex::new(core));
     let sock = format!("/tmp/fusion-sv-rpc-{}.sock", std::process::id());

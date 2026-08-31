@@ -19,13 +19,28 @@ pub struct ProbeSpec {
 
 impl ProbeSpec {
     pub fn http(port: u16, path: &str) -> Self {
-        Self { kind: ProbeKind::Http, port, path: Some(path.to_string()), socket: None }
+        Self {
+            kind: ProbeKind::Http,
+            port,
+            path: Some(path.to_string()),
+            socket: None,
+        }
     }
     pub fn uds(socket: &str) -> Self {
-        Self { kind: ProbeKind::Uds, port: 0, path: None, socket: Some(socket.to_string()) }
+        Self {
+            kind: ProbeKind::Uds,
+            port: 0,
+            path: None,
+            socket: Some(socket.to_string()),
+        }
     }
     pub fn tcp(port: u16) -> Self {
-        Self { kind: ProbeKind::Tcp, port, path: None, socket: None }
+        Self {
+            kind: ProbeKind::Tcp,
+            port,
+            path: None,
+            socket: None,
+        }
     }
 }
 
@@ -42,7 +57,10 @@ pub enum UnhealthyReason {
 impl UnhealthyReason {
     // 仅这两个 = 真宕机信号, 触发重启。其余不重启 (防风暴)。
     pub fn restart_eligible(&self) -> bool {
-        matches!(self, UnhealthyReason::ConnectionRefused | UnhealthyReason::Timeout)
+        matches!(
+            self,
+            UnhealthyReason::ConnectionRefused | UnhealthyReason::Timeout
+        )
     }
 }
 
@@ -59,9 +77,13 @@ pub fn classify_status(status: u16) -> ProbeResult {
     if (200..300).contains(&status) {
         ProbeResult::Healthy { latency_ms: 0 }
     } else if status == 404 || status == 405 {
-        ProbeResult::Unhealthy { reason: UnhealthyReason::BadPath(status) }
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::BadPath(status),
+        }
     } else {
-        ProbeResult::Unhealthy { reason: UnhealthyReason::BadStatus(status) }
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::BadStatus(status),
+        }
     }
 }
 
@@ -86,18 +108,26 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
             let latency = start.elapsed().as_millis() as u64;
             let status = resp.status().as_u16();
             match classify_status(status) {
-                ProbeResult::Healthy { .. } => ProbeResult::Healthy { latency_ms: latency },
+                ProbeResult::Healthy { .. } => ProbeResult::Healthy {
+                    latency_ms: latency,
+                },
                 other => other,
             }
         }
         Err(e) => {
             tracing::warn!(url = %url, err = %e, "http probe fail");
             if e.is_connect() {
-                ProbeResult::Unhealthy { reason: UnhealthyReason::ConnectionRefused }
+                ProbeResult::Unhealthy {
+                    reason: UnhealthyReason::ConnectionRefused,
+                }
             } else if e.is_timeout() {
-                ProbeResult::Unhealthy { reason: UnhealthyReason::Timeout }
+                ProbeResult::Unhealthy {
+                    reason: UnhealthyReason::Timeout,
+                }
             } else {
-                ProbeResult::Unhealthy { reason: UnhealthyReason::ConnectionRefused }
+                ProbeResult::Unhealthy {
+                    reason: UnhealthyReason::ConnectionRefused,
+                }
             }
         }
     }
@@ -105,39 +135,42 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
 
 async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
     let sock = spec.socket.as_deref().unwrap_or("/tmp/fusion-sv.sock");
-    let conn = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        tokio::net::UnixStream::connect(sock),
-    )
-    .await;
+    let conn = tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(sock)).await;
     let mut stream = match conn {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::warn!(sock = %sock, err = %e, "uds connect fail");
-            return ProbeResult::Unhealthy { reason: UnhealthyReason::UdsConnectFailed };
+            return ProbeResult::Unhealthy {
+                reason: UnhealthyReason::UdsConnectFailed,
+            };
         }
-        Err(_) => return ProbeResult::Unhealthy { reason: UnhealthyReason::Timeout },
+        Err(_) => {
+            return ProbeResult::Unhealthy {
+                reason: UnhealthyReason::Timeout,
+            };
+        }
     };
     // 发 repo 既有 envelope ping
     let req = r#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
     use tokio::io::AsyncWriteExt;
     if stream.write_all(req.as_bytes()).await.is_err() {
-        return ProbeResult::Unhealthy { reason: UnhealthyReason::UdsBadReply };
+        return ProbeResult::Unhealthy {
+            reason: UnhealthyReason::UdsBadReply,
+        };
     }
     ProbeResult::Healthy { latency_ms: 0 }
 }
 
 async fn probe_tcp(spec: &ProbeSpec) -> ProbeResult {
     let addr = format!("127.0.0.1:{}", spec.port);
-    match tokio::time::timeout(
-        PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    {
+    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => ProbeResult::Healthy { latency_ms: 0 },
-        Ok(Err(_)) => ProbeResult::Unhealthy { reason: UnhealthyReason::ConnectionRefused },
-        Err(_) => ProbeResult::Unhealthy { reason: UnhealthyReason::Timeout },
+        Ok(Err(_)) => ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused,
+        },
+        Err(_) => ProbeResult::Unhealthy {
+            reason: UnhealthyReason::Timeout,
+        },
     }
 }
 
@@ -179,15 +212,21 @@ mod tests {
         assert!(matches!(classify_status(204), ProbeResult::Healthy { .. }));
         assert!(matches!(
             classify_status(500),
-            ProbeResult::Unhealthy { reason: UnhealthyReason::BadStatus(500) }
+            ProbeResult::Unhealthy {
+                reason: UnhealthyReason::BadStatus(500)
+            }
         ));
         assert!(matches!(
             classify_status(404),
-            ProbeResult::Unhealthy { reason: UnhealthyReason::BadPath(404) }
+            ProbeResult::Unhealthy {
+                reason: UnhealthyReason::BadPath(404)
+            }
         ));
         assert!(matches!(
             classify_status(405),
-            ProbeResult::Unhealthy { reason: UnhealthyReason::BadPath(405) }
+            ProbeResult::Unhealthy {
+                reason: UnhealthyReason::BadPath(405)
+            }
         ));
     }
 }

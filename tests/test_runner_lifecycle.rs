@@ -34,23 +34,24 @@ async fn test_lifecycle_crash_then_recover() {
     let mut path = std::env::temp_dir();
     path.push(format!("fusion-sv-lifecycle-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let mut store = HistoryStore::open(&path).unwrap();
+    let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
     // 健康保持
-    r.tick(1000, &mut store, &mut al).await.unwrap();
+    r.tick(1000, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Healthy));
     // 宕机: 首次标 Unhealthy, 不重启
-    *probe_cell.lock().unwrap() =
-        ProbeResult::Unhealthy { reason: UnhealthyReason::ConnectionRefused };
-    r.tick(1001, &mut store, &mut al).await.unwrap();
+    *probe_cell.lock().unwrap() = ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    };
+    r.tick(1001, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     // 再次宕机: 进重启流
-    r.tick(1002, &mut store, &mut al).await.unwrap();
+    r.tick(1002, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Restarting));
     assert_eq!(calls.lock().unwrap().len(), 1);
     // 恢复
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 5 };
-    r.tick(1003, &mut store, &mut al).await.unwrap();
+    r.tick(1003, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Healthy));
     cleanup_db(&path);
 }

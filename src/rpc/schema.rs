@@ -52,11 +52,24 @@ pub fn parse_method(s: &str) -> Option<Method> {
 }
 
 pub fn make_result(result: Value, id: i64) -> RpcResponse {
-    RpcResponse { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
+    RpcResponse {
+        jsonrpc: "2.0".into(),
+        result: Some(result),
+        error: None,
+        id,
+    }
 }
 
 pub fn make_error(code: i64, message: &str, id: i64) -> RpcResponse {
-    RpcResponse { jsonrpc: "2.0".into(), result: None, error: Some(RpcError { code, message: message.into() }), id }
+    RpcResponse {
+        jsonrpc: "2.0".into(),
+        result: None,
+        error: Some(RpcError {
+            code,
+            message: message.into(),
+        }),
+        id,
+    }
 }
 
 #[cfg(test)]
