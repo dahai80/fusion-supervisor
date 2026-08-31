@@ -1,5 +1,6 @@
 mod config;
 mod manifest;
+mod probe;
 mod supervisor;
 
 use clap::{Parser, Subcommand};
