@@ -195,7 +195,7 @@ fn real_probe_spec(_s: &ProbeSpec) -> ProbeResult {
 mod tests {
     use super::*;
     use crate::manifest::{Layer, ServiceDef};
-    use crate::probe::{ProbeResult, ProbeSpec};
+    use crate::probe::ProbeResult;
     use std::sync::{Arc, Mutex};
 
     fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
