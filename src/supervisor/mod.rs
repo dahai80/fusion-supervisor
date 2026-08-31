@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusEntry {
     pub name: String,
     pub state: runner::State,

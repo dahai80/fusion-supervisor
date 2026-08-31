@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::rpc::schema::{RpcRequest, RpcResponse};
 use anyhow::{anyhow, Result};
 use serde_json::Value;

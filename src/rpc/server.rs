@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::rpc::schema::{make_error, make_result, parse_method, Method, RpcRequest, RpcResponse};
 use crate::supervisor::SupervisorCore;
 use anyhow::Result;
