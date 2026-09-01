@@ -16,8 +16,9 @@ COMPOSE="docker compose -f $BASE_COMPOSE -f $OVERLAY"
 CLUSTER_ONLY="docker compose -f $BASE_COMPOSE"
 
 # precheck: env shape + MLX liveness. Pure-ish (no compose), testable with stub.
+# MLX /health is token-exempt (200) — /v1/models requires API key (401), wrong for liveness.
 mlx_liveness() {
-    curl -sf "http://localhost:11434/v1/models" >/dev/null 2>&1 \
+    curl -sf "http://localhost:11434/health" >/dev/null 2>&1 \
         || { log "FAIL: MLX not reachable at localhost:11434 — run ~/claude-home/fusion-mlx/start.sh start"; return 1; }
 }
 precheck() {
@@ -30,7 +31,7 @@ precheck() {
     log "  token set, MLX live, compose files present"
 }
 
-# cluster_up: base compose only — Master + Agent healthy.
+# cluster_up: base compose only — Master healthy + Agent online.
 wait_healthy() { # $1=compose-cmd $2=service $3=max-wait-s
     local cmd="$1" svc="$2" max="${3:-60}" i=0
     while [ $i -lt $max ]; do
@@ -40,15 +41,26 @@ wait_healthy() { # $1=compose-cmd $2=service $3=max-wait-s
     done
     die "$svc not healthy within ${max}s (last: $st)"
 }
+# agent Docker healthcheck probes /api/health/deep which hardcodes localhost:11432
+# (upstream fusion-multi-node bug: ignores FUSION_MLX_URL, attr mismatch base_url vs _base_url).
+# Docker health stays unhealthy despite agent registered+online. Validate via master
+# /api/nodes online count — the real topology signal, not the broken healthcheck.
+wait_agent_online() { # $1=max-wait-s
+    local max="${1:-90}" i=0 body=""
+    while [ $i -lt $max ]; do
+        body=$(curl -sS -m 5 -H "Authorization: Bearer $FUSION_CLUSTER_TOKEN" http://127.0.0.1:11452/api/nodes 2>/dev/null || echo "")
+        echo "$body" | grep -Eq '"online"[: ]+[1-9]' && { log "  agent online via /api/nodes (${i}s)"; return 0; }
+        sleep 2; i=$((i+2))
+    done
+    die "agent not online in /api/nodes within ${max}s (last: $body)"
+}
 cluster_up() {
     log "STEP 2: cluster plane (base)"
     $CLUSTER_ONLY up -d master agent >/dev/null 2>&1 || die "cluster up failed"
     wait_healthy "$CLUSTER_ONLY" master 60
-    wait_healthy "$CLUSTER_ONLY" agent 90
+    wait_agent_online 90
     curl -sf -H "Authorization: Bearer $FUSION_CLUSTER_TOKEN" http://127.0.0.1:11452/api/health >/dev/null \
-        || die "master /api/health unreachable (token?)"
-    curl -sf -H "Authorization: Bearer $FUSION_CLUSTER_TOKEN" http://127.0.0.1:11452/api/nodes | grep -q online \
-        || die "no agent online in /api/nodes"
+        || die "master /api/health unreachable"
     log "  master :11452 healthy, agent online"
 }
 
