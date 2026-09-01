@@ -69,5 +69,20 @@ trap - EXIT INT TERM  # Case E re-sourced harness (re-armed teardown trap); drop
     && { echo "PASS: extract_status empty"; PASS=$((PASS+1)); } \
     || { echo "FAIL: extract_status empty got '$(extract_status '{}' 2>/dev/null)'"; FAIL=$((FAIL+1)); }
 rm -rf "$SMOKE_LOG_DIR"
+
+# Case F: is_exempt/is_protected classify routes for auth proof (pure)
+export FUSION_CLUSTER_TOKEN="t-ok" FUSION_MLX_API_KEY="k-ok"
+export FUSION_MULTI_NODE_DIR="$(cd ../fusion-multi-node && pwd)"
+export SMOKE_LOG_DIR="$(mktemp -d)"
+source "$HARNESS" --self-test-only >/dev/null 2>&1 || true
+trap - EXIT INT TERM
+is_exempt /api/health && { echo "PASS: /api/health exempt"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: /api/health should be exempt"; FAIL=$((FAIL+1)); }
+is_protected /api/nodes && { echo "PASS: /api/nodes protected"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: /api/nodes should be protected"; FAIL=$((FAIL+1)); }
+! is_exempt /api/nodes && { echo "PASS: /api/nodes not exempt"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: /api/nodes wrongly exempt"; FAIL=$((FAIL+1)); }
+trap - EXIT INT TERM
+rm -rf "$SMOKE_LOG_DIR"
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

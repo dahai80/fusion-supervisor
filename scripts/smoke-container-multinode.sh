@@ -68,6 +68,14 @@ probe_health() { # $1=port
 extract_status() { # $1=json
     python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" <<<"$1" 2>/dev/null || echo ""
 }
+# token-exempt routes (BearerAuthMiddleware whitelist) — design §4.1.
+is_exempt() { # $1=path
+    case "$1" in
+        /api/health|/health|/api/health/deep|/health/deep) return 0;;
+        *) return 1;;
+    esac
+}
+is_protected() { ! is_exempt "$1"; }
 # routed_inference: core proof — Master→Agent→host.docker.internal→MLX.
 SMOKE_MODEL="${SMOKE_MODEL:-mlx-community-Llama-3.2-1B-Instruct-4bit}"
 routed_inference() {
@@ -97,6 +105,19 @@ JSON
         esac
     done
     die "task $task_id timeout after ${i}s (last status: $st)"
+}
+auth_proof() {
+    log "STEP 5: auth handshake proof (cluster token, mTLS-off — lean)"
+    # exempt route: no token → 200 (proves middleware skips it, not that auth is off)
+    local rc_exempt; rc_exempt=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:11452/api/health)
+    [ "$rc_exempt" = "200" ] || die "exempt /api/health should be 200 without token, got $rc_exempt"
+    log "  /api/health no-token → $rc_exempt (exempt, as designed)"
+    # protected route: no token → 401 (proves BearerAuthMiddleware enforces)
+    local rc_denied; rc_denied=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:11452/api/nodes)
+    [ "$rc_denied" = "401" ] || die "protected /api/nodes should be 401 without token, got $rc_denied"
+    log "  /api/nodes no-token → $rc_denied (token enforced, fail-closed)"
+    # mTLS: documented, not run (lean = mTLS-off). design §5.1 step 5.
+    log "  mTLS path: opt-in, not exercised in lean smoke (see design §4.1 Layer 2)"
 }
 business_up() {
     log "STEP 3: business plane (overlay)"
@@ -146,5 +167,6 @@ precheck
 cluster_up
 business_up
 routed_inference
-log "smoke: inference proven — auth step added by Task 5"
-log "see $LOG"
+auth_proof
+log "===== SMOKE PASS: topology up + 1 routed inference + auth handshake ====="
+log "log: $LOG"
