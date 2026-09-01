@@ -1,0 +1,39 @@
+# smoke-only wrapper for fusion-model-hub — scopes deps to model-hub's own
+# pyproject (10 light, all prebuilt wheels) instead of the full monorepo
+# requirements.lock. Upstream fusion-model-hub/Dockerfile installs the full
+# monorepo lock (~200 pkgs incl. miniaudio sdist) which needs a C++ compiler
+# python:3.12-slim lacks — upstream build fails (issue filed).
+#
+# This wrapper avoids two upstream problems in-scope:
+#  1. full monorepo lock → scoped `pip install .` (pyproject deps only).
+#  2. apt-get curl layer stalls on the debian trixie Packages index over the
+#     flaky buildkit network path → drop apt entirely; the HEALTHCHECK uses
+#     python's stdlib urllib instead of curl.
+# Do NOT use for production — correct fixes are upstream (scoped lock or
+# build-essential in the upstream Dockerfile). Smoke runs `serve` which uses
+# init_db create_all on SQLite, so alembic is not needed at runtime (kept in
+# context, harmlessly uninstalled).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY fusion_model_hub/ fusion_model_hub/
+COPY alembic/ alembic/
+COPY alembic.ini ./
+
+RUN pip install --no-cache-dir .
+
+ENV FMH_DATA_DIR=/data
+ENV FMH_HOST=0.0.0.0
+ENV FMH_PORT=11444
+
+RUN mkdir -p /data
+
+EXPOSE 11444
+
+# urllib is stdlib — no curl needed, avoids the apt layer entirely.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; urllib.request.urlopen('http://localhost:11444/api/v1/system/health', timeout=4); sys.exit(0)" || exit 1
+
+CMD ["fusion-model-hub", "serve"]

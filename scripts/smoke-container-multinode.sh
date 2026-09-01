@@ -14,6 +14,7 @@ BASE_COMPOSE="$BASE_DIR/docker-compose.yml"
 OVERLAY="$(cd "$(dirname "$0")/.." && pwd)/docker-compose.business.yml"
 COMPOSE="docker compose -f $BASE_COMPOSE -f $OVERLAY"
 CLUSTER_ONLY="docker compose -f $BASE_COMPOSE"
+PREPARE_CTX="$(cd "$(dirname "$0")" && pwd)/prepare-build-ctx.sh"
 
 # precheck: env shape + MLX liveness. Pure-ish (no compose), testable with stub.
 # MLX /health is token-exempt (200) — /v1/models requires API key (401), wrong for liveness.
@@ -25,6 +26,12 @@ precheck() {
     log "STEP 1: precheck"
     [ -f "$BASE_COMPOSE" ] || die "base compose missing: $BASE_COMPOSE"
     [ -f "$OVERLAY" ] || die "overlay missing: $OVERLAY"
+    # business-plane Dockerfiles COPY root-relative paths — overlay build.context
+    # is a staged lean dir (.build-ctx/). Ensure it exists before compose build.
+    if [ -x "$PREPARE_CTX" ] && [ ! -d "$(cd "$(dirname "$0")/.." && pwd)/.build-ctx" ]; then
+        log "  staging build context (prepare-build-ctx.sh)"
+        "$PREPARE_CTX" >/dev/null 2>&1 || die "prepare-build-ctx.sh failed"
+    fi
     [ -n "${FUSION_CLUSTER_TOKEN:-}" ] || { log "FAIL: FUSION_CLUSTER_TOKEN empty — set in $BASE_DIR/.env"; return 1; }
     [ -n "${FUSION_MLX_API_KEY:-}" ] || { log "FAIL: FUSION_MLX_API_KEY empty — set in $BASE_DIR/.env (fusion-mlx api_key)"; return 1; }
     mlx_liveness || return 1

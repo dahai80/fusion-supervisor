@@ -42,6 +42,7 @@ export FUSION_CLUSTER_TOKEN="t-ok" FUSION_MLX_API_KEY="k-ok"
 export FUSION_MULTI_NODE_DIR="$(cd ../fusion-multi-node && pwd)"
 export SMOKE_LOG_DIR="$(mktemp -d)"
 source "$HARNESS" --self-test-only >/dev/null 2>&1 || true
+trap - EXIT INT TERM  # Case D re-sourced harness (re-armed teardown trap); drop it
 # model-hub :11444 → /api/v1/system/health ; cowork :11438 → /health
 [ "$(probe_path 11444)" = "/api/v1/system/health" ] && { echo "PASS: probe_path 11444"; PASS=$((PASS+1)); } \
     || { echo "FAIL: probe_path 11444 got '$(probe_path 11444)'"; FAIL=$((FAIL+1)); }

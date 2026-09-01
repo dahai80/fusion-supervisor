@@ -11,7 +11,15 @@ networks:
 
 services:
   fusion-model-hub:          # Dockerfile 已有 — health :11444/api/v1/system/health
-    build: ../fusion-model-hub
+    # Upstream Dockerfile installs the full monorepo requirements.lock, which
+    # includes sdist packages (miniaudio) needing a C++ compiler that
+    # python:3.12-slim lacks — upstream build fails (issue filed). Smoke uses a
+    # wrapper (scripts/Dockerfile.model-hub-smoke) that adds build-essential;
+    # otherwise identical. Context staged by prepare-build-ctx.sh (.build-ctx/).
+    build:
+      context: ../fusion-supervisor/.build-ctx
+      dockerfile: ../scripts/Dockerfile.model-hub-smoke
+    image: fusion-model-hub:smoke
     ports: ["11444:11444"]
     environment:
       FUSION_MLX_URL: "http://host.docker.internal:11434"
@@ -24,7 +32,13 @@ services:
     cpus: "2"
 
   fusion-cowork:             # Dockerfile 已有 — health :11438/health
-    build: ../fusion-cowork
+    # Dockerfile COPYs fusion-core/ + fusion-cowork/ from context root — staged
+    # into .build-ctx/ by scripts/prepare-build-ctx.sh (lean context). dockerfile
+    # stays in its source repo. Run prepare-build-ctx.sh before `docker compose build`.
+    build:
+      context: ../fusion-supervisor/.build-ctx
+      dockerfile: ../../fusion-cowork/Dockerfile
+    image: fusion-cowork:smoke
     ports: ["11438:11438"]
     environment:
       FUSION_MLX_URL: "http://host.docker.internal:11434"
