@@ -36,5 +36,20 @@ export FUSION_CLUSTER_TOKEN="t-ok"
 precheck >/dev/null 2>&1; assert_exit 1 "precheck missing MLX_API_KEY rejected"
 
 rm -rf "$SMOKE_LOG_DIR"
+
+# Case D: probe_health maps port→path correctly (pure, no network)
+export FUSION_CLUSTER_TOKEN="t-ok" FUSION_MLX_API_KEY="k-ok"
+export FUSION_MULTI_NODE_DIR="$(cd ../fusion-multi-node && pwd)"
+export SMOKE_LOG_DIR="$(mktemp -d)"
+source "$HARNESS" --self-test-only >/dev/null 2>&1 || true
+# model-hub :11444 → /api/v1/system/health ; cowork :11438 → /health
+[ "$(probe_path 11444)" = "/api/v1/system/health" ] && { echo "PASS: probe_path 11444"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: probe_path 11444 got '$(probe_path 11444)'"; FAIL=$((FAIL+1)); }
+[ "$(probe_path 11438)" = "/health" ] && { echo "PASS: probe_path 11438"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: probe_path 11438 got '$(probe_path 11438)'"; FAIL=$((FAIL+1)); }
+# unknown port → fallback /health
+[ "$(probe_path 99999)" = "/health" ] && { echo "PASS: probe_path fallback"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: probe_path fallback got '$(probe_path 99999)'"; FAIL=$((FAIL+1)); }
+rm -rf "$SMOKE_LOG_DIR"
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -41,6 +41,32 @@ wait_healthy() { # $1=compose-cmd $2=service $3=max-wait-s
     done
     die "$svc not healthy within ${max}s (last: $st)"
 }
+# port → health path. authoritative source: each service Dockerfile HEALTHCHECK.
+# unknown → /health fallback.
+probe_path() { # $1=port
+    case "$1" in
+        11444) echo "/api/v1/system/health" ;;  # fusion-model-hub
+        11436) echo "/health" ;;                # fusion-rag (Task 7)
+        11438) echo "/health" ;;                # fusion-cowork
+        11441|11449|11432|11451) echo "/health" ;;  # code/doc/gateway/artifacts (Task 7)
+        *) echo "/health" ;;
+    esac
+}
+probe_health() { # $1=port
+    local p="$1" path; path=$(probe_path "$p")
+    curl -sf "http://127.0.0.1:$p$path" >/dev/null 2>&1 \
+        || die "business service :$p$path unreachable"
+}
+business_up() {
+    log "STEP 3: business plane (overlay)"
+    $COMPOSE up -d fusion-model-hub fusion-cowork >/dev/null 2>&1 \
+        || die "business overlay up failed"
+    wait_healthy "$COMPOSE" fusion-model-hub 90
+    wait_healthy "$COMPOSE" fusion-cowork 90
+    probe_health 11444
+    probe_health 11438
+    log "  model-hub :11444 + cowork :11438 healthy"
+}
 # agent Docker healthcheck probes /api/health/deep which hardcodes localhost:11432
 # (upstream fusion-multi-node bug: ignores FUSION_MLX_URL, attr mismatch base_url vs _base_url).
 # Docker health stays unhealthy despite agent registered+online. Validate via master
@@ -77,5 +103,6 @@ if [ "${1:-}" = "--self-test-only" ]; then return 0 2>/dev/null || exit 0; fi
 # main (extended by Tasks 3-5)
 precheck
 cluster_up
-log "smoke: cluster plane up — remaining steps added by Tasks 3-5"
+business_up
+log "smoke: cluster + business planes up — inference/auth steps added by Tasks 4-5"
 log "see $LOG"
