@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-// 服务名 → ProbeSpec。路径由扫描 44 服务确探活路径得 (spec §4.3)。
+// 服务名 → ProbeSpec。路径由扫描 41 服务确探活路径得 (spec §4.3)。
 // 默认 HTTP GET /health; 例外覆盖。UDS 服务 (speech/memory) 用 uds。
 fn build_table() -> HashMap<&'static str, ProbeSpec> {
     let mut m = HashMap::new();
@@ -24,7 +24,7 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-k12-teacher", ProbeSpec::http(11448, "/health"));
     // speech = UDS daemon
     m.insert("fusion-speech", ProbeSpec::uds("/tmp/fusion-speech.sock"));
-    // 其余 44 服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
+    // 其余 41 服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
 
