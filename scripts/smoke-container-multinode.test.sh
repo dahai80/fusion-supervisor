@@ -52,5 +52,22 @@ trap - EXIT INT TERM  # Case D re-sourced harness (re-armed teardown trap); drop
 [ "$(probe_path 99999)" = "/health" ] && { echo "PASS: probe_path fallback"; PASS=$((PASS+1)); } \
     || { echo "FAIL: probe_path fallback got '$(probe_path 99999)'"; FAIL=$((FAIL+1)); }
 rm -rf "$SMOKE_LOG_DIR"
+
+# Case E: extract_status parses poll JSON correctly (pure, no network)
+export FUSION_CLUSTER_TOKEN="t-ok" FUSION_MLX_API_KEY="k-ok"
+export FUSION_MULTI_NODE_DIR="$(cd ../fusion-multi-node && pwd)"
+export SMOKE_LOG_DIR="$(mktemp -d)"
+source "$HARNESS" --self-test-only >/dev/null 2>&1 || true
+trap - EXIT INT TERM  # Case E re-sourced harness (re-armed teardown trap); drop it
+[ "$(extract_status '{"status":"completed","result":{"text":"hi"}}')" = "completed" ] \
+    && { echo "PASS: extract_status completed"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: extract_status completed"; FAIL=$((FAIL+1)); }
+[ "$(extract_status '{"status":"failed","error":"oom"}')" = "failed" ] \
+    && { echo "PASS: extract_status failed"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: extract_status failed"; FAIL=$((FAIL+1)); }
+[ "$(extract_status '{}' 2>/dev/null)" = "" ] \
+    && { echo "PASS: extract_status empty"; PASS=$((PASS+1)); } \
+    || { echo "FAIL: extract_status empty got '$(extract_status '{}' 2>/dev/null)'"; FAIL=$((FAIL+1)); }
+rm -rf "$SMOKE_LOG_DIR"
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

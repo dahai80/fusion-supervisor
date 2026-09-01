@@ -64,6 +64,40 @@ probe_health() { # $1=port
     curl -sf "http://127.0.0.1:$p$path" >/dev/null 2>&1 \
         || die "business service :$p$path unreachable"
 }
+# extract .status from poll JSON (python3 for robust parse; jq optional).
+extract_status() { # $1=json
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" <<<"$1" 2>/dev/null || echo ""
+}
+# routed_inference: core proof — Master→Agent→host.docker.internal→MLX.
+SMOKE_MODEL="${SMOKE_MODEL:-mlx-community-Llama-3.2-1B-Instruct-4bit}"
+routed_inference() {
+    log "STEP 4: routed inference (core proof) — model=$SMOKE_MODEL"
+    local body; body=$(cat <<JSON
+{"name":"smoke-inference","model_name":"$SMOKE_MODEL","task_type":"inference","prompt":"Say hello in one word.","max_tokens":16}
+JSON
+)
+    local resp rc task_id
+    resp=$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $FUSION_CLUSTER_TOKEN" \
+        -H "Content-Type: application/json" -d "$body" http://127.0.0.1:11452/api/tasks/submit)
+    rc=$(echo "$resp" | tail -1)
+    body=$(echo "$resp" | sed '$d')
+    [ "$rc" = "200" ] || [ "$rc" = "202" ] || die "submit failed (http $rc): $body"
+    task_id=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('task_id',''))" <<<"$body" 2>/dev/null)
+    [ -n "$task_id" ] || die "submit returned no task_id: $body"
+    log "  submitted task_id=$task_id (http $rc)"
+    # poll until completed/failed or timeout (lean: single 1B inference, 120s budget)
+    local i=0 st=""
+    while [ $i -lt 120 ]; do
+        sleep 2; i=$((i+2))
+        st=$(extract_status "$(curl -s -H "Authorization: Bearer $FUSION_CLUSTER_TOKEN" \
+            http://127.0.0.1:11452/api/tasks/$task_id)")
+        case "$st" in
+            completed) log "  task $task_id COMPLETED (${i}s) — full chain proven"; return 0;;
+            failed) die "task $task_id FAILED — check agent log + MLX reachability";;
+        esac
+    done
+    die "task $task_id timeout after ${i}s (last status: $st)"
+}
 business_up() {
     log "STEP 3: business plane (overlay)"
     $COMPOSE up -d fusion-model-hub fusion-cowork >/dev/null 2>&1 \
@@ -111,5 +145,6 @@ if [ "${1:-}" = "--self-test-only" ]; then return 0 2>/dev/null || exit 0; fi
 precheck
 cluster_up
 business_up
-log "smoke: cluster + business planes up — inference/auth steps added by Tasks 4-5"
+routed_inference
+log "smoke: inference proven — auth step added by Task 5"
 log "see $LOG"
