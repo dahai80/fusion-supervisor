@@ -88,3 +88,82 @@ cargo fmt --all --check
 ## Non-goals (v1)
 
 Prometheus aggregation (v2), cross-node cluster orchestration, rewriting start.sh, Web UI, launchd self-guard (v1.1), config hot-reload, multi-user.
+
+## Container Multi-Node Deploy
+
+Containerized multi-node commercial-deployment topology — extends
+`architecture/fusion-deploy-container-multinode-0901.md`. Layered Docker
+Compose: base cluster plane (`fusion-multi-node/docker-compose.yml`, network
+pin #58 landed) + business-plane overlay (`docker-compose.business.yml` here).
+Merge: `docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml up -d`.
+
+**What's containerized:** cluster plane (Master + Agent) + HTTP business plane
+(model-hub, cowork now; gateway/rag/artifacts/code/doc gated on upstream
+Dockerfile PRs). **What stays bare-metal:** MLX (`localhost:11434`, Metal /
+unified memory), UDS guardian plane (memory/speech — UDS doesn't cross the
+container boundary).
+
+### Prerequisites
+
+1. MLX running bare-metal: `~/claude-home/fusion-mlx/start.sh start`
+2. Cluster token + MLX API key exported inline (the base compose is fail-closed
+   `${FUSION_CLUSTER_TOKEN:?}` / `${FUSION_MLX_API_KEY:?}` — no `.env` is
+   created in `fusion-multi-node`):
+   ```bash
+   export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
+   export FUSION_MLX_API_KEY=fg-admin-key   # matches fusion-mlx api_key
+   ```
+3. Smoke model cached: `mlx-community-Llama-3.2-1B-Instruct-4bit`
+   (download via `HF_MIRROR=https://hf-mirror.com` if missing), available in MLX.
+4. Docker Desktop running (v29.4+).
+5. Stop any bare-metal `fusion-multi-node` master first (it holds port 11452):
+   `cd fusion-multi-node && bash start.sh stop`.
+
+### Build the smoke images
+
+The overlay Dockerfiles COPY monorepo-root-relative paths (requirements.lock,
+`fusion-core/`, `fusion-cowork/`), so the build context must be the monorepo
+root — but that is 200G+ with no root `.dockerignore`, making a root-context
+build infeasible. The harness stages a lean build context instead:
+
+```bash
+bash scripts/prepare-build-ctx.sh   # idempotent: populates .build-ctx/ (git-ignored)
+```
+
+Then the harness builds `fusion-cowork:smoke` (real upstream Dockerfile) and
+`fusion-model-hub:smoke` (scoped wrapper `scripts/Dockerfile.model-hub-smoke`
+that installs model-hub's own pyproject deps instead of the full monorepo
+lock — see upstream issue dahai80/fusion-models-hub#52).
+
+### Run smoke validation
+
+```bash
+cd fusion-supervisor
+export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
+export FUSION_MLX_API_KEY=fg-admin-key
+export FUSION_MULTI_NODE_DIR=$(cd ../fusion-multi-node && pwd)
+export SMOKE_MODEL=mlx-community-Llama-3.2-1B-Instruct-4bit
+bash scripts/smoke-container-multinode.sh
+```
+
+Runs 5 steps (design §5.1): precheck → cluster up → business up → routed
+inference (Master→Agent→`host.docker.internal`→MLX) → auth handshake. Logs to
+`/tmp/fusion-smoke.*/smoke.log`. Pass banner = `SMOKE PASS`. Teardown is
+automatic via a `trap` (both planes `down --remove-orphans`).
+
+### Bring up topology without smoke
+
+```bash
+cd fusion-multi-node
+docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml up -d
+```
+
+Teardown: `docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml down --remove-orphans`
+
+### Cleanup (process data)
+
+Smoke harness auto-teardowns via `trap` — no persistent test data is kept,
+only the `/tmp/fusion-smoke.*/smoke.log` run log remains (per CLAUDE.md:
+keep only final output + logs). The `fusion-cluster` Docker network may
+persist (harmless, reused across runs). For manual teardown + cert cleanup
+(mTLS path): `docker compose ... down` + `rm -rf fusion-multi-node/tls/`.

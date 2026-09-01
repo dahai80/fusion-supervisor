@@ -35,7 +35,15 @@ precheck() {
     [ -n "${FUSION_CLUSTER_TOKEN:-}" ] || { log "FAIL: FUSION_CLUSTER_TOKEN empty — set in $BASE_DIR/.env"; return 1; }
     [ -n "${FUSION_MLX_API_KEY:-}" ] || { log "FAIL: FUSION_MLX_API_KEY empty — set in $BASE_DIR/.env (fusion-mlx api_key)"; return 1; }
     mlx_liveness || return 1
-    log "  token set, MLX live, compose files present"
+    # port 11452 collision: a bare-metal master (e.g. fusion-sv-managed
+    # fusion-multi-node) on 11452 hijacks host curl away from the container
+    # master and rate-limits agent registration (请求过于频繁). If anything
+    # holds 11452 before compose up, fail loudly — stop it first
+    # (fusion-sv down fusion-multi-node, or cd fusion-multi-node && bash start.sh stop).
+    if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:11452 -sTCP:LISTEN >/dev/null 2>&1; then
+        die "port 11452 already in use — stop the bare-metal master first: fusion-sv down fusion-multi-node (or fusion-multi-node/start.sh stop)"
+    fi
+    log "  token set, MLX live, compose files present, 11452 free"
 }
 
 # cluster_up: base compose only — Master healthy + Agent online.

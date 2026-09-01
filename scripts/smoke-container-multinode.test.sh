@@ -82,7 +82,6 @@ is_protected /api/nodes && { echo "PASS: /api/nodes protected"; PASS=$((PASS+1))
     || { echo "FAIL: /api/nodes should be protected"; FAIL=$((FAIL+1)); }
 ! is_exempt /api/nodes && { echo "PASS: /api/nodes not exempt"; PASS=$((PASS+1)); } \
     || { echo "FAIL: /api/nodes wrongly exempt"; FAIL=$((FAIL+1)); }
-trap - EXIT INT TERM
 rm -rf "$SMOKE_LOG_DIR"
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
