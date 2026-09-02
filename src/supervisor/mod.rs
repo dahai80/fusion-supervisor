@@ -335,17 +335,25 @@ impl SupervisorCore {
         let live: Vec<String> = cs.iter().map(|c| c.service.clone()).collect();
         for c in &cs {
             let st = c.supervisor_state();
+            // 每容器每 tick 写健康行 plane=compose (issue #7: 容器进 history.db)
+            if let Err(e) = self
+                .store
+                .record_health(&c.service, st, 0, now_ts, "compose")
+            {
+                tracing::warn!(svc = %c.service, err = %e, "compose health write fail (非致命)");
+            }
             let decisions = self
                 .compose_tracker
                 .observe(&c.service, &c.state, st, now_ts);
             for d in decisions {
-                let (kind, detail) = match d {
+                let (kind, detail, event_kind) = match d {
                     crate::compose_tracker::ComposeAlert::Down => (
                         crate::alert::AlertKind::ServiceDown,
                         format!(
                             "compose container {} state={} health={}",
                             c.name, c.state, c.health
                         ),
+                        "ServiceDown",
                     ),
                     crate::compose_tracker::ComposeAlert::StateChange => (
                         crate::alert::AlertKind::ContainerStateChange,
@@ -353,6 +361,7 @@ impl SupervisorCore {
                             "compose container {} state changed to {} health={}",
                             c.name, c.state, c.health
                         ),
+                        "ContainerStateChange",
                     ),
                     crate::compose_tracker::ComposeAlert::CrashLoop => (
                         crate::alert::AlertKind::ContainerCrashLoop,
@@ -360,13 +369,22 @@ impl SupervisorCore {
                             "compose container {} crash-loop (consecutive failures >= threshold)",
                             c.name
                         ),
+                        "ContainerCrashLoop",
                     ),
                     crate::compose_tracker::ComposeAlert::Back => (
                         crate::alert::AlertKind::ServiceBack,
                         format!("compose container {} recovered", c.name),
+                        "ServiceBack",
                     ),
                 };
                 tracing::info!(svc = %c.service, kind = kind.label(), "compose tick 告警决策");
+                // 持久化事件行 plane=compose (issue #7)
+                if let Err(e) = self
+                    .store
+                    .record_event(&c.service, event_kind, &detail, now_ts, "compose")
+                {
+                    tracing::warn!(svc = %c.service, err = %e, "compose event write fail (非致命)");
+                }
                 let _ = self
                     .alerter
                     .alert(crate::alert::Alert {
@@ -1164,5 +1182,58 @@ mod tests {
         let rec = core.compose_tracker.record("redis").unwrap();
         assert!(rec.escalated, "达阈值应升级标记");
         assert_eq!(rec.fail_count, 5);
+    }
+
+    // ---- compose 容器持久化进 history.db (issue #7) ----
+
+    // 容器 exited → tick_compose 应写 event 行 plane=compose, kind=ServiceDown
+    #[tokio::test]
+    async fn test_tick_compose_persists_down_event() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "exited", "", 6379)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        let ev = core.store.recent_events("redis", 10).unwrap();
+        assert!(!ev.is_empty(), "exited 容器应写 event 行");
+        assert_eq!(ev[0].kind, "ServiceDown");
+        assert_eq!(ev[0].plane, "compose");
+        // 健康行也应存在 plane=compose
+        let h = core.store.recent_health("redis", 10).unwrap();
+        assert!(!h.is_empty(), "应写 compose 健康行");
+        assert_eq!(h[0].plane, "compose");
+    }
+
+    // 容器 exited→running → tick_compose 应写 Back 事件 plane=compose
+    #[tokio::test]
+    async fn test_tick_compose_persists_back_event() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "exited", "", 6379)]);
+        let containers = fake.containers.clone();
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        // 恢复
+        *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
+        core.tick_all(1010).await;
+        let ev = core.store.recent_events("redis", 10).unwrap();
+        let has_back = ev
+            .iter()
+            .any(|e| e.kind == "ServiceBack" && e.plane == "compose");
+        assert!(has_back, "恢复应写 ServiceBack 事件 plane=compose");
     }
 }
