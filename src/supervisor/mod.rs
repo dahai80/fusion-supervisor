@@ -4,6 +4,7 @@ pub mod runner;
 use crate::alert::Alerter;
 use crate::compose::{ComposeBackend, DockerCompose};
 use crate::config::Config;
+use crate::dep_map;
 use crate::manifest::{Layer, ServiceDef, ServiceManifest};
 use crate::probe::{ProbeResult, ProbeSpec, probe};
 use crate::probe_map;
@@ -159,6 +160,14 @@ impl SupervisorCore {
         for (_layer, batch) in by_layer {
             let mut handles = Vec::new();
             for d in batch {
+                // 依赖门: compose 启用时, 该 native 服务依赖的 sidecar 容器须 Healthy 才起。
+                // 不靠 layer 隐式顺序; 显式校验, gate 未就绪跳过启动 (不标 Failed, 依赖问题非服务崩溃)。
+                if !self.dep_gate_ok(&d.name).await {
+                    if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == d.name) {
+                        r.state = runner::State::Stopped;
+                    }
+                    continue;
+                }
                 let sem = sem.clone();
                 let start_fn = self.start_fn.clone();
                 let probe_fn = self.probe_fn.clone();
@@ -364,6 +373,57 @@ impl SupervisorCore {
     // compose 是否启用 (测试 + cli 用)
     pub fn compose_enabled(&self) -> bool {
         self.compose.is_some()
+    }
+
+    // 依赖门: compose 启用时, 该 native 服务依赖的 sidecar 容器须全部 Healthy。
+    // compose 未启用 → 无门 (无依赖可等, 保留单节点开发行为)。
+    // 服务无依赖 (dep_map 未列) → 通行。
+    // gate 未就绪 → 返回 false (调用方跳过启动 + 记录, 不标 Failed)。
+    async fn dep_gate_ok(&mut self, name: &str) -> bool {
+        let deps = dep_map::deps_for(name);
+        if deps.is_empty() {
+            return true;
+        }
+        let Some(cb) = &self.compose else {
+            return true; // compose 未启用, 无门
+        };
+        let cs = match cb.ps() {
+            Ok(cs) => cs,
+            Err(e) => {
+                tracing::warn!(svc = name, err = %e, "dep_gate ps 失败, 放行 (避免误阻断)");
+                return true;
+            }
+        };
+        for dep in deps {
+            let found = cs.iter().find(|c| c.service == *dep);
+            match found {
+                Some(c) if c.supervisor_state() == "Healthy" => {
+                    tracing::debug!(svc = name, dep, "dep_gate 通过");
+                }
+                _ => {
+                    tracing::warn!(
+                        svc = name,
+                        dep,
+                        "dep_gate 未就绪, 跳过启动 (依赖非 Healthy)"
+                    );
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let _ = self
+                        .alerter
+                        .alert(crate::alert::Alert {
+                            service: name.to_string(),
+                            kind: crate::alert::AlertKind::ServiceDown,
+                            detail: format!("blocked on sidecar {dep} not healthy (dep_gate)"),
+                            ts,
+                        })
+                        .await;
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -659,6 +719,8 @@ mod tests {
         let native_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let no_p = native_order.clone();
         let fake = Box::new(FakeCompose::new());
+        // rag 依赖 qdrant (dep_map), 预置 qdrant Healthy 满足 dep-gate
+        fake.set_containers(vec![mk_container("qdrant", "running", "healthy", 6333)]);
         let calls_ref = fake.calls.clone();
         let mut core = SupervisorCore::new_with_fns_and_compose(
             defs,
@@ -842,5 +904,115 @@ mod tests {
             |_, _| Ok(()),
         );
         assert!(core2.compose_logs("postgres").is_none());
+    }
+
+    // ---- dep-gate (issue #5) 集成测试 ----
+
+    // dep_gate: compose 启用且依赖容器 Healthy → native 服务正常起
+    #[tokio::test]
+    async fn test_up_native_gates_on_sidecar_healthy() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::Platform, 11436), // 依赖 qdrant
+        ];
+        let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ns_p = native_started.clone();
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("qdrant", "running", "healthy", 6333)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, _cmd| {
+                ns_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
+            Some(fake),
+        );
+        core.up_native().await.unwrap();
+        let started = native_started.lock().unwrap();
+        assert!(
+            started.contains(&"fusion-rag".to_string()),
+            "依赖 qdrant Healthy 时 rag 应启动"
+        );
+    }
+
+    // dep_gate: 依赖容器未就绪 → 跳过该 native 服务启动 (标 Stopped, 不 Failed)
+    #[tokio::test]
+    async fn test_up_native_gate_skips_when_dep_unhealthy() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::Platform, 11436), // 依赖 qdrant
+        ];
+        let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ns_p = native_started.clone();
+        let fake = Box::new(FakeCompose::new());
+        // qdrant exited (非 Healthy) → gate 未就绪
+        fake.set_containers(vec![mk_container("qdrant", "exited", "", 0)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, _cmd| {
+                ns_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
+            Some(fake),
+        );
+        core.up_native().await.unwrap();
+        let started = native_started.lock().unwrap();
+        assert!(
+            !started.contains(&"fusion-rag".to_string()),
+            "qdrant 非 Healthy 时 rag 应被 gate 跳过, 不启动"
+        );
+        // rag runner 应标 Stopped (非 Failed, 依赖问题非崩溃)
+        let rag = core
+            .runners
+            .iter()
+            .find(|r| r.def.name == "fusion-rag")
+            .unwrap();
+        assert!(
+            matches!(rag.state, runner::State::Stopped),
+            "gate 跳过应标 Stopped, 实际: {:?}",
+            rag.state
+        );
+        // mlx 无依赖 → 照常起
+        assert!(
+            started.contains(&"fusion-mlx".to_string()),
+            "无依赖服务不受 gate 影响"
+        );
+    }
+
+    // dep_gate: compose 未启用 → 无门, 所有 native 正常起
+    #[tokio::test]
+    async fn test_up_native_no_gate_when_compose_disabled() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::Platform, 11436), // 若有门会被拦 (无 qdrant 容器)
+        ];
+        let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ns_p = native_started.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, _cmd| {
+                ns_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
+        );
+        assert!(!core.compose_enabled());
+        core.up_native().await.unwrap();
+        let started = native_started.lock().unwrap();
+        assert!(
+            started.contains(&"fusion-rag".to_string()),
+            "compose 未启用时无 dep-gate, rag 应正常启动"
+        );
     }
 }
