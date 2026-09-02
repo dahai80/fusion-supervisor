@@ -84,7 +84,7 @@ impl ServiceRunner {
             ProbeResult::Healthy { latency_ms } => ("healthy", *latency_ms),
             ProbeResult::Unhealthy { .. } => ("unhealthy", 0),
         };
-        if let Err(e) = store.record_health(&self.def.name, status, latency, now_ts) {
+        if let Err(e) = store.record_health(&self.def.name, status, latency, now_ts, "native") {
             tracing::warn!(svc = %self.def.name, err = %e, "health write fail (非致命, 继续监督)");
         }
     }
