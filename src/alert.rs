@@ -8,6 +8,10 @@ pub enum AlertKind {
     ServiceBack,
     RestartFailed,
     RestartCapHit,
+    // compose 容器失败期间 docker state 变化 (新事件, 不去抖)
+    ContainerStateChange,
+    // compose 容器连续失败达阈值升级 (crash-loop, 不去抖)
+    ContainerCrashLoop,
 }
 
 impl AlertKind {
@@ -17,6 +21,8 @@ impl AlertKind {
             AlertKind::ServiceBack => "ServiceBack",
             AlertKind::RestartFailed => "RestartFailed",
             AlertKind::RestartCapHit => "RestartCapHit",
+            AlertKind::ContainerStateChange => "ContainerStateChange",
+            AlertKind::ContainerCrashLoop => "ContainerCrashLoop",
         }
     }
 }
@@ -67,12 +73,23 @@ impl Alerter {
             tracing::debug!(svc = %alert.service, kind = alert.kind.label(), "alert dedup skip");
             return Ok(());
         }
-        tracing::warn!(
-            svc = %alert.service,
-            kind = alert.kind.label(),
-            detail = %alert.detail,
-            "ALERT"
-        );
+        // CrashLoop 升级用 ERROR, 其余 WARN (便于运维筛 crash-loop)
+        let is_escalation = matches!(alert.kind, AlertKind::ContainerCrashLoop);
+        if is_escalation {
+            tracing::error!(
+                svc = %alert.service,
+                kind = alert.kind.label(),
+                detail = %alert.detail,
+                "ALERT (crash-loop escalation)"
+            );
+        } else {
+            tracing::warn!(
+                svc = %alert.service,
+                kind = alert.kind.label(),
+                detail = %alert.detail,
+                "ALERT"
+            );
+        }
         self.record_emitted(&alert.service, &alert.kind, alert.ts);
         if !self.webhook_url.is_empty()
             && let Err(e) = self.send_webhook(&alert).await
@@ -154,5 +171,10 @@ mod tests {
         assert_eq!(AlertKind::ServiceBack.label(), "ServiceBack");
         assert_eq!(AlertKind::RestartFailed.label(), "RestartFailed");
         assert_eq!(AlertKind::RestartCapHit.label(), "RestartCapHit");
+        assert_eq!(
+            AlertKind::ContainerStateChange.label(),
+            "ContainerStateChange"
+        );
+        assert_eq!(AlertKind::ContainerCrashLoop.label(), "ContainerCrashLoop");
     }
 }

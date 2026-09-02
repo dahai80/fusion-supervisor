@@ -1,6 +1,7 @@
 pub mod alert;
 pub mod cli;
 pub mod compose;
+pub mod compose_tracker;
 pub mod config;
 pub mod manifest;
 pub mod probe;
