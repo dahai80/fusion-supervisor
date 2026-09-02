@@ -2,6 +2,7 @@ pub mod alert;
 pub mod cli;
 pub mod compose;
 pub mod config;
+pub mod dep_map;
 pub mod manifest;
 pub mod probe;
 pub mod probe_map;
