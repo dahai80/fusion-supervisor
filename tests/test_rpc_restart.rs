@@ -50,7 +50,7 @@ async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
         vec![def("fusion-rag", 11436)],
         cfg(),
         |_| ProbeResult::Healthy { latency_ms: 1 },
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
     // 预置: Unhealthy + crash_count=2, restart 应复位 policy 并起重启
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
@@ -94,7 +94,7 @@ async fn test_rpc_restart_unknown_service_returns_32602() {
         vec![def("fusion-rag", 11436)],
         cfg(),
         |_| ProbeResult::Healthy { latency_ms: 1 },
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     let sock = format!("/tmp/fusion-sv-restart-unknown-{}.sock", std::process::id());
@@ -123,7 +123,7 @@ async fn test_rpc_restart_empty_or_missing_service_returns_32602() {
         vec![def("fusion-rag", 11436)],
         cfg(),
         |_| ProbeResult::Healthy { latency_ms: 1 },
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     let sock = format!("/tmp/fusion-sv-restart-empty-{}.sock", std::process::id());

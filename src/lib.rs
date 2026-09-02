@@ -3,6 +3,7 @@ pub mod cli;
 pub mod compose;
 pub mod compose_tracker;
 pub mod config;
+pub mod env_map;
 pub mod manifest;
 pub mod probe;
 pub mod probe_map;
