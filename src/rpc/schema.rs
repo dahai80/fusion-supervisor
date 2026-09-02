@@ -35,6 +35,7 @@ pub enum Method {
     Restart,
     Top,
     Ping,
+    Logs,
     Shutdown,
 }
 
@@ -46,6 +47,7 @@ pub fn parse_method(s: &str) -> Option<Method> {
         "restart" => Some(Method::Restart),
         "top" => Some(Method::Top),
         "ping" => Some(Method::Ping),
+        "logs" => Some(Method::Logs),
         "shutdown" => Some(Method::Shutdown),
         _ => None,
     }

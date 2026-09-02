@@ -17,14 +17,16 @@ cargo build --release   # binary: target/release/fusion-sv
 
 ```bash
 fusion-sv daemon          # start supervisor daemon (long-lived)
-fusion-sv status          # list all 41 services + state (talks to daemon over UDS)
+fusion-sv status          # list all services + containers + state (native + compose planes)
 fusion-sv top             # live status table, 1s refresh
-fusion-sv up              # start all services (layer order: core→platform→app→domain→cluster)
-fusion-sv down            # stop all (reverse layer order)
-fusion-sv restart <svc>   # restart one service (resets Failed state)
-fusion-sv logs <svc>      # tail last 50 lines of per-service start.sh log
+fusion-sv up              # start all (compose sidecar → native layer order → compose business)
+fusion-sv down            # stop all (compose down → native reverse layer order)
+fusion-sv restart <svc>   # restart one native service (resets Failed state)
+fusion-sv logs <svc>      # tail last 50 lines (compose container logs OR native start.sh log)
 fusion-sv ping            # ping the daemon (alive check, prints pong)
 ```
+
+When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 41 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
 ## How it works
 
@@ -35,6 +37,7 @@ fusion-sv ping            # ping the daemon (alive check, prints pong)
 - **Anti-restart-storm:** a 404/405 (`BadPath`) = probe path wrong, NOT a crash signal → never restarts, only alerts. Only `ConnectionRefused`/`Timeout` trigger restart. The crash-window cap is the final backstop.
 - **History:** SQLite (`~/.fusion-sv/history.db`, WAL mode), `health_check` + `event` tables, 7-day retention.
 - **Alerts:** `ServiceDown` (deduped 5min/service), `ServiceBack`, `RestartFailed`, `RestartCapHit` → log + optional webhook.
+- **Compose plane (optional):** `docker compose` wrapped behind `ComposeBackend` trait. `up` = sidecar (`--wait`) → native (layer-ordered) → business (`--wait`); `down` = compose `down --remove-orphans` → native reverse. `status` merges native + container rows (tagged by `plane`); `tick` alerts on exited/unhealthy containers (monitored, not crash-restarted — Docker restart policy owns that). Fail-closed on `FUSION_PG_PASSWORD`/`FUSION_MLX_API_KEY`. See `src/compose.rs`.
 
 ## Config
 
@@ -53,6 +56,13 @@ backoff_max_sec = 30
 alert_url = ""        # empty = log only
 alert_dedup_sec = 300
 registry_path = "architecture/port-registry.yaml"
+
+# Compose plane orchestration (disabled by default — native-only)
+[compose]
+enabled = false                    # set true to orchestrate container planes too
+sidecar_file = "docker-compose.sidecar.yml"
+business_file = "docker-compose.business.yml"
+env_file = ".env"                  # fail-closed: needs FUSION_PG_PASSWORD + FUSION_MLX_API_KEY
 ```
 
 Optional auth: set `FUSION_SV_TOKEN` env on daemon; CLI/clients pass `params.token`.
