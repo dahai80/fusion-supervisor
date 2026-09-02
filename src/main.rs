@@ -35,6 +35,14 @@ enum Commands {
     Top,
     /// Ping the daemon (alive check)
     Ping,
+    /// Drain traffic from a service (or all if no service given) — issue #9
+    Drain {
+        service: Option<String>,
+    },
+    /// Zero-downtime rollout a service: drain→stop→start→prewarm — issue #9
+    Rollout {
+        service: String,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Restart { service }) => cli_call_param(cfg, "restart", service).await,
         Some(Commands::Logs { service }) => cli_logs(cfg, service).await,
         Some(Commands::Ping) => cli_ping(cfg).await,
+        Some(Commands::Drain { service }) => match service {
+            Some(s) => cli_call_param(cfg, "drain", s).await,
+            None => cli_call(cfg, "drain").await,
+        },
+        Some(Commands::Rollout { service }) => cli_call_param(cfg, "rollout", service).await,
     }
 }
 
