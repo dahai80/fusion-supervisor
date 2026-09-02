@@ -12,7 +12,7 @@ It never rewrites start.sh scripts — it orchestrates them (`bash <repo>/start.
 
 ```bash
 cargo build --release              # binary: target/release/fusion-sv
-cargo test --all-targets           # ~40 unit + 9 integration (57 test fns total)
+cargo test --all-targets           # ~50 unit + 11 integration (88 test fns total)
 cargo test <name> -- --nocapture   # single test by name substring
 cargo clippy --all-targets -- -D warnings   # warnings = errors
 cargo fmt --all --check
@@ -60,7 +60,8 @@ The tick loop (`src/main.rs::run_daemon`) **never holds the `SupervisorCore` Mut
 - `src/store.rs` — `HistoryStore`: SQLite wrapped in `std::sync::Mutex` (Connection is `Send` but `!Sync`; the Mutex makes `HistoryStore: Sync` so tick's `&self` across `.await` compiles). Tables `health_check` + `event`, WAL mode
 - `src/probe.rs` — three probe kinds (HTTP / UDS / TCP), 2s timeout. `classify_status`: 2xx=Healthy, 404/405=`BadPath`, else `BadStatus`
 - `src/probe_map.rs` — service-name → `ProbeSpec` table (known HTTP paths + UDS services); unknown services fall back to TCP port-probe. Also `restart_cmd_for` (`fusion-store` has no `restart` → `stop+start`) and `start_sh_path` (resolves repo dir, honors `FUSION_ROOT`)
-- `src/alert.rs` — `Alerter`: `ServiceDown` deduped 5min/service; other kinds always emit. Sink = tracing WARN + optional webhook (3-retry, fails back to log only)
+- `src/alert.rs` — `Alerter`: `ServiceDown` deduped 5min/service; other kinds always emit. `AlertKind::ContainerStateChange` + `ContainerCrashLoop` (issue #6, compose-plane) always emit; `ContainerCrashLoop` logs at ERROR. Sink = tracing WARN + optional webhook (3-retry, fails back to log only)
+- `src/compose_tracker.rs` — pure-logic compose container alert throttle (issue #6): per-container `ContainerRecord` + `observe()` returning `ComposeAlert` decisions (Down/StateChange/CrashLoop/Back); dedup window + consecutive-failure escalation latch. Injected `u64` ts, deterministic tests
 - `src/supervisor/mod.rs` — `SupervisorCore`: `up_all`/`down_all` (layered, per-layer concurrency cap via `Semaphore`), `tick_all`, `poll_interval` (switches to `poll_unhealthy_sec` when any runner is down). Production `new()` uses real `bash start.sh` + real probe; `new_with_fns()` injects fakes for tests
 - `src/supervisor/runner.rs` — `ServiceRunner` + state machine `Stopped→Starting→Healthy→(Unhealthy)→Restarting→Healthy|Failed`
 - `src/supervisor/policy.rs` — `RestartPolicy`: 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Pure logic with injected `u64` unix-sec timestamps for deterministic tests
@@ -116,7 +117,8 @@ The supervisor itself orchestrates BOTH the 41 native services AND the container
 - **down_all order**: `compose down --remove-orphans` (tolerates non-zero) → `down_native()` (reverse layer order).
 - **status_all**: native `StatusEntry` rows (plane="native") merged with compose `ps` container rows (plane="compose"). `StatusEntry.state` is now a `String` (was `runner::State`) to hold container states; `StatusEntry.plane` added.
 - **Container state mapping** (`ContainerStatus::supervisor_state`): running+healthy→Healthy, exited/dead→Failed, restarting→Restarting, running+unhealthy→Failed, running+no-healthcheck→Healthy, else→Starting.
-- **tick_compose**: per-tick `ps()` → for each Failed container emit `ServiceDown` alert with container name/state/health. `poll_interval` returns `poll_unhealthy_sec` if any container is Failed. Containers are NOT crash-restarted (compose `--wait` + Docker restart policy own that); supervisor only monitors + alerts.
+- **tick_compose**: per-tick `ps()` → each container observed by `compose_tracker` (`src/compose_tracker.rs`, issue #6) which returns alert decisions; `tick_compose` emits an `Alert` per decision. `poll_interval` returns `poll_unhealthy_sec` if any container is Failed. Containers are NOT crash-restarted (compose `--wait` + Docker restart policy own that); supervisor only monitors + alerts.
+- **compose_tracker (issue #6, alert-side backoff)**: pure-logic throttle (injected `u64` ts, same deterministic-test pattern as `policy.rs`) preventing flapping containers from flooding alerts every tick. Per-container `ContainerRecord` tracks `state`/`raw_state`/`last_alert_ts`/`fail_count`/`escalated`. `observe()` returns 0..2 `ComposeAlert` decisions: `Down` (first failure OR dedup window elapsed OR docker `state` changed), `StateChange` (new docker state during failure), `CrashLoop` (consecutive failures ≥ `container_crash_escalation` config, default 5, emitted once then latched until recovery), `Back` (Failed→Healthy recovery). Alert service key is `compose:{service}` (avoids collision with native service names). `AlertKind::ContainerStateChange` + `ContainerCrashLoop` are NOT deduped (always emit); `ContainerCrashLoop` logs at ERROR level (escalation). `reap(live)` drops snapshots for vanished containers. Config field `container_crash_escalation` (serde default 5).
 - **logs dispatch**: RPC `logs` method tries `compose_logs(service)` first (returns `{lines, plane:"compose"}` if service in compose ps), else native tail -n 50 of `~/.fusion-sv/logs/<dir>.log` (plane:"native").
 - **Fail-closed**: `check_env()` refuses `up_sidecar` if `FUSION_PG_PASSWORD`/`FUSION_MLX_API_KEY` missing from both env vars and env_file — points to `.env.example`.
 - **serde**: docker compose v2 `ps --format json` uses PascalCase fields (`Name/Service/State/Health/Publishers`) and `URL` (all-caps) on publishers — `#[serde(rename_all = "PascalCase")]` + `#[serde(alias = "URL")]` handle both. `normalize_publisher` converts `0.0.0.0:5432:5432/tcp` → `0.0.0.0:5432->5432/tcp`.
