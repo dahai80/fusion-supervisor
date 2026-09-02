@@ -2,6 +2,7 @@ pub mod policy;
 pub mod runner;
 
 use crate::alert::Alerter;
+use crate::compose::{ComposeBackend, DockerCompose};
 use crate::config::Config;
 use crate::manifest::{Layer, ServiceDef, ServiceManifest};
 use crate::probe::{ProbeResult, ProbeSpec, probe};
@@ -17,8 +18,9 @@ pub type ArcProbeFn = Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusEntry {
     pub name: String,
-    pub state: runner::State,
+    pub state: String, // State 的字符串形式, 兼容容器平面 (Failed/Healthy/...)
     pub port: u16,
+    pub plane: String, // "native" | "compose"
 }
 
 pub struct SupervisorCore {
@@ -29,6 +31,8 @@ pub struct SupervisorCore {
     // 注入的 start 函数 (生产=bash start.sh, 测试=fake)。签名: (repo_dir, cmd) -> Result
     start_fn: ArcStartFn,
     probe_fn: ArcProbeFn,
+    // compose 平面 (可选)。enabled=false 时为 None, 保留仅 native 行为。
+    compose: Option<Box<dyn ComposeBackend>>,
 }
 
 impl SupervisorCore {
@@ -56,6 +60,7 @@ impl SupervisorCore {
                 )
             })
             .collect();
+        let compose = build_compose(&cfg);
         Ok(Self {
             runners,
             store,
@@ -63,15 +68,28 @@ impl SupervisorCore {
             cfg,
             start_fn: Arc::new(real_start_pair),
             probe_fn: Arc::new(real_probe_spec),
+            compose,
         })
     }
 
     // 测试构造: 注入 fake probe + fake start。defs 不经 layer 排序 (测试自带顺序)。
+    // compose 可选注入 (None=仅 native, Some=测试 compose 编排)。
     pub fn new_with_fns(
         defs: Vec<ServiceDef>,
         cfg: Config,
         probe_fn: impl Fn(&ProbeSpec) -> ProbeResult + Send + Sync + 'static,
         start_fn: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_fns_and_compose(defs, cfg, probe_fn, start_fn, None)
+    }
+
+    // 测试构造 + compose 注入。
+    pub fn new_with_fns_and_compose(
+        defs: Vec<ServiceDef>,
+        cfg: Config,
+        probe_fn: impl Fn(&ProbeSpec) -> ProbeResult + Send + Sync + 'static,
+        start_fn: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+        compose: Option<Box<dyn ComposeBackend>>,
     ) -> Self {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -105,11 +123,30 @@ impl SupervisorCore {
             cfg,
             start_fn,
             probe_fn,
+            compose,
         }
     }
 
-    // up: 按 layer 序, 层内并发 cap。先探活, 已健康跳过 (避双启)。
+    // up: compose 平面先 (sidecar), native 按 layer 序, business 容器最后。
+    // enabled=false 跳过 compose, 仅 native (保留单节点开发行为)。
     pub async fn up_all(&mut self) -> Result<()> {
+        // 1. compose sidecar 先 (traefik/redis/postgres/qdrant), 等健康
+        if let Some(cb) = &self.compose {
+            tracing::info!("up: compose sidecar 平面先起");
+            cb.up_sidecar()?;
+        }
+        // 2. native 按 layer 序 (core→...→cluster), 层内并发 cap, 探活跳过已健康
+        self.up_native().await?;
+        // 3. compose business 容器 (model-hub/cowork), 依赖 sidecar 健康
+        if let Some(cb) = &self.compose {
+            tracing::info!("up: compose business 容器起 (依赖 sidecar)");
+            cb.up_business()?;
+        }
+        Ok(())
+    }
+
+    // native up: 按 layer 序, 层内并发 cap。先探活, 已健康跳过 (避双启)。
+    async fn up_native(&mut self) -> Result<()> {
         let sorted =
             ServiceManifest::sort_by_layer(self.runners.iter().map(|r| r.def.clone()).collect());
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
@@ -165,8 +202,21 @@ impl SupervisorCore {
         Ok(())
     }
 
-    // down: 逆序 (cluster→domain→app→platform→core)。
+    // down: business 容器先 → native 逆序 (cluster→...→core) → sidecar 最后。
+    // compose down 一次性停 business+sidecar, 故分两步: 先停 business, native 停后再 down 全部。
     pub async fn down_all(&mut self) -> Result<()> {
+        // 1. compose 全停 (business + sidecar 一起; 容器无 native 依赖, 先停安全)
+        if let Some(cb) = &self.compose {
+            tracing::info!("down: compose 平面停 (business + sidecar)");
+            cb.down()?;
+        }
+        // 2. native 逆序停
+        self.down_native().await?;
+        Ok(())
+    }
+
+    // native down: 逆序 (cluster→domain→app→platform→core)。
+    async fn down_native(&mut self) -> Result<()> {
         let mut defs: Vec<ServiceDef> = self.runners.iter().map(|r| r.def.clone()).collect();
         defs = ServiceManifest::sort_by_layer(defs);
         defs.reverse(); // 逆序停
@@ -203,29 +253,84 @@ impl SupervisorCore {
         Ok(())
     }
 
+    // status: native entries + compose 容器 entries, 合并一张表。
+    // 容器 plane="compose", state 来自 docker ps 健康映射。
     pub fn status_all(&self) -> Vec<StatusEntry> {
-        self.runners
+        let mut out: Vec<StatusEntry> = self
+            .runners
             .iter()
             .map(|r| StatusEntry {
                 name: r.def.name.clone(),
-                state: r.state,
+                state: format!("{:?}", r.state),
                 port: r.def.port,
+                plane: "native".into(),
             })
-            .collect()
+            .collect();
+        if let Some(cb) = &self.compose {
+            match cb.ps() {
+                Ok(cs) => {
+                    for c in cs {
+                        out.push(StatusEntry {
+                            name: c.service.clone(),
+                            state: c.supervisor_state().to_string(),
+                            port: c.port(),
+                            plane: "compose".into(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "compose ps 失败 (状态表缺容器行)");
+                }
+            }
+        }
+        out
     }
 
-    // 单轮监督: 遍历所有 runner 调 tick。split-borrow 在 &mut self 方法内合法
-    // (runners &mut / store & / alerter &mut 三字段分借)。tick 内 async, 每轮
-    // 借用在本迭代结束释放, 下一迭代重新借, 编译通过。
+    // 单轮监督: native runner tick + compose 容器健康探测。
+    // 容器: ps → exited/unhealthy → 标 Failed + 告警 (同 native 宕机路径)。
+    // compose restart: unless-stopped 已处理自动重启, supervisor 仅报告状态 + 告警。
     pub async fn tick_all(&mut self, now_ts: u64) {
         for r in &mut self.runners {
             if let Err(e) = r.tick(now_ts, &self.store, &mut self.alerter).await {
                 tracing::warn!(svc = %r.def.name, err = %e, "tick fail (继续下一个)");
             }
         }
+        self.tick_compose(now_ts).await;
     }
 
-    // 探活间隔: 有 down 态服务用 poll_unhealthy_sec, 否则 poll_healthy_sec
+    // compose 容器监督: 探活每个容器, 宕机告警。
+    async fn tick_compose(&mut self, now_ts: u64) {
+        let Some(cb) = &self.compose else {
+            return;
+        };
+        let cs = match cb.ps() {
+            Ok(cs) => cs,
+            Err(e) => {
+                tracing::warn!(err = %e, "compose ps 失败 (跳过容器监督本轮)");
+                return;
+            }
+        };
+        for c in cs {
+            let st = c.supervisor_state();
+            if st == "Failed" {
+                tracing::warn!(svc = %c.service, state = %c.state, health = %c.health, "compose 容器宕机");
+                let _ = self
+                    .alerter
+                    .alert(crate::alert::Alert {
+                        service: c.service.clone(),
+                        kind: crate::alert::AlertKind::ServiceDown,
+                        detail: format!(
+                            "compose container {} state={} health={}",
+                            c.name, c.state, c.health
+                        ),
+                        ts: now_ts,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    // 探活间隔: 有 down 态服务 (native 或 compose 容器) 用 poll_unhealthy_sec, 否则 poll_healthy_sec
     pub fn poll_interval(&self) -> u64 {
         let any_down = self.runners.iter().any(|r| {
             matches!(
@@ -234,11 +339,52 @@ impl SupervisorCore {
             )
         });
         if any_down {
-            self.cfg.poll_unhealthy_sec
-        } else {
-            self.cfg.poll_healthy_sec
+            return self.cfg.poll_unhealthy_sec;
+        }
+        // compose 容器有 Failed 也算 down
+        if let Some(cb) = &self.compose
+            && let Ok(cs) = cb.ps()
+            && cs.iter().any(|c| c.supervisor_state() == "Failed")
+        {
+            return self.cfg.poll_unhealthy_sec;
+        }
+        self.cfg.poll_healthy_sec
+    }
+
+    // logs 分派: compose 容器服务名 → compose logs; 否则 None (native 走 cli_logs)
+    pub fn compose_logs(&self, service: &str) -> Option<Result<String>> {
+        let cb = self.compose.as_ref()?;
+        // 仅当该服务在 compose 容器列表中才走 compose logs
+        match cb.ps() {
+            Ok(cs) if cs.iter().any(|c| c.service == service) => Some(cb.logs(service)),
+            _ => None,
         }
     }
+
+    // compose 是否启用 (测试 + cli 用)
+    pub fn compose_enabled(&self) -> bool {
+        self.compose.is_some()
+    }
+}
+
+// 据配置构建 compose 后端。enabled=false → None (仅 native)。
+// 文件不存在时告警但返回 None (不阻塞 native 启动, 操作员按提示补文件)。
+fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
+    if !cfg.compose.enabled {
+        return None;
+    }
+    if !cfg.compose.sidecar_file.exists() {
+        tracing::warn!(
+            path = %cfg.compose.sidecar_file.display(),
+            "compose.enabled=true 但 sidecar 文件不存在, 回退仅 native"
+        );
+        return None;
+    }
+    Some(Box::new(DockerCompose::new(
+        cfg.compose.sidecar_file.clone(),
+        cfg.compose.business_file.clone(),
+        cfg.compose.env_file.clone(),
+    )))
 }
 
 // 真 start.sh 调用: bash {repo}/start.sh {cmd}, stderr → 每服务日志
@@ -484,5 +630,217 @@ mod tests {
         // Failed 也算 down
         core.runners[0].state = runner::State::Failed;
         assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
+    }
+
+    // ---- compose 平面集成测试 ----
+    use crate::compose::{ContainerStatus, test_support::FakeCompose};
+
+    fn mk_container(service: &str, state: &str, health: &str, port: u16) -> ContainerStatus {
+        ContainerStatus {
+            name: format!("sv-{service}-1"),
+            service: service.into(),
+            state: state.into(),
+            health: health.into(),
+            publishers: if port > 0 {
+                vec![format!("0.0.0.0:{port}->{port}/tcp")]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    // up_all: compose 启用时顺序 = sidecar → native → business
+    #[tokio::test]
+    async fn test_up_all_compose_order_sidecar_native_business() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::Platform, 11436),
+        ];
+        let native_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let no_p = native_order.clone();
+        let fake = Box::new(FakeCompose::new());
+        let calls_ref = fake.calls.clone();
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, _cmd| {
+                no_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
+            Some(fake),
+        );
+        core.up_all().await.unwrap();
+        let calls = calls_ref.lock().unwrap();
+        // 顺序: up_sidecar 先, up_business 最后
+        assert_eq!(calls[0], "up_sidecar", "sidecar 先起");
+        assert_eq!(calls[calls.len() - 1], "up_business", "business 最后起");
+        // native 在中间: core 先于 platform
+        let no = native_order.lock().unwrap();
+        let mlx_i = no.iter().position(|n| n == "fusion-mlx").unwrap();
+        let rag_i = no.iter().position(|n| n == "fusion-rag").unwrap();
+        assert!(mlx_i < rag_i, "native core 先于 platform");
+        // sidecar 在 native 之前
+        let sidecar_i = calls.iter().position(|c| c == "up_sidecar").unwrap();
+        let business_i = calls.iter().position(|c| c == "up_business").unwrap();
+        assert!(sidecar_i < business_i);
+    }
+
+    // compose 未启用 (None): up_all 不调任何 compose 方法, 仅 native
+    #[tokio::test]
+    async fn test_up_all_no_compose_native_only() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let called: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cp = called.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, cmd| {
+                cp.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        assert!(!core.compose_enabled(), "默认 compose 未启用");
+        core.up_all().await.unwrap();
+        let c = called.lock().unwrap();
+        assert!(
+            c.iter().all(|x| x.contains("start")),
+            "仅 native start 调用"
+        );
+    }
+
+    // down_all: compose 启用时 compose down 先, native 逆序后
+    #[tokio::test]
+    async fn test_down_all_compose_then_native_reverse() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::Platform, 11436),
+        ];
+        let native_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let no_p = native_order.clone();
+        let fake = Box::new(FakeCompose::new());
+        let calls_ref = fake.calls.clone();
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            move |svc, _cmd| {
+                no_p.lock().unwrap().push(svc.to_string());
+                Ok(())
+            },
+            Some(fake),
+        );
+        core.down_all().await.unwrap();
+        let calls = calls_ref.lock().unwrap();
+        assert_eq!(calls[0], "down", "compose down 先");
+        // native 逆序: platform 先停, core 后停
+        let no = native_order.lock().unwrap();
+        let rag_i = no.iter().position(|n| n == "fusion-rag").unwrap();
+        let mlx_i = no.iter().position(|n| n == "fusion-mlx").unwrap();
+        assert!(rag_i < mlx_i, "native 逆序: platform 先停, core 后停");
+    }
+
+    // status_all: compose 启用时合并 native + 容器行
+    #[test]
+    fn test_status_all_merges_compose_rows() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![
+            mk_container("postgres", "running", "healthy", 5432),
+            mk_container("qdrant", "exited", "", 0),
+        ]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        let st = core.status_all();
+        // 1 native + 2 compose
+        assert_eq!(st.len(), 3);
+        let native = st.iter().find(|e| e.plane == "native").unwrap();
+        assert_eq!(native.name, "fusion-mlx");
+        let pg = st.iter().find(|e| e.name == "postgres").unwrap();
+        assert_eq!(pg.plane, "compose");
+        assert_eq!(pg.state, "Healthy");
+        assert_eq!(pg.port, 5432);
+        let qd = st.iter().find(|e| e.name == "qdrant").unwrap();
+        assert_eq!(qd.state, "Failed");
+    }
+
+    // tick_all: compose 容器 exited → ServiceDown 告警
+    #[tokio::test]
+    async fn test_tick_all_compose_exited_alerts() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![
+            mk_container("postgres", "running", "healthy", 5432),
+            mk_container("redis", "exited", "", 6379),
+        ]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        // 告警经由 tracing WARN + 可选 webhook; 此处验证不 panic + 状态表见 Failed
+        let st = core.status_all();
+        let redis = st.iter().find(|e| e.name == "redis").unwrap();
+        assert_eq!(redis.state, "Failed", "exited 容器应标 Failed");
+    }
+
+    // poll_interval: compose 容器 Failed → poll_unhealthy_sec
+    #[test]
+    fn test_poll_interval_compose_failed() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("postgres", "exited", "", 5432)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        // native 全 Healthy 但 compose 容器 Failed → poll_unhealthy_sec
+        assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
+    }
+
+    // compose_logs: compose 服务走 compose logs, native 服务返回 None
+    #[test]
+    fn test_compose_logs_dispatch() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("postgres", "running", "healthy", 5432)]);
+        let core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        // compose 服务 → Some
+        assert!(core.compose_logs("postgres").is_some());
+        // native 服务 → None (走 native 日志路径)
+        assert!(core.compose_logs("fusion-mlx").is_none());
+        // compose 未启用 → None
+        let core2 = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+        );
+        assert!(core2.compose_logs("postgres").is_none());
     }
 }

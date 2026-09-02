@@ -180,22 +180,27 @@ async fn connect_client(cfg: &Config) -> anyhow::Result<RpcClient> {
     }
 }
 
-async fn cli_logs(_cfg: Config, service: String) -> anyhow::Result<()> {
-    let log_dir = std::env::var("HOME")
-        .map(|h| format!("{h}/.fusion-sv/logs"))
-        .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
-    let dir = manifest::name_to_dir(&service);
-    let path = std::path::Path::new(&log_dir).join(format!("{dir}.log"));
-    if !path.exists() {
-        cli::print_error(&format!("no log for {service}: {}", path.display()));
-        return Ok(());
+async fn cli_logs(cfg: Config, service: String) -> anyhow::Result<()> {
+    let mut client = connect_client(&cfg).await?;
+    let req = RpcRequest {
+        jsonrpc: "2.0".into(),
+        method: "logs".into(),
+        params: serde_json::json!({"service": service}),
+        id: 1,
+    };
+    let resp = client.call(req).await?;
+    if let Some(err) = resp.error {
+        cli::print_error(&err.message);
+        std::process::exit(1);
     }
-    tracing::info!(svc = %service, log = %path.display(), "tail logs");
-    let out = std::process::Command::new("tail")
-        .args(["-n", "50"])
-        .arg(&path)
-        .output()?;
-    print!("{}", String::from_utf8_lossy(&out.stdout));
+    let obj = resp.result.unwrap_or(serde_json::Value::Null);
+    let lines = obj.get("lines").and_then(|v| v.as_str()).unwrap_or("");
+    let plane = obj
+        .get("plane")
+        .and_then(|v| v.as_str())
+        .unwrap_or("native");
+    tracing::info!(svc = %service, plane, "tail logs");
+    print!("{lines}");
     Ok(())
 }
 

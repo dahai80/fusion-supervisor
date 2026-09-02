@@ -107,6 +107,21 @@ docker compose -f docker-compose.sidecar.yml -f docker-compose.business.yml up -
 
 Fail-closed: requires `FUSION_PG_PASSWORD` + `FUSION_MLX_API_KEY` (see `.env.example`; `.env`/`.env.test` are git-ignored). Single PG instance creates per-app DBs at first boot via `scripts/pg-init-multiple-db.sh` (`POSTGRES_MULTIPLE_DATABASES`). Traefik routes `/v1`+`/api/gateway` to the native gateway (`traefik/dynamic.yml`); Docker labels on business services register TLS routers. Smoke: `bash scripts/smoke-sidecar.sh` (live) + `bash scripts/smoke-sidecar.test.sh` (unit, no Docker). The overlay reuses sidecar redis/postgres (no self-hosted cowork PG in prod).
 
+### Compose plane orchestration (unified bring-up)
+
+The supervisor itself orchestrates BOTH the 41 native services AND the container planes (sidecar + business) in one command — this is the issue #3 integration. `fusion-sv up/down/status/logs` now span both planes. `src/compose.rs` wraps `docker compose --env-file ... -f sidecar -f business ...` behind the `ComposeBackend` trait (prod = `DockerCompose`, test = `FakeCompose` in `compose::test_support`). Disabled by default (`compose.enabled = false` in config → `build_compose` returns `None`, all compose code paths no-op, preserves single-node dev behavior).
+
+- **up_all order**: `up_sidecar()` (traefik/redis/postgres/qdrant, `--wait`) → `up_native()` (layer-ordered, concurrency cap, probe-skip-healthy) → `up_business()` (model-hub/cowork, `--wait`, depends on sidecar + native gateway).
+- **down_all order**: `compose down --remove-orphans` (tolerates non-zero) → `down_native()` (reverse layer order).
+- **status_all**: native `StatusEntry` rows (plane="native") merged with compose `ps` container rows (plane="compose"). `StatusEntry.state` is now a `String` (was `runner::State`) to hold container states; `StatusEntry.plane` added.
+- **Container state mapping** (`ContainerStatus::supervisor_state`): running+healthy→Healthy, exited/dead→Failed, restarting→Restarting, running+unhealthy→Failed, running+no-healthcheck→Healthy, else→Starting.
+- **tick_compose**: per-tick `ps()` → for each Failed container emit `ServiceDown` alert with container name/state/health. `poll_interval` returns `poll_unhealthy_sec` if any container is Failed. Containers are NOT crash-restarted (compose `--wait` + Docker restart policy own that); supervisor only monitors + alerts.
+- **logs dispatch**: RPC `logs` method tries `compose_logs(service)` first (returns `{lines, plane:"compose"}` if service in compose ps), else native tail -n 50 of `~/.fusion-sv/logs/<dir>.log` (plane:"native").
+- **Fail-closed**: `check_env()` refuses `up_sidecar` if `FUSION_PG_PASSWORD`/`FUSION_MLX_API_KEY` missing from both env vars and env_file — points to `.env.example`.
+- **serde**: docker compose v2 `ps --format json` uses PascalCase fields (`Name/Service/State/Health/Publishers`) and `URL` (all-caps) on publishers — `#[serde(rename_all = "PascalCase")]` + `#[serde(alias = "URL")]` handle both. `normalize_publisher` converts `0.0.0.0:5432:5432/tcp` → `0.0.0.0:5432->5432/tcp`.
+
+To enable: set `compose.enabled = true` in `~/.fusion-sv/config.toml` (paths default to `docker-compose.sidecar.yml` / `docker-compose.business.yml` / `.env` in CWD, all tilde-expanded).
+
 ## Boundary with other supervisors
 
 - **fusion-gateway** stays the inference routing entry; its `auto_start` only starts fusion-mlx. Supervisor manages all 41 (including mlx) — double-start avoided by probing-first-then-skip.

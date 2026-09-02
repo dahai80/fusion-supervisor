@@ -71,7 +71,7 @@ async fn dispatch(
                 .into_iter()
                 .map(|e| {
                     json!({
-                        "name": e.name, "state": format!("{:?}", e.state), "port": e.port,
+                        "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
                     })
                 })
                 .collect();
@@ -114,6 +114,42 @@ async fn dispatch(
                     make_error(-32000, &format!("restart fail: {e}"), req.id)
                 }
             }
+        }
+        Some(Method::Logs) => {
+            let svc = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return make_error(-32602, "invalid params: service required", req.id),
+            };
+            let c = core.lock().await;
+            // compose 容器优先: 走 compose logs
+            if let Some(res) = c.compose_logs(&svc) {
+                match res {
+                    Ok(text) => {
+                        return make_result(json!({"lines": text, "plane": "compose"}), req.id);
+                    }
+                    Err(e) => {
+                        return make_error(-32000, &format!("compose logs fail: {e}"), req.id);
+                    }
+                }
+            }
+            // native: 读每服务日志文件 tail 50
+            let log_dir = std::env::var("HOME")
+                .map(|h| format!("{h}/.fusion-sv/logs"))
+                .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
+            let dir = crate::manifest::name_to_dir(&svc);
+            let path = std::path::Path::new(&log_dir).join(format!("{dir}.log"));
+            if !path.exists() {
+                return make_error(-32000, &format!("no log for {svc}"), req.id);
+            }
+            let out = match std::process::Command::new("tail")
+                .args(["-n", "50"])
+                .arg(&path)
+                .output()
+            {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Err(e) => return make_error(-32000, &format!("tail fail: {e}"), req.id),
+            };
+            make_result(json!({"lines": out, "plane": "native"}), req.id)
         }
         Some(Method::Top | Method::Shutdown) => make_error(-32601, "not implemented yet", req.id),
     }

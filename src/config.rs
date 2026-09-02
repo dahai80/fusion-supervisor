@@ -16,6 +16,31 @@ pub struct Config {
     pub alert_url: String,
     pub alert_dedup_sec: u64,
     pub registry_path: PathBuf,
+    #[serde(default)]
+    pub compose: ComposeConfig,
+}
+
+// compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ComposeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sidecar")]
+    pub sidecar_file: PathBuf,
+    #[serde(default = "default_business")]
+    pub business_file: PathBuf,
+    #[serde(default = "default_env")]
+    pub env_file: PathBuf,
+}
+
+fn default_sidecar() -> PathBuf {
+    PathBuf::from("docker-compose.sidecar.yml")
+}
+fn default_business() -> PathBuf {
+    PathBuf::from("docker-compose.business.yml")
+}
+fn default_env() -> PathBuf {
+    PathBuf::from(".env")
 }
 
 impl Default for Config {
@@ -33,6 +58,7 @@ impl Default for Config {
             alert_url: String::new(),
             alert_dedup_sec: 300,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
+            compose: ComposeConfig::default(),
         }
     }
 }
@@ -48,12 +74,16 @@ impl Config {
             let mut cfg = Config::default();
             cfg.db_path = expand_tilde(&cfg.db_path);
             cfg.registry_path = expand_tilde(&cfg.registry_path);
+            cfg.compose = ComposeConfig::default();
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(&expanded)?;
         let mut cfg: Config = toml::from_str(&text)?;
         cfg.db_path = expand_tilde(&cfg.db_path);
         cfg.registry_path = expand_tilde(&cfg.registry_path);
+        cfg.compose.sidecar_file = expand_tilde(&cfg.compose.sidecar_file);
+        cfg.compose.business_file = expand_tilde(&cfg.compose.business_file);
+        cfg.compose.env_file = expand_tilde(&cfg.compose.env_file);
         Ok(cfg)
     }
 }

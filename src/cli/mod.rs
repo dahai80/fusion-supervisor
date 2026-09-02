@@ -6,6 +6,7 @@ struct Row {
     service: String,
     state: String,
     port: u16,
+    plane: String,
 }
 
 pub fn print_status(entries: &[StatusEntry]) {
@@ -13,8 +14,9 @@ pub fn print_status(entries: &[StatusEntry]) {
         .iter()
         .map(|e| Row {
             service: e.name.clone(),
-            state: format!("{:?}", e.state),
+            state: e.state.clone(),
             port: e.port,
+            plane: e.plane.clone(),
         })
         .collect();
     let table = Table::new(rows);
