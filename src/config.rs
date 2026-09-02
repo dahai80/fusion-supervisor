@@ -15,6 +15,9 @@ pub struct Config {
     pub backoff_max_sec: u64,
     pub alert_url: String,
     pub alert_dedup_sec: u64,
+    // compose 容器连续失败达此次数 → 升级告警 (ContainerCrashLoop, issue #6)
+    #[serde(default = "default_container_crash_escalation")]
+    pub container_crash_escalation: u32,
     pub registry_path: PathBuf,
     #[serde(default)]
     pub compose: ComposeConfig,
@@ -42,6 +45,9 @@ fn default_business() -> PathBuf {
 fn default_env() -> PathBuf {
     PathBuf::from(".env")
 }
+fn default_container_crash_escalation() -> u32 {
+    5
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -57,6 +63,7 @@ impl Default for Config {
             backoff_max_sec: 30,
             alert_url: String::new(),
             alert_dedup_sec: 300,
+            container_crash_escalation: 5,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
         }

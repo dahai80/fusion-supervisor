@@ -34,6 +34,8 @@ pub struct SupervisorCore {
     probe_fn: ArcProbeFn,
     // compose 平面 (可选)。enabled=false 时为 None, 保留仅 native 行为。
     compose: Option<Box<dyn ComposeBackend>>,
+    // compose 容器告警节流 (issue #6): 防 flapping 容器每 tick 刷告警。
+    compose_tracker: crate::compose_tracker::ComposeTracker,
 }
 
 impl SupervisorCore {
@@ -62,6 +64,10 @@ impl SupervisorCore {
             })
             .collect();
         let compose = build_compose(&cfg);
+        let compose_tracker = crate::compose_tracker::ComposeTracker::new(
+            cfg.alert_dedup_sec,
+            cfg.container_crash_escalation,
+        );
         Ok(Self {
             runners,
             store,
@@ -70,6 +76,7 @@ impl SupervisorCore {
             start_fn: Arc::new(real_start_pair),
             probe_fn: Arc::new(real_probe_spec),
             compose,
+            compose_tracker,
         })
     }
 
@@ -117,6 +124,10 @@ impl SupervisorCore {
                 )
             })
             .collect();
+        let compose_tracker = crate::compose_tracker::ComposeTracker::new(
+            cfg.alert_dedup_sec,
+            cfg.container_crash_escalation,
+        );
         Self {
             runners,
             store,
@@ -125,6 +136,7 @@ impl SupervisorCore {
             start_fn,
             probe_fn,
             compose,
+            compose_tracker,
         }
     }
 
@@ -307,7 +319,8 @@ impl SupervisorCore {
         self.tick_compose(now_ts).await;
     }
 
-    // compose 容器监督: 探活每个容器, 宕机告警。
+    // compose 容器监督: 探活每个容器, 宕机告警 (经 compose_tracker 节流, issue #6)。
+    // tracker 纯逻辑给决策, 此处据决策发告警。容器不被 supervisor 重启 (Docker 管)。
     async fn tick_compose(&mut self, now_ts: u64) {
         let Some(cb) = &self.compose else {
             return;
@@ -319,24 +332,54 @@ impl SupervisorCore {
                 return;
             }
         };
-        for c in cs {
+        let live: Vec<String> = cs.iter().map(|c| c.service.clone()).collect();
+        for c in &cs {
             let st = c.supervisor_state();
-            if st == "Failed" {
-                tracing::warn!(svc = %c.service, state = %c.state, health = %c.health, "compose 容器宕机");
-                let _ = self
-                    .alerter
-                    .alert(crate::alert::Alert {
-                        service: c.service.clone(),
-                        kind: crate::alert::AlertKind::ServiceDown,
-                        detail: format!(
+            let decisions = self
+                .compose_tracker
+                .observe(&c.service, &c.state, st, now_ts);
+            for d in decisions {
+                let (kind, detail) = match d {
+                    crate::compose_tracker::ComposeAlert::Down => (
+                        crate::alert::AlertKind::ServiceDown,
+                        format!(
                             "compose container {} state={} health={}",
                             c.name, c.state, c.health
                         ),
+                    ),
+                    crate::compose_tracker::ComposeAlert::StateChange => (
+                        crate::alert::AlertKind::ContainerStateChange,
+                        format!(
+                            "compose container {} state changed to {} health={}",
+                            c.name, c.state, c.health
+                        ),
+                    ),
+                    crate::compose_tracker::ComposeAlert::CrashLoop => (
+                        crate::alert::AlertKind::ContainerCrashLoop,
+                        format!(
+                            "compose container {} crash-loop (consecutive failures >= threshold)",
+                            c.name
+                        ),
+                    ),
+                    crate::compose_tracker::ComposeAlert::Back => (
+                        crate::alert::AlertKind::ServiceBack,
+                        format!("compose container {} recovered", c.name),
+                    ),
+                };
+                tracing::info!(svc = %c.service, kind = kind.label(), "compose tick 告警决策");
+                let _ = self
+                    .alerter
+                    .alert(crate::alert::Alert {
+                        service: format!("compose:{}", c.service),
+                        kind,
+                        detail,
                         ts: now_ts,
                     })
                     .await;
             }
         }
+        // 清除已消失容器快照
+        self.compose_tracker.reap(&live);
     }
 
     // 探活间隔: 有 down 态服务 (native 或 compose 容器) 用 poll_unhealthy_sec, 否则 poll_healthy_sec
@@ -1014,5 +1057,112 @@ mod tests {
             started.contains(&"fusion-rag".to_string()),
             "compose 未启用时无 dep-gate, rag 应正常启动"
         );
+    }
+
+    // ---- compose 容器告警节流 (issue #6) 集成测试 ----
+    // 4 场景经 tick_compose 驱动 compose_tracker, 验证快照/决策不 panic 且状态正确。
+
+    // 同容器 exited 连续 5 tick (去抖窗内) → fail_count 累计, 仅首 tick 记 last_alert
+    #[tokio::test]
+    async fn test_tick_compose_dedup_repeated_failed() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "exited", "", 6379)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        // 5 tick, 去抖窗内 (默认 alert_dedup_sec=300, escalation=5)
+        for ts in [1000u64, 1002, 1004, 1006, 1008] {
+            core.tick_all(ts).await;
+        }
+        let rec = core.compose_tracker.record("redis").unwrap();
+        assert_eq!(rec.fail_count, 5, "连续 5 tick 失败应累计 5");
+        assert_eq!(rec.state, "Failed");
+    }
+
+    // docker state 变化 (restarting→exited) → tracker 记录 raw_state 变化
+    #[tokio::test]
+    async fn test_tick_compose_state_change_re_alerts() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "restarting", "", 6379)]);
+        let containers = fake.containers.clone();
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        assert_eq!(
+            core.compose_tracker.record("redis").unwrap().raw_state,
+            "restarting"
+        );
+        // 切到 exited (经 Arc<Mutex> 内部可变, 无需借 core.compose)
+        *containers.lock().unwrap() = vec![mk_container("redis", "exited", "", 6379)];
+        core.tick_all(1002).await;
+        assert_eq!(
+            core.compose_tracker.record("redis").unwrap().raw_state,
+            "exited",
+            "state 变化应更新快照"
+        );
+    }
+
+    // 失败→健康 → tracker 重置 fail_count, escalated 清零
+    #[tokio::test]
+    async fn test_tick_compose_service_back() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "exited", "", 6379)]);
+        let containers = fake.containers.clone();
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        assert_eq!(
+            core.compose_tracker.record("redis").unwrap().state,
+            "Failed"
+        );
+        // 恢复 (经 Arc<Mutex> 内部可变)
+        *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
+        core.tick_all(1010).await;
+        let rec = core.compose_tracker.record("redis").unwrap();
+        assert_eq!(rec.state, "Healthy", "恢复应转 Healthy");
+        assert_eq!(rec.fail_count, 0, "恢复应重置 fail_count");
+    }
+
+    // 连续失败达阈值 → escalated=true (CrashLoop 升级)
+    #[tokio::test]
+    async fn test_tick_compose_escalation() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let fake = Box::new(FakeCompose::new());
+        fake.set_containers(vec![mk_container("redis", "exited", "", 6379)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _| Ok(()),
+            Some(fake),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        // escalation=5 (fake_cfg 默认), 跑 5 tick
+        for ts in [1000u64, 1002, 1004, 1006, 1008] {
+            core.tick_all(ts).await;
+        }
+        let rec = core.compose_tracker.record("redis").unwrap();
+        assert!(rec.escalated, "达阈值应升级标记");
+        assert_eq!(rec.fail_count, 5);
     }
 }
