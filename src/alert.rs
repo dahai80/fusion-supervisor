@@ -12,6 +12,10 @@ pub enum AlertKind {
     ContainerStateChange,
     // compose 容器连续失败达阈值升级 (crash-loop, 不去抖)
     ContainerCrashLoop,
+    // issue #9: 服务 drain 完成 (摘流量后停止, 正常事件)
+    ServiceDrained,
+    // issue #9: rollout prewarm 失败 (启动后超时未达 Healthy)
+    RolloutPrewarmFailed,
 }
 
 impl AlertKind {
@@ -23,6 +27,8 @@ impl AlertKind {
             AlertKind::RestartCapHit => "RestartCapHit",
             AlertKind::ContainerStateChange => "ContainerStateChange",
             AlertKind::ContainerCrashLoop => "ContainerCrashLoop",
+            AlertKind::ServiceDrained => "ServiceDrained",
+            AlertKind::RolloutPrewarmFailed => "RolloutPrewarmFailed",
         }
     }
 }

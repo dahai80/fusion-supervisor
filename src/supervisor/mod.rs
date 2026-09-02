@@ -514,6 +514,115 @@ impl SupervisorCore {
         }
         true
     }
+
+    // issue #9: 摘单服务流量。标 Draining + 设宽限期。
+    // 返回 Err 若服务不存在或状态不可 drain。
+    // 边界: 仅管本地生命周期 (停止接新工作), 流量切换归 fusion-gateway。
+    pub fn drain(&mut self, service: &str, now_ts: u64) -> Result<()> {
+        let r = self
+            .runners
+            .iter_mut()
+            .find(|r| r.def.name == service)
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
+        r.begin_drain(self.cfg.drain_grace_sec, now_ts)?;
+        Ok(())
+    }
+
+    // issue #9: 摘全部 native 服务流量 (集群 drain 的本地部分, 边界归 fusion-multi-node)。
+    pub fn drain_all(&mut self, now_ts: u64) -> Result<()> {
+        let mut errs = Vec::new();
+        for r in &mut self.runners {
+            if let Err(e) = r.begin_drain(self.cfg.drain_grace_sec, now_ts) {
+                tracing::warn!(svc = %r.def.name, err = %e, "drain_all 跳过 (状态不可 drain)");
+                errs.push(format!("{}: {e}", r.def.name));
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("drain_all 部分失败: {}", errs.join("; "))
+        }
+    }
+
+    // issue #9: 取消单服务 drain (回流量)。仅 Draining 可取消。
+    pub fn cancel_drain(&mut self, service: &str) -> Result<()> {
+        let r = self
+            .runners
+            .iter_mut()
+            .find(|r| r.def.name == service)
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
+        r.cancel_drain()?;
+        Ok(())
+    }
+
+    // issue #9: 零停机换版 — drain→stop→start→prewarm(Healthy gate)→清 drain 标记。
+    // prewarm: 循环探活, 达 Healthy 立即返回成功并清 drain (换版完成)。
+    // 超时未达 Healthy → 告警 RolloutPrewarmFailed + 留 Stopped (不回滚, 由调用方决策)。
+    // now_ts=起始时间戳; grace=drain 宽限; prewarm_timeout=探活超时。
+    pub async fn rollout(
+        &mut self,
+        service: &str,
+        now_ts: u64,
+        grace: u64,
+        prewarm_timeout: u64,
+    ) -> Result<()> {
+        let r = self
+            .runners
+            .iter_mut()
+            .find(|r| r.def.name == service)
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
+        // 1. drain (标 Draining + 宽限)
+        r.begin_drain(grace, now_ts)?;
+        tracing::info!(svc = %service, grace, "rollout: drain 开始");
+        // 2. 等宽限期过 (drain 完成) — 实际生产由 tick 推进 Stopped, 此处直接标 Stopped 走 start
+        r.state = runner::State::Stopped;
+        r.drain_grace_until = None;
+        tracing::info!(svc = %service, "rollout: drain 完成, 停服务");
+        // 3. start (复用 runner.invoke_start, 1-arg start.sh 读自身 .env)
+        if let Err(e) = r.invoke_start() {
+            tracing::error!(svc = %service, err = %e, "rollout: start 失败");
+            let _ = self
+                .alerter
+                .alert(crate::alert::Alert {
+                    service: service.to_string(),
+                    kind: crate::alert::AlertKind::RolloutPrewarmFailed,
+                    detail: format!("start fail: {e}"),
+                    ts: now_ts,
+                })
+                .await;
+            anyhow::bail!("rollout start fail: {e}");
+        }
+        r.state = runner::State::Starting;
+        tracing::info!(svc = %service, "rollout: start 完成, prewarm 等健康");
+        // 4. prewarm: 探活循环, 达 Healthy 即成功
+        let deadline = now_ts + prewarm_timeout;
+        let mut t = now_ts + 1;
+        loop {
+            if t > deadline {
+                tracing::error!(svc = %service, deadline, "rollout: prewarm 超时未达 Healthy");
+                r.state = runner::State::Stopped;
+                let _ = self
+                    .alerter
+                    .alert(crate::alert::Alert {
+                        service: service.to_string(),
+                        kind: crate::alert::AlertKind::RolloutPrewarmFailed,
+                        detail: format!("prewarm timeout {prewarm_timeout}s, not healthy"),
+                        ts: t,
+                    })
+                    .await;
+                anyhow::bail!(
+                    "rollout prewarm timeout: {service} not healthy in {prewarm_timeout}s"
+                );
+            }
+            let result = r.probe_once();
+            if matches!(result, ProbeResult::Healthy { .. }) {
+                r.state = runner::State::Healthy;
+                tracing::info!(svc = %service, "rollout: prewarm 达 Healthy, 换版完成");
+                return Ok(());
+            }
+            t += 1;
+        }
+    }
 }
 
 // 据配置构建 compose 后端。enabled=false → None (仅 native)。
@@ -587,7 +696,7 @@ mod tests {
     use super::*;
     use crate::manifest::{Layer, ServiceDef};
     use crate::probe::ProbeResult;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     // env 注入测试共用 env_map::tests::env_lock (单一全局锁, 避免双锁竞态)。
     use crate::env_map::tests::env_lock;
@@ -1346,6 +1455,122 @@ mod tests {
         assert!(
             matches!(core.runners[0].state, runner::State::Failed),
             "env 注入失败应标 Failed (非静默降级)"
+        );
+    }
+
+    // ---- issue #9: drain / drain_all / rollout ----
+
+    // drain 单服务: Healthy → Draining
+    #[tokio::test]
+    async fn test_drain_single_service() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.drain("fusion-mlx", 1000).unwrap();
+        assert!(matches!(core.runners[0].state, runner::State::Draining));
+        assert_eq!(core.runners[0].drain_grace_until, Some(1030)); // grace=30 默认
+    }
+
+    // drain 未知服务 → Err
+    #[tokio::test]
+    async fn test_drain_unknown_service_err() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        assert!(core.drain("nope", 1000).is_err());
+    }
+
+    // drain_all: 全部 Healthy → 全 Draining
+    #[tokio::test]
+    async fn test_drain_all_services() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::App, 11436),
+        ];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        for r in &mut core.runners {
+            r.state = runner::State::Healthy;
+        }
+        core.drain_all(1000).unwrap();
+        assert!(
+            core.runners
+                .iter()
+                .all(|r| matches!(r.state, runner::State::Draining))
+        );
+    }
+
+    // cancel_drain: Draining → Healthy
+    #[tokio::test]
+    async fn test_cancel_drain() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.drain("fusion-mlx", 1000).unwrap();
+        assert!(matches!(core.runners[0].state, runner::State::Draining));
+        core.cancel_drain("fusion-mlx").unwrap();
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+        assert!(core.runners[0].drain_grace_until.is_none());
+    }
+
+    // rollout 全周期: drain→stop→start→prewarm(Healthy)→Healthy
+    #[tokio::test]
+    async fn test_rollout_full_cycle() {
+        let probe_cell: Arc<Mutex<ProbeResult>> =
+            Arc::new(Mutex::new(ProbeResult::Healthy { latency_ms: 2 }));
+        let pc = probe_cell.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            move |_: &ProbeSpec| pc.lock().unwrap().clone(),
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        // rollout: grace=5, prewarm_timeout=10
+        core.rollout("fusion-mlx", 1000, 5, 10).await.unwrap();
+        assert!(
+            matches!(core.runners[0].state, runner::State::Healthy),
+            "rollout 成功后应 Healthy"
+        );
+        assert!(core.runners[0].drain_grace_until.is_none());
+    }
+
+    // rollout prewarm 失败: 探活恒不健康 → 超时 → Err + 留 Stopped + 告警
+    #[tokio::test]
+    async fn test_rollout_prewarm_fail_alerts() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        // prewarm_timeout=3 → 很快超时
+        let res = core.rollout("fusion-mlx", 1000, 5, 3).await;
+        assert!(res.is_err(), "prewarm 超时应返回 Err");
+        assert!(
+            matches!(core.runners[0].state, runner::State::Stopped),
+            "prewarm 失败应留 Stopped (不回滚)"
         );
     }
 }

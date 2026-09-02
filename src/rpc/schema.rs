@@ -37,6 +37,9 @@ pub enum Method {
     Ping,
     Logs,
     Shutdown,
+    // issue #9: 摘流量 (单服务或全部) + 零停机换版
+    Drain,
+    Rollout,
 }
 
 pub fn parse_method(s: &str) -> Option<Method> {
@@ -49,6 +52,8 @@ pub fn parse_method(s: &str) -> Option<Method> {
         "ping" => Some(Method::Ping),
         "logs" => Some(Method::Logs),
         "shutdown" => Some(Method::Shutdown),
+        "drain" => Some(Method::Drain),
+        "rollout" => Some(Method::Rollout),
         _ => None,
     }
 }
