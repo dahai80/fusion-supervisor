@@ -167,3 +167,77 @@ only the `/tmp/fusion-smoke.*/smoke.log` run log remains (per CLAUDE.md:
 keep only final output + logs). The `fusion-cluster` Docker network may
 persist (harmless, reused across runs). For manual teardown + cert cleanup
 (mTLS path): `docker compose ... down` + `rm -rf fusion-multi-node/tls/`.
+
+## Production Sidecar (Traefik + Redis + Postgres + Qdrant)
+
+Implements `architecture/fusion-deploy-0902.md` §1.1 — the OrbStack sidecar
+middleware/data layer for the 10-person Phase 2 production deployment. The
+native core (MLX + fusion-gateway, Metal/VRAM) stays on the host; sidecar runs
+the reverse proxy, queue/lock/rate-limit store, relational metadata, and vector
+DB in containers.
+
+| Service | Image | Host port | Role |
+| --- | --- | --- | --- |
+| traefik | traefik:v3.1 | 80/443/8080 | TLS, domain routing, CORS, routes to native gateway + containerized apps |
+| redis | redis:7-alpine | 6379 | quota/lock/rate-limit tokens (gateway `budget.go`, identity concurrency) |
+| postgres | postgres:16-alpine | 5432 | shared relational DB (cowork/identity/rag/modelhub — one instance, per-app DBs) |
+| qdrant | qdrant/qdrant:v1.12.4 | 6333/6334 | fusion-rag vector DB, tenant-prefix isolation |
+
+Ports respect `architecture/port-registry.yaml` — sidecar middleware uses the
+reserved standard ports, none collide with the 41 fusion service ports (11xxx).
+
+### One-command bring-up
+
+```bash
+cd fusion-supervisor
+cp .env.example .env          # fill FUSION_PG_PASSWORD + FUSION_MLX_API_KEY (required)
+bash scripts/prepare-build-ctx.sh   # stage lean build context for business images
+docker compose -f docker-compose.sidecar.yml -f docker-compose.business.yml up -d
+```
+
+This brings up traefik + redis + postgres + qdrant + model-hub + cowork, all
+healthy. The business overlay (`docker-compose.business.yml`) depends on the
+sidecar services (redis/postgres healthy) and connects via shared
+`DATABASE_URL`/`REDIS_URL` — no self-hosted Postgres per app (consolidates the
+dev-only cowork postgres). The native MLX/gateway attach via
+`host.docker.internal:11434` / `:11432`.
+
+### Postgres multi-DB init
+
+The single PG instance creates one DB per app at first boot
+(`POSTGRES_MULTIPLE_DATABASES=cowork,identity,rag,modelhub`), via
+`scripts/pg-init-multiple-db.sh`. Each app connects by DB name; RLS / per-tenant
+isolation remains each app's responsibility.
+
+### Traefik routing
+
+Docker labels on each business service register Traefik routers (TLS on the
+`websecure` entrypoint). A static dynamic config (`traefik/dynamic.yml`) routes
+`/v1` + `/api/gateway` to the **native** fusion-gateway at
+`host.docker.internal:11432`. API-key → tenant resolution stays in
+fusion-identity (upstream) — Traefik forwards the key; the gateway stamps
+`X-Fusion-Tenant` and rejects invalid keys (auth source-of-truth not duplicated
+in compose).
+
+### Sidecar smoke validation
+
+```bash
+bash scripts/smoke-sidecar.test.sh      # unit (no Docker): compose presence + guards
+bash scripts/smoke-sidecar.sh           # live: 5-step sidecar bring-up + overlay merge
+```
+
+Live smoke (design §1.1): precheck → sidecar up → PG multi-DB check → business
+overlay on shared PG/Redis → Traefik router table. Pass banner = `SMOKE PASS`.
+Auto-teardown via `trap`. Log: `/tmp/fusion-smoke-sidecar.*/smoke.log`.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.sidecar.yml -f docker-compose.business.yml down --remove-orphans
+```
+
+Volumes (`pg_data`, `qdrant_data`, `redis_data`, `traefik_letsencrypt`)
+persist across `down` unless `-v` is passed. Nightly backup of PG/Qdrant to
+shared NAS is an ops task (§5.4) — `FUSION_BACKUP_TARGET` documented in
+`.env.example`.
+

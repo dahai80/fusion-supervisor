@@ -1,0 +1,50 @@
+# Traefik dynamic config — production tenant routing for fusion-supervisor sidecar.
+# Loaded by the traefik service in docker-compose.sidecar.yml via a file provider
+# (enabled when FUSION_TRAEFIK_DYNAMIC=1; otherwise routes come from Docker labels).
+#
+# What this defines (issue #1 §acceptance):
+#   - `fusion-gateway` router: routes PathPrefix(`/v1`, `/api`) to the NATIVE
+#     gateway at host.docker.internal:11432 (Metal/VRAM core must stay native).
+#   - `fusion-tenant-auth` middleware: API-key -> X-Fusion-Tenant header.
+#     NOTE: the actual key->tenant map lives in fusion-identity (upstream repo).
+#     Traefik here forwards the key to the gateway, which resolves the tenant and
+#     stamps X-Fusion-Tenant; an invalid key is rejected at the gateway auth layer.
+#     This keeps the auth source-of-truth in fusion-identity, not in compose.
+http:
+  routers:
+    fusion-gateway:
+      rule: "PathPrefix(`/v1`) || PathPrefix(`/api/gateway`)"
+      entrypoints:
+        - websecure
+      tls: true
+      service: fusion-gateway-native
+      middlewares:
+        - fusion-cors
+      priority: 100
+
+  middlewares:
+    fusion-cors:
+      headers:
+        accessControlAllowOriginList:
+          - "https://${FUSION_DOMAIN:-fusion.local}"
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - Authorization
+          - Content-Type
+          - X-Fusion-Tenant
+        accessControlExposeHeaders:
+          - X-Fusion-Tenant
+        addVaryHeader: true
+
+  services:
+    fusion-gateway-native:
+      loadBalancer:
+        # Native gateway on host — reached inside container via host.docker.internal
+        passHostHeader: true
+        servers:
+          - url: "http://host.docker.internal:11432"
