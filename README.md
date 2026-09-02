@@ -88,3 +88,156 @@ cargo fmt --all --check
 ## Non-goals (v1)
 
 Prometheus aggregation (v2), cross-node cluster orchestration, rewriting start.sh, Web UI, launchd self-guard (v1.1), config hot-reload, multi-user.
+
+## Container Multi-Node Deploy
+
+Containerized multi-node commercial-deployment topology — extends
+`architecture/fusion-deploy-container-multinode-0901.md`. Layered Docker
+Compose: base cluster plane (`fusion-multi-node/docker-compose.yml`, network
+pin #58 landed) + business-plane overlay (`docker-compose.business.yml` here).
+Merge: `docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml up -d`.
+
+**What's containerized:** cluster plane (Master + Agent) + HTTP business plane
+(model-hub, cowork now; gateway/rag/artifacts/code/doc gated on upstream
+Dockerfile PRs). **What stays bare-metal:** MLX (`localhost:11434`, Metal /
+unified memory), UDS guardian plane (memory/speech — UDS doesn't cross the
+container boundary).
+
+### Prerequisites
+
+1. MLX running bare-metal: `~/claude-home/fusion-mlx/start.sh start`
+2. Cluster token + MLX API key exported inline (the base compose is fail-closed
+   `${FUSION_CLUSTER_TOKEN:?}` / `${FUSION_MLX_API_KEY:?}` — no `.env` is
+   created in `fusion-multi-node`):
+   ```bash
+   export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
+   export FUSION_MLX_API_KEY=fg-admin-key   # matches fusion-mlx api_key
+   ```
+3. Smoke model cached: `mlx-community-Llama-3.2-1B-Instruct-4bit`
+   (download via `HF_MIRROR=https://hf-mirror.com` if missing), available in MLX.
+4. Docker Desktop running (v29.4+).
+5. Stop any bare-metal `fusion-multi-node` master first (it holds port 11452):
+   `cd fusion-multi-node && bash start.sh stop`.
+
+### Build the smoke images
+
+The overlay Dockerfiles COPY monorepo-root-relative paths (requirements.lock,
+`fusion-core/`, `fusion-cowork/`), so the build context must be the monorepo
+root — but that is 200G+ with no root `.dockerignore`, making a root-context
+build infeasible. The harness stages a lean build context instead:
+
+```bash
+bash scripts/prepare-build-ctx.sh   # idempotent: populates .build-ctx/ (git-ignored)
+```
+
+Then the harness builds `fusion-cowork:smoke` (real upstream Dockerfile) and
+`fusion-model-hub:smoke` (scoped wrapper `scripts/Dockerfile.model-hub-smoke`
+that installs model-hub's own pyproject deps instead of the full monorepo
+lock — see upstream issue dahai80/fusion-models-hub#52).
+
+### Run smoke validation
+
+```bash
+cd fusion-supervisor
+export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
+export FUSION_MLX_API_KEY=fg-admin-key
+export FUSION_MULTI_NODE_DIR=$(cd ../fusion-multi-node && pwd)
+export SMOKE_MODEL=mlx-community-Llama-3.2-1B-Instruct-4bit
+bash scripts/smoke-container-multinode.sh
+```
+
+Runs 5 steps (design §5.1): precheck → cluster up → business up → routed
+inference (Master→Agent→`host.docker.internal`→MLX) → auth handshake. Logs to
+`/tmp/fusion-smoke.*/smoke.log`. Pass banner = `SMOKE PASS`. Teardown is
+automatic via a `trap` (both planes `down --remove-orphans`).
+
+### Bring up topology without smoke
+
+```bash
+cd fusion-multi-node
+docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml up -d
+```
+
+Teardown: `docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml down --remove-orphans`
+
+### Cleanup (process data)
+
+Smoke harness auto-teardowns via `trap` — no persistent test data is kept,
+only the `/tmp/fusion-smoke.*/smoke.log` run log remains (per CLAUDE.md:
+keep only final output + logs). The `fusion-cluster` Docker network may
+persist (harmless, reused across runs). For manual teardown + cert cleanup
+(mTLS path): `docker compose ... down` + `rm -rf fusion-multi-node/tls/`.
+
+## Production Sidecar (Traefik + Redis + Postgres + Qdrant)
+
+Implements `architecture/fusion-deploy-0902.md` §1.1 — the OrbStack sidecar
+middleware/data layer for the 10-person Phase 2 production deployment. The
+native core (MLX + fusion-gateway, Metal/VRAM) stays on the host; sidecar runs
+the reverse proxy, queue/lock/rate-limit store, relational metadata, and vector
+DB in containers.
+
+| Service | Image | Host port | Role |
+| --- | --- | --- | --- |
+| traefik | traefik:v3.1 | 80/443/8080 | TLS, domain routing, CORS, routes to native gateway + containerized apps |
+| redis | redis:7-alpine | 6379 | quota/lock/rate-limit tokens (gateway `budget.go`, identity concurrency) |
+| postgres | postgres:16-alpine | 5432 | shared relational DB (cowork/identity/rag/modelhub — one instance, per-app DBs) |
+| qdrant | qdrant/qdrant:v1.12.4 | 6333/6334 | fusion-rag vector DB, tenant-prefix isolation |
+
+Ports respect `architecture/port-registry.yaml` — sidecar middleware uses the
+reserved standard ports, none collide with the 41 fusion service ports (11xxx).
+
+### One-command bring-up
+
+```bash
+cd fusion-supervisor
+cp .env.example .env          # fill FUSION_PG_PASSWORD + FUSION_MLX_API_KEY (required)
+bash scripts/prepare-build-ctx.sh   # stage lean build context for business images
+docker compose -f docker-compose.sidecar.yml -f docker-compose.business.yml up -d
+```
+
+This brings up traefik + redis + postgres + qdrant + model-hub + cowork, all
+healthy. The business overlay (`docker-compose.business.yml`) depends on the
+sidecar services (redis/postgres healthy) and connects via shared
+`DATABASE_URL`/`REDIS_URL` — no self-hosted Postgres per app (consolidates the
+dev-only cowork postgres). The native MLX/gateway attach via
+`host.docker.internal:11434` / `:11432`.
+
+### Postgres multi-DB init
+
+The single PG instance creates one DB per app at first boot
+(`POSTGRES_MULTIPLE_DATABASES=cowork,identity,rag,modelhub`), via
+`scripts/pg-init-multiple-db.sh`. Each app connects by DB name; RLS / per-tenant
+isolation remains each app's responsibility.
+
+### Traefik routing
+
+Docker labels on each business service register Traefik routers (TLS on the
+`websecure` entrypoint). A static dynamic config (`traefik/dynamic.yml`) routes
+`/v1` + `/api/gateway` to the **native** fusion-gateway at
+`host.docker.internal:11432`. API-key → tenant resolution stays in
+fusion-identity (upstream) — Traefik forwards the key; the gateway stamps
+`X-Fusion-Tenant` and rejects invalid keys (auth source-of-truth not duplicated
+in compose).
+
+### Sidecar smoke validation
+
+```bash
+bash scripts/smoke-sidecar.test.sh      # unit (no Docker): compose presence + guards
+bash scripts/smoke-sidecar.sh           # live: 5-step sidecar bring-up + overlay merge
+```
+
+Live smoke (design §1.1): precheck → sidecar up → PG multi-DB check → business
+overlay on shared PG/Redis → Traefik router table. Pass banner = `SMOKE PASS`.
+Auto-teardown via `trap`. Log: `/tmp/fusion-smoke-sidecar.*/smoke.log`.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.sidecar.yml -f docker-compose.business.yml down --remove-orphans
+```
+
+Volumes (`pg_data`, `qdrant_data`, `redis_data`, `traefik_letsencrypt`)
+persist across `down` unless `-v` is passed. Nightly backup of PG/Qdrant to
+shared NAS is an ops task (§5.4) — `FUSION_BACKUP_TARGET` documented in
+`.env.example`.
+
