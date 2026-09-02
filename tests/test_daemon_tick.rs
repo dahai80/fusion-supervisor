@@ -35,7 +35,7 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
         vec![def("fusion-rag", 11436)],
         cfg(),
         move |_: &ProbeSpec| pc.lock().unwrap().clone(),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
     // 起始 Unhealthy: 首 tick_all 进重启流 → Restarting
     core.runners[0].state = State::Unhealthy;
@@ -64,7 +64,7 @@ async fn test_tick_all_skips_stopped_runner() {
         |_| ProbeResult::Unhealthy {
             reason: UnhealthyReason::ConnectionRefused,
         },
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
     core.runners[0].state = State::Stopped;
     core.tick_all(2000).await;

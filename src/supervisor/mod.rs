@@ -13,7 +13,8 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-pub type ArcStartFn = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+// 签名: (repo_dir, cmd, env_overrides)。env_overrides 为注入连接 env (issue #8)。
+pub type ArcStartFn = Arc<dyn Fn(&str, &str, &[(String, String)]) -> Result<()> + Send + Sync>;
 pub type ArcProbeFn = Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,7 +59,7 @@ impl SupervisorCore {
                     d,
                     &cmd,
                     move || real_probe_spec(&spec),
-                    move |c: &str| real_start_pair(&repo_dir, c),
+                    move |c: &str| real_start_pair(&repo_dir, c, &[]),
                     policy,
                 )
             })
@@ -86,7 +87,7 @@ impl SupervisorCore {
         defs: Vec<ServiceDef>,
         cfg: Config,
         probe_fn: impl Fn(&ProbeSpec) -> ProbeResult + Send + Sync + 'static,
-        start_fn: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+        start_fn: impl Fn(&str, &str, &[(String, String)]) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self::new_with_fns_and_compose(defs, cfg, probe_fn, start_fn, None)
     }
@@ -96,7 +97,7 @@ impl SupervisorCore {
         defs: Vec<ServiceDef>,
         cfg: Config,
         probe_fn: impl Fn(&ProbeSpec) -> ProbeResult + Send + Sync + 'static,
-        start_fn: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+        start_fn: impl Fn(&str, &str, &[(String, String)]) -> Result<()> + Send + Sync + 'static,
         compose: Option<Box<dyn ComposeBackend>>,
     ) -> Self {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -184,39 +185,66 @@ impl SupervisorCore {
                 let start_fn = self.start_fn.clone();
                 let probe_fn = self.probe_fn.clone();
                 let timeout = self.cfg.start_timeout_sec;
-                // 返回 (服务名, 是否跳过=已健康), join 后据其写 runner.state
+                let compose_enabled = self.cfg.compose.enabled;
+                let env_file = self.cfg.compose.env_file.clone();
+                // 返回 (服务名, 是否跳过=已健康, 启动结果), join 后据其写 runner.state
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // 先探活: 已健康跳过 (R11: 用注入 probe_fn, 非真 probe)
                     let spec = ProbeSpec::tcp(d.port);
                     if matches!((probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                         tracing::info!(svc = %d.name, "skip start (already up)");
-                        return (d.name, true);
+                        return (d.name, true, Ok(()));
                     }
-                    tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh start");
-                    let cmd = async { (start_fn)(&d.repo_dir, "start") };
+                    // issue #8: compose enabled 时, 依赖 sidecar 的服务注入连接 env。
+                    // fail-closed: 解析失败 → 拒绝启动 (非静默降级)。
+                    let env_overrides: Vec<(String, String)> = if compose_enabled
+                        && crate::env_map::needs_injection(&d.name)
+                    {
+                        match crate::env_map::native_env_for(&d.name, &env_file) {
+                            Ok(m) => m.into_iter().collect(),
+                            Err(e) => {
+                                tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
+                                return (d.name, false, Err(e));
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start");
+                    let cmd = async { (start_fn)(&d.repo_dir, "start", &env_overrides) };
                     match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
-                        Ok(Ok(())) => (d.name, false),
+                        Ok(Ok(())) => (d.name, false, Ok(())),
                         Ok(Err(e)) => {
                             tracing::warn!(svc = %d.name, err = %e, "start fail");
-                            (d.name, false)
+                            (d.name, false, Err(e))
                         }
                         Err(_) => {
+                            let e = anyhow::anyhow!("start timeout {timeout}s");
                             tracing::warn!(svc = %d.name, "start timeout {timeout}s");
-                            (d.name, false)
+                            (d.name, false, Err(e))
                         }
                     }
                 }));
             }
             for h in handles {
-                if let Ok((name, skipped_healthy)) = h.await
+                if let Ok((name, skipped_healthy, start_res)) = h.await
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
-                    r.state = if skipped_healthy {
-                        runner::State::Healthy
+                    if skipped_healthy {
+                        r.state = runner::State::Healthy;
+                    } else if start_res.is_ok() {
+                        r.state = runner::State::Starting;
                     } else {
-                        runner::State::Starting
-                    };
+                        // fail-closed (env 注入失败) 或 start.sh 失败 → 标 Failed。
+                        // 下一 tick 的 handle_unhealthy/探活会补告警; 此处仅记 ERROR。
+                        let detail = start_res
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "start failed".into());
+                        tracing::error!(svc = %name, %detail, "up_native: 服务未启动 (fail-closed 或 start 失败)");
+                        r.state = runner::State::Failed;
+                    }
                 }
             }
         }
@@ -257,7 +285,7 @@ impl SupervisorCore {
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop");
-                    if let Err(e) = (start_fn)(&d.repo_dir, "stop") {
+                    if let Err(e) = (start_fn)(&d.repo_dir, "stop", &[]) {
                         tracing::warn!(svc = %d.name, err = %e, "stop fail");
                     }
                     d.name
@@ -508,8 +536,9 @@ fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
     )))
 }
 
-// 真 start.sh 调用: bash {repo}/start.sh {cmd}, stderr → 每服务日志
-fn real_start_pair(repo_dir: &str, cmd: &str) -> Result<()> {
+// 真 start.sh 调用: bash {repo}/start.sh {cmd}, stderr → 每服务日志。
+// env_overrides: 注入连接 env (issue #8, compose enabled 时依赖 sidecar 的服务)。
+fn real_start_pair(repo_dir: &str, cmd: &str, env_overrides: &[(String, String)]) -> Result<()> {
     let sh = probe_map::start_sh_path(repo_dir);
     if !sh.exists() {
         anyhow::bail!("start.sh 不存在: {}", sh.display());
@@ -519,7 +548,7 @@ fn real_start_pair(repo_dir: &str, cmd: &str) -> Result<()> {
         .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
     std::fs::create_dir_all(&log_dir).ok();
     let svc_log = format!("{log_dir}/{repo_dir}.log");
-    tracing::info!(sh = %sh.display(), cmd, log = %svc_log, "exec start.sh");
+    tracing::info!(sh = %sh.display(), cmd, log = %svc_log, env_n = env_overrides.len(), "exec start.sh");
     let stderr: std::process::Stdio = match std::fs::File::create(&svc_log) {
         Ok(f) => f.into(),
         Err(e) => {
@@ -527,9 +556,13 @@ fn real_start_pair(repo_dir: &str, cmd: &str) -> Result<()> {
             std::process::Stdio::null()
         }
     };
-    let status = std::process::Command::new("bash")
-        .arg(&sh)
-        .arg(cmd)
+    let mut command = std::process::Command::new("bash");
+    command.arg(&sh).arg(cmd);
+    // 注入连接 env (覆盖/新增), 继承父进程其余 env
+    for (k, v) in env_overrides {
+        command.env(k, v);
+    }
+    let status = command
         .stdout(std::process::Stdio::null())
         .stderr(stderr)
         .status()
@@ -554,7 +587,10 @@ mod tests {
     use super::*;
     use crate::manifest::{Layer, ServiceDef};
     use crate::probe::ProbeResult;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // env 注入测试共用 env_map::tests::env_lock (单一全局锁, 避免双锁竞态)。
+    use crate::env_map::tests::env_lock;
 
     fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
         ServiceDef {
@@ -588,7 +624,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 }, // 探活恒健康
-            move |svc, cmd| {
+            move |svc, cmd, _env| {
                 calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
                 Ok(())
             },
@@ -622,7 +658,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 order_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -652,7 +688,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 order_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -686,7 +722,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |_svc, _cmd| {
+            move |_svc, _cmd, _env| {
                 let mut cur = inflight_p.lock().unwrap();
                 *cur += 1;
                 let mut mx = max_p.lock().unwrap();
@@ -715,7 +751,7 @@ mod tests {
             vec![def("fusion-rag", Layer::App, 11436)],
             fake_cfg(),
             move |_: &ProbeSpec| pc.lock().unwrap().clone(),
-            |_svc, _cmd| Ok(()),
+            |_svc, _cmd, _env| Ok(()),
         );
         // 起始: 已 Unhealthy (首 tick 进重启流 → Restarting)
         core.runners[0].state = runner::State::Unhealthy;
@@ -740,7 +776,7 @@ mod tests {
             vec![def("fusion-rag", Layer::App, 11436)],
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
         );
         // 全 Healthy → poll_healthy_sec
         core.runners[0].state = runner::State::Healthy;
@@ -789,7 +825,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 no_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -823,7 +859,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, cmd| {
+            move |svc, cmd, _env| {
                 cp.lock().unwrap().push(format!("{svc}/{cmd}"));
                 Ok(())
             },
@@ -852,7 +888,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 no_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -881,7 +917,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -911,7 +947,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -932,7 +968,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -950,7 +986,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         // compose 服务 → Some
@@ -962,7 +998,7 @@ mod tests {
             vec![def("fusion-mlx", Layer::Core, 11434)],
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
         );
         assert!(core2.compose_logs("postgres").is_none());
     }
@@ -986,7 +1022,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 ns_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -1018,7 +1054,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 ns_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -1063,7 +1099,7 @@ mod tests {
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
-            move |svc, _cmd| {
+            move |svc, _cmd, _env| {
                 ns_p.lock().unwrap().push(svc.to_string());
                 Ok(())
             },
@@ -1090,7 +1126,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1114,7 +1150,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1144,7 +1180,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1171,7 +1207,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1196,7 +1232,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1222,7 +1258,7 @@ mod tests {
             defs,
             fake_cfg(),
             |_| ProbeResult::Healthy { latency_ms: 1 },
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
@@ -1235,5 +1271,81 @@ mod tests {
             .iter()
             .any(|e| e.kind == "ServiceBack" && e.plane == "compose");
         assert!(has_back, "恢复应写 ServiceBack 事件 plane=compose");
+    }
+
+    // issue #8: compose disabled (单节点开发) → 依赖 sidecar 的服务照常启动, 无 env 注入。
+    // start_fn 收到空 env_overrides (第三参为空切片)。
+    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_up_native_no_env_injection_when_compose_disabled() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        let defs = vec![def("fusion-identity", Layer::App, 11450)];
+        let received_env: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let re_p = received_env.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(), // compose.enabled=false (默认)
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |_svc, _cmd, env: &[(String, String)]| {
+                re_p.lock().unwrap().extend(env.iter().cloned());
+                Ok(())
+            },
+        );
+        assert!(!core.compose_enabled(), "compose 应未启用");
+        core.up_all().await.unwrap();
+        assert!(
+            received_env.lock().unwrap().is_empty(),
+            "compose disabled 时不应注入连接 env"
+        );
+        assert!(
+            matches!(core.runners[0].state, runner::State::Starting),
+            "无注入时服务应正常 Starting"
+        );
+    }
+
+    // issue #8: compose enabled + 依赖 sidecar 的服务 + .env 缺 FUSION_PG_PASSWORD
+    // → fail-closed: 拒绝启动, 不调 start.sh, runner 标 Failed。
+    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_up_native_fail_closed_when_pg_password_missing() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        // .env 只有 USER 无 PASSWORD → DATABASE_URL 构造不出
+        let env_f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(env_f.path(), "FUSION_PG_USER=fusion\n").unwrap();
+        let mut cfg = fake_cfg();
+        cfg.compose.enabled = true;
+        cfg.compose.env_file = env_f.path().to_path_buf();
+        let defs = vec![def("fusion-identity", Layer::App, 11450)];
+        let started: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let st_p = started.clone();
+        let fake = Box::new(FakeCompose::new());
+        // dep-gate (#5): fusion-identity 依赖 postgres, 需 postgres Healthy 才过门,
+        // 过门后才走 env 注入 (fail-closed 路径)。无此容器 dep-gate 先跳过 → Stopped。
+        fake.set_containers(vec![mk_container("postgres", "running", "healthy", 5432)]);
+        let mut core = SupervisorCore::new_with_fns_and_compose(
+            defs,
+            cfg,
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |_svc, _cmd, _env| {
+                *st_p.lock().unwrap() = true;
+                Ok(())
+            },
+            Some(fake),
+        );
+        assert!(core.compose_enabled(), "compose 应启用");
+        core.up_all().await.unwrap();
+        assert!(!*started.lock().unwrap(), "fail-closed 应拒绝调用 start.sh");
+        assert!(
+            matches!(core.runners[0].state, runner::State::Failed),
+            "env 注入失败应标 Failed (非静默降级)"
+        );
     }
 }
