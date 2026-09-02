@@ -151,6 +151,48 @@ async fn dispatch(
             };
             make_result(json!({"lines": out, "plane": "native"}), req.id)
         }
+        Some(Method::Drain) => {
+            // issue #9: drain 单服务 (params.service) 或全部 (无 service)。
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut c = core.lock().await;
+            match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match c.drain(s, now_ts) {
+                    Ok(()) => make_result(json!("ok"), req.id),
+                    Err(e) => make_error(-32000, &e.to_string(), req.id),
+                },
+                _ => match c.drain_all(now_ts) {
+                    Ok(()) => make_result(json!("ok"), req.id),
+                    Err(e) => make_error(-32000, &e.to_string(), req.id),
+                },
+            }
+        }
+        Some(Method::Rollout) => {
+            // issue #9: 零停机换版单服务 (drain→stop→start→prewarm→清 drain)。
+            let svc = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return make_error(-32602, "invalid params: service required", req.id),
+            };
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut c = core.lock().await;
+            let grace = c.cfg.drain_grace_sec;
+            let prewarm_timeout = c.cfg.rollout_prewarm_timeout_sec;
+            match c.rollout(&svc, now_ts, grace, prewarm_timeout).await {
+                Ok(()) => {
+                    tracing::info!(svc = %svc, "rollout ok (prewarm healthy)");
+                    make_result(json!("ok"), req.id)
+                }
+                Err(e) => {
+                    tracing::warn!(svc = %svc, err = %e, "rollout fail");
+                    make_error(-32000, &format!("rollout fail: {e}"), req.id)
+                }
+            }
+        }
         Some(Method::Top | Method::Shutdown) => make_error(-32601, "not implemented yet", req.id),
     }
 }

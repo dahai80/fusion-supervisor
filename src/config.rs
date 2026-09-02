@@ -18,6 +18,12 @@ pub struct Config {
     // compose 容器连续失败达此次数 → 升级告警 (ContainerCrashLoop, issue #6)
     #[serde(default = "default_container_crash_escalation")]
     pub container_crash_escalation: u32,
+    // issue #9: drain 宽限期 (秒)。到期强制 Stopped (in-flight 未完也停)。
+    #[serde(default = "default_drain_grace_sec")]
+    pub drain_grace_sec: u64,
+    // issue #9: rollout prewarm 超时 (秒)。启动后探活在此时间内未达 Healthy → 告警 + 留 Stopped。
+    #[serde(default = "default_rollout_prewarm_timeout_sec")]
+    pub rollout_prewarm_timeout_sec: u64,
     pub registry_path: PathBuf,
     #[serde(default)]
     pub compose: ComposeConfig,
@@ -48,6 +54,12 @@ fn default_env() -> PathBuf {
 fn default_container_crash_escalation() -> u32 {
     5
 }
+fn default_drain_grace_sec() -> u64 {
+    30
+}
+fn default_rollout_prewarm_timeout_sec() -> u64 {
+    60
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -64,6 +76,8 @@ impl Default for Config {
             alert_url: String::new(),
             alert_dedup_sec: 300,
             container_crash_escalation: 5,
+            drain_grace_sec: 30,
+            rollout_prewarm_timeout_sec: 60,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
         }
