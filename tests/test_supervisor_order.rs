@@ -34,7 +34,7 @@ async fn test_up_order_core_before_app() {
         |_| ProbeResult::Unhealthy {
             reason: UnhealthyReason::ConnectionRefused,
         },
-        move |svc, _c| {
+        move |svc, _c, _env| {
             o.lock().unwrap().push(svc.into());
             Ok(())
         },
