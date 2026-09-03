@@ -45,6 +45,8 @@ enum Commands {
     },
     /// Run a one-shot backup (Postgres + Qdrant → FUSION_BACKUP_TARGET) — issue #10
     Backup,
+    /// Gracefully shut down the daemon (remote shutdown via RPC) — issue #20
+    Shutdown,
 }
 
 #[tokio::main]
@@ -69,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Some(Commands::Rollout { service }) => cli_call_param(cfg, "rollout", service).await,
         Some(Commands::Backup) => cli_call(cfg, "backup").await,
+        Some(Commands::Shutdown) => cli_call(cfg, "shutdown").await,
     }
 }
 
@@ -81,8 +84,12 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let token = std::env::var("FUSION_SV_TOKEN").ok();
     let core_rpc = core.clone();
     let socket_path = cfg.socket_path.clone();
+    // issue #20: shutdown 信号通道 (RPC Shutdown → run_daemon select 退出)。
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        if let Err(e) = rpc::server::serve(core_rpc, &socket_path, token).await {
+        if let Err(e) =
+            rpc::server::serve_with_shutdown(core_rpc, &socket_path, token, Some(shutdown_tx)).await
+        {
             tracing::error!(err = %e, "rpc serve exit");
         }
     });
@@ -108,8 +115,15 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             c.check_backup_schedule(now).await;
         }
     });
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("daemon shutdown (ctrl-c)");
+    // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("daemon shutdown (ctrl-c)");
+        }
+        _ = &mut shutdown_rx => {
+            tracing::info!("daemon shutdown (rpc)");
+        }
+    }
     tick_handle.abort();
     Ok(())
 }

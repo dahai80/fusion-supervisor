@@ -27,6 +27,7 @@ fusion-sv ping            # ping the daemon (alive check, prints pong)
 fusion-sv drain [svc]     # drain traffic from one service or all (zero-downtime prep) — issue #9
 fusion-sv rollout <svc>   # zero-downtime rollout: drain→stop→start→prewarm — issue #9
 fusion-sv backup          # one-shot backup: Postgres (pg_dumpall→gzip) + Qdrant snapshot → NAS — issue #10
+fusion-sv shutdown        # gracefully shut down the daemon over the UDS socket — issue #20
 ```
 
 When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 41 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
@@ -42,6 +43,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 41 nati
 - **Alerts:** `ServiceDown` (deduped 5min/service), `ServiceBack`, `RestartFailed`, `RestartCapHit` → log + optional webhook.
 - **Compose plane (optional):** `docker compose` wrapped behind `ComposeBackend` trait. `up` = sidecar (`--wait`) → native (layer-ordered) → business (`--wait`); `down` = compose `down --remove-orphans` → native reverse. `status` merges native + container rows (tagged by `plane`); `tick` alerts on exited/unhealthy containers (monitored, not crash-restarted — Docker restart policy owns that). Fail-closed on `FUSION_PG_PASSWORD`/`FUSION_MLX_API_KEY`. See `src/compose.rs`.
 - **NAS backup (issue #10):** `fusion-sv backup` (CLI or RPC) dumps Postgres (`pg_dumpall` → gzip) and snapshots Qdrant (`storage` tar) to `FUSION_BACKUP_TARGET` (`{target}/fusion-pg-{date}.sql.gz`, `{target}/fusion-qdrant-{date}/`). Scheduled by the daemon tick loop via `backup_schedule_sec` (default daily); retention `backup_retention` (default 7) prunes older sets. **Fail-closed:** `FUSION_BACKUP_TARGET` unset → refuses + `BackupFailed` alert (production safety task never silently skipped). Outcome recorded in history.db as `kind=Backup`. See `src/backup.rs`.
+- **Remote shutdown (issue #20):** `fusion-sv shutdown` (CLI or RPC) sends a one-shot signal over the UDS socket. The daemon's main loop selects on `ctrl-c` OR this signal, so either triggers the same graceful path (abort tick loop, return). Idempotent: a second `shutdown` call returns `-32000 shutdown channel unavailable` (the signal can only be sent once). `top` is a client-side command (`fusion-sv top` loops `fusion-sv status` with a 1s clear-screen refresh) — its server RPC arm returns `-32601` with a message directing you to run `fusion-sv top` directly; no server RPC is needed.
 
 ## Config
 

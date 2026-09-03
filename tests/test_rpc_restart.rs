@@ -1,6 +1,6 @@
 // C2: Method::Restart RPC — reset policy + set Stopped + invoke_start → Starting,
 // returns "ok". Unknown service → -32602. Empty/missing service → -32602.
-// Top/Shutdown 保持 -32601 未实现。
+// Top/Shutdown: Top 是客户端命令 (-32601 带说明), Shutdown 已实现 (issue #20)。
 //
 // 偏差说明: brief 期望断言 "start_fn was called", 但 new_with_fns 把 runner 的
 // start_fn 硬编码为 no-op (|_: &str| Ok(())), 注入的 start_fn 只供 up/down 用,
