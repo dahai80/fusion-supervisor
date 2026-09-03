@@ -5,10 +5,21 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+// issue #20: shutdown 信号 (RPC Shutdown arm 触发 → run_daemon select 接收 → 优雅退出)。
 pub async fn serve(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     socket_path: &str,
     token: Option<String>,
+) -> Result<()> {
+    serve_with_shutdown(core, socket_path, token, None).await
+}
+
+// 带 shutdown tx 的 serve: Shutdown arm 发送信号, run_daemon 监听 rx。
+pub async fn serve_with_shutdown(
+    core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
+    socket_path: &str,
+    token: Option<String>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -17,11 +28,13 @@ pub async fn serve(
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
     tracing::info!(sock = %socket_path, "rpc server listening (0600)");
+    let shutdown_tx = std::sync::Arc::new(tokio::sync::Mutex::new(shutdown_tx));
     loop {
         let (stream, _) = listener.accept().await?;
         let core = core.clone();
         let token = token.clone();
-        tokio::spawn(handle_conn(stream, core, token));
+        let tx = shutdown_tx.clone();
+        tokio::spawn(handle_conn(stream, core, token, tx));
     }
 }
 
@@ -29,12 +42,13 @@ async fn handle_conn(
     stream: tokio::net::UnixStream,
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     token: Option<String>,
+    shutdown_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let resp = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(req) => dispatch(req, &core, &token).await,
+            Ok(req) => dispatch(req, &core, &token, &shutdown_tx).await,
             Err(e) => make_error(-32700, &format!("parse error: {e}"), 0),
         };
         let mut out =
@@ -50,6 +64,7 @@ async fn dispatch(
     req: RpcRequest,
     core: &std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     token: &Option<String>,
+    shutdown_tx: &std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) -> RpcResponse {
     if let Some(expected) = token {
         let got = req
@@ -193,7 +208,29 @@ async fn dispatch(
                 }
             }
         }
-        Some(Method::Top | Method::Shutdown) => make_error(-32601, "not implemented yet", req.id),
+        // issue #20: Top 是客户端命令 (cli_top 循环 cli_status), 无需 server RPC。
+        Some(Method::Top) => make_error(
+            -32601,
+            "top is a client-side command, run `fusion-sv top` directly",
+            req.id,
+        ),
+        // issue #20: 优雅远程关停 daemon。发送 shutdown 信号 → run_daemon select 接收 → 退出。
+        Some(Method::Shutdown) => {
+            let mut guard = shutdown_tx.lock().await;
+            let usable = guard.as_ref().map(|tx| !tx.is_closed()).unwrap_or(false);
+            if usable {
+                // 取出 tx 发送; 置 None 防重复触发 (幂等: 再次 shutdown 返回 unavailable)。
+                if let Some(tx) = guard.take()
+                    && tx.send(()).is_err()
+                {
+                    tracing::warn!("shutdown signal recv already dropped");
+                }
+                tracing::info!("shutdown requested via rpc");
+                make_result(json!("ok"), req.id)
+            } else {
+                make_error(-32000, "shutdown channel unavailable", req.id)
+            }
+        }
         Some(Method::Backup) => {
             // issue #10: 一次性备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
             // fail-closed: target 未设 → Err + BackupFailed 告警。
