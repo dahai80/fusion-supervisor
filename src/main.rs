@@ -115,6 +115,20 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             c.check_backup_schedule(now).await;
         }
     });
+    // issue #22: Prometheus /metrics HTTP 端点 (可选)。
+    // 第三个 spawn task, 共享 core.clone()。hand-rolled HTTP (无新依赖)。
+    // 锁纪律: handler lock().await → metrics::render(&c) → 立即释放, 短持锁同 RPC。
+    let metrics_handle = if let Some(addr) = &cfg.metrics_addr {
+        let core_metrics = core.clone();
+        let addr = addr.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = serve_metrics(core_metrics, &addr).await {
+                tracing::error!(err = %e, "metrics server exit");
+            }
+        }))
+    } else {
+        None
+    };
     // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -125,6 +139,70 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
     }
     tick_handle.abort();
+    if let Some(h) = metrics_handle {
+        h.abort();
+    }
+    Ok(())
+}
+
+// issue #22: hand-rolled Prometheus /metrics HTTP server (无 hyper/axum 依赖)。
+// TcpListener accept 循环: 每连接读请求行, 仅响应 GET /metrics (200 text/plain),
+// 其他路径 404。锁纪律: 短持锁 (lock → render → release), 绝不持锁跨 await。
+async fn serve_metrics(
+    core: Arc<tokio::sync::Mutex<supervisor::SupervisorCore>>,
+    addr: &str,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(addr, "metrics server listening");
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, peer)) => {
+                let core = core.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_metrics_conn(&mut stream, &core).await {
+                        tracing::debug!(peer = %peer, err = %e, "metrics conn error");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "metrics accept error");
+            }
+        }
+    }
+}
+
+async fn handle_metrics_conn(
+    stream: &mut tokio::net::TcpStream,
+    core: &Arc<tokio::sync::Mutex<supervisor::SupervisorCore>>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 读请求 (最多 4KB, 足够 HTTP 请求行 + 头)。
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+    // 仅响应 GET /metrics, 其他 → 404。
+    let is_metrics =
+        first_line.starts_with("GET /metrics") || first_line.starts_with("GET /metrics?");
+    if !is_metrics {
+        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
+    // 短持锁: lock → render → 释放 (render 纯函数, 无 await)。
+    let body = {
+        let c = core.lock().await;
+        fusion_supervisor::metrics::render(&c)
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes()).await?;
     Ok(())
 }
 

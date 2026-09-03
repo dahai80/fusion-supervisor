@@ -33,6 +33,11 @@ pub struct Config {
     pub registry_path: PathBuf,
     #[serde(default)]
     pub compose: ComposeConfig,
+    // issue #22: Prometheus /metrics HTTP 端点监听地址。
+    // Some → 启用端点; None → 不启 HTTP server (默认 Some("127.0.0.1:9100"))。
+    // 仅 localhost 绑定是安全边界 (不对外暴露, 不加 auth)。
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: Option<String>,
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
@@ -72,6 +77,10 @@ fn default_backup_schedule_sec() -> u64 {
 fn default_backup_retention() -> u32 {
     7
 }
+// issue #22: metrics 默认绑 localhost:9100 (不对外, 无 auth)。
+fn default_metrics_addr() -> Option<String> {
+    Some("127.0.0.1:9100".to_string())
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -94,6 +103,7 @@ impl Default for Config {
             backup_retention: 7,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
+            metrics_addr: default_metrics_addr(),
         }
     }
 }
@@ -119,6 +129,12 @@ impl Config {
         cfg.compose.sidecar_file = expand_tilde(&cfg.compose.sidecar_file);
         cfg.compose.business_file = expand_tilde(&cfg.compose.business_file);
         cfg.compose.env_file = expand_tilde(&cfg.compose.env_file);
+        // issue #22: 空字符串 → None (禁用 metrics 端点)。
+        if let Some(addr) = &cfg.metrics_addr
+            && addr.trim().is_empty()
+        {
+            cfg.metrics_addr = None;
+        }
         Ok(cfg)
     }
 }

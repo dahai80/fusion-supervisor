@@ -7,6 +7,7 @@ pub mod config;
 pub mod dep_map;
 pub mod env_map;
 pub mod manifest;
+pub mod metrics;
 pub mod probe;
 pub mod probe_map;
 pub mod rpc;
