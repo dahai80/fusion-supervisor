@@ -16,6 +16,8 @@ pub enum AlertKind {
     ServiceDrained,
     // issue #9: rollout prewarm 失败 (启动后超时未达 Healthy)
     RolloutPrewarmFailed,
+    // issue #10: 备份失败 (目标未设/不可写/docker exec 失败)
+    BackupFailed,
 }
 
 impl AlertKind {
@@ -29,6 +31,7 @@ impl AlertKind {
             AlertKind::ContainerCrashLoop => "ContainerCrashLoop",
             AlertKind::ServiceDrained => "ServiceDrained",
             AlertKind::RolloutPrewarmFailed => "RolloutPrewarmFailed",
+            AlertKind::BackupFailed => "BackupFailed",
         }
     }
 }

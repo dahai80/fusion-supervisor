@@ -40,6 +40,8 @@ pub enum Method {
     // issue #9: 摘流量 (单服务或全部) + 零停机换版
     Drain,
     Rollout,
+    // issue #10: NAS 备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)
+    Backup,
 }
 
 pub fn parse_method(s: &str) -> Option<Method> {
@@ -54,6 +56,7 @@ pub fn parse_method(s: &str) -> Option<Method> {
         "shutdown" => Some(Method::Shutdown),
         "drain" => Some(Method::Drain),
         "rollout" => Some(Method::Rollout),
+        "backup" => Some(Method::Backup),
         _ => None,
     }
 }

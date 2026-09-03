@@ -27,6 +27,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tabled = "0.17"
 toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
+# issue #10: 备份 gzip 压缩 pg_dumpall 输出
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

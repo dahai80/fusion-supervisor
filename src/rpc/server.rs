@@ -194,5 +194,24 @@ async fn dispatch(
             }
         }
         Some(Method::Top | Method::Shutdown) => make_error(-32601, "not implemented yet", req.id),
+        Some(Method::Backup) => {
+            // issue #10: 一次性备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
+            // fail-closed: target 未设 → Err + BackupFailed 告警。
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut c = core.lock().await;
+            match c.run_backup(now_ts).await {
+                Ok(()) => {
+                    tracing::info!("backup ok (rpc)");
+                    make_result(json!("ok"), req.id)
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "backup fail (rpc, fail-closed 已告警)");
+                    make_error(-32000, &format!("backup fail: {e}"), req.id)
+                }
+            }
+        }
     }
 }

@@ -37,6 +37,8 @@ pub struct SupervisorCore {
     compose: Option<Box<dyn ComposeBackend>>,
     // compose 容器告警节流 (issue #6): 防 flapping 容器每 tick 刷告警。
     compose_tracker: crate::compose_tracker::ComposeTracker,
+    // issue #10: 上次备份时间戳 (调度判定用)。0=从未备份 → 首次 tick 即到期。
+    last_backup_ts: u64,
 }
 
 impl SupervisorCore {
@@ -78,6 +80,7 @@ impl SupervisorCore {
             probe_fn: Arc::new(real_probe_spec),
             compose,
             compose_tracker,
+            last_backup_ts: 0,
         })
     }
 
@@ -138,6 +141,7 @@ impl SupervisorCore {
             probe_fn,
             compose,
             compose_tracker,
+            last_backup_ts: 0,
         }
     }
 
@@ -621,6 +625,45 @@ impl SupervisorCore {
                 return Ok(());
             }
             t += 1;
+        }
+    }
+
+    // issue #10: 执行一次备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
+    // BackupRunner 借用 self.store / self.alerter (避免 Clone Connection)。
+    // 记录 last_backup_ts 供调度。
+    pub async fn run_backup(&mut self, now_ts: u64) -> Result<()> {
+        tracing::info!("backup 开始 (issue #10)");
+        let mut runner = crate::backup::BackupRunner::new(&self.cfg);
+        // 分裂借用: store/alerter/cfg 独立字段, 可同时 &mut runner + &mut self.store + &mut self.alerter
+        let res = runner.run(now_ts, &self.store, &mut self.alerter).await;
+        if res.is_ok() {
+            self.last_backup_ts = now_ts;
+        }
+        res
+    }
+
+    // issue #10: 调度检查。到期 (now >= last + schedule) → 触发 backup。
+    // 在 daemon tick 循环内调用。返回是否触发了备份。
+    pub async fn check_backup_schedule(&mut self, now_ts: u64) -> bool {
+        if !crate::backup::backup_due(now_ts, self.last_backup_ts, self.cfg.backup_schedule_sec) {
+            return false;
+        }
+        tracing::info!(
+            now_ts,
+            schedule = self.cfg.backup_schedule_sec,
+            "backup 调度到期, 触发"
+        );
+        match self.run_backup(now_ts).await {
+            Ok(()) => {
+                tracing::info!("调度备份完成");
+                true
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "调度备份失败 (fail-closed 已告警)");
+                // 失败也更新时间戳, 避免下个 tick 立即重试风暴
+                self.last_backup_ts = now_ts;
+                true
+            }
         }
     }
 }

@@ -24,6 +24,12 @@ pub struct Config {
     // issue #9: rollout prewarm 超时 (秒)。启动后探活在此时间内未达 Healthy → 告警 + 留 Stopped。
     #[serde(default = "default_rollout_prewarm_timeout_sec")]
     pub rollout_prewarm_timeout_sec: u64,
+    // issue #10: 备份调度间隔 (秒)。daemon tick 循环检查, 到期触发 backup。默认 86400 (每日)。
+    #[serde(default = "default_backup_schedule_sec")]
+    pub backup_schedule_sec: u64,
+    // issue #10: 备份保留份数。新备份后裁剪超出 N 份的旧备份, 默认 7。
+    #[serde(default = "default_backup_retention")]
+    pub backup_retention: u32,
     pub registry_path: PathBuf,
     #[serde(default)]
     pub compose: ComposeConfig,
@@ -60,6 +66,12 @@ fn default_drain_grace_sec() -> u64 {
 fn default_rollout_prewarm_timeout_sec() -> u64 {
     60
 }
+fn default_backup_schedule_sec() -> u64 {
+    86400
+}
+fn default_backup_retention() -> u32 {
+    7
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -78,6 +90,8 @@ impl Default for Config {
             container_crash_escalation: 5,
             drain_grace_sec: 30,
             rollout_prewarm_timeout_sec: 60,
+            backup_schedule_sec: 86400,
+            backup_retention: 7,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
         }

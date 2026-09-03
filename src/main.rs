@@ -43,6 +43,8 @@ enum Commands {
     Rollout {
         service: String,
     },
+    /// Run a one-shot backup (Postgres + Qdrant → FUSION_BACKUP_TARGET) — issue #10
+    Backup,
 }
 
 #[tokio::main]
@@ -66,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
             None => cli_call(cfg, "drain").await,
         },
         Some(Commands::Rollout { service }) => cli_call_param(cfg, "rollout", service).await,
+        Some(Commands::Backup) => cli_call(cfg, "backup").await,
     }
 }
 
@@ -101,6 +104,8 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                 .unwrap_or(0);
             let mut c = core_tick.lock().await;
             c.tick_all(now).await;
+            // issue #10: 备份调度检查 (到期触发 run_backup, fail-closed 已告警)
+            c.check_backup_schedule(now).await;
         }
     });
     tokio::signal::ctrl_c().await?;
