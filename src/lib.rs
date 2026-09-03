@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod backup;
 pub mod cli;
 pub mod compose;
 pub mod compose_tracker;
