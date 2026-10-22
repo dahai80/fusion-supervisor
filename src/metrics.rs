@@ -110,6 +110,27 @@ pub fn render(core: &SupervisorCore) -> String {
     out
 }
 
+// issue #26: 只读 HTTP 状态面 (GET /api/v1/status) 纯逻辑渲染。
+// 镜像 UDS RPC `status` 方法: 每服务 {name, state, port, plane} JSON 数组。
+// 浏览器可达的 ops 面板数据源; start/stop 等变更操作仍只在 UDS RPC。
+// 纯函数, 不持锁, 调用方 (HTTP handler) lock core 后传引用, 同 render 锁纪律。
+pub fn render_status_json(core: &SupervisorCore) -> String {
+    let entries: Vec<serde_json::Value> = core
+        .status_all()
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
+            })
+        })
+        .collect();
+    serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "services": entries,
+    }))
+    .unwrap_or_else(|_| "{\"ok\":false,\"services\":[]}".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +233,33 @@ mod tests {
             out.contains("fusion_sv_crash_count{service=\"fusion-mlx\"} 2"),
             "crash_count 应为 2"
         );
+    }
+
+    #[test]
+    fn test_render_status_json_mirrors_status_rpc() {
+        // issue #26: 只读状态面 = UDS status RPC 的字段镜像 (name/state/port/plane)
+        let mut core = SupervisorCore::new_with_fns(
+            vec![
+                def("fusion-mlx", Layer::Core, 11434),
+                def("fusion-agent-studio", Layer::App, 11442),
+            ],
+            cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = State::Healthy;
+        core.runners[1].state = State::Stopped;
+        let out = render_status_json(&core);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        let svcs = v["services"].as_array().unwrap();
+        assert_eq!(svcs.len(), 2);
+        assert_eq!(svcs[0]["name"], "fusion-mlx");
+        assert_eq!(svcs[0]["state"], "Healthy");
+        assert_eq!(svcs[0]["port"], 11434);
+        assert_eq!(svcs[0]["plane"], "native");
+        assert_eq!(svcs[1]["state"], "Stopped");
+        assert_eq!(svcs[1]["port"], 11442);
     }
 
     #[test]
