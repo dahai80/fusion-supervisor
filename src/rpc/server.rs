@@ -11,15 +11,22 @@ pub async fn serve(
     socket_path: &str,
     token: Option<String>,
 ) -> Result<()> {
-    serve_with_shutdown(core, socket_path, token, None).await
+    serve_with_shutdown(
+        core,
+        socket_path,
+        token,
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+    )
+    .await
 }
 
 // 带 shutdown tx 的 serve: Shutdown arm 发送信号, run_daemon 监听 rx。
+// issue #25: tx 改为共享 Arc — HTTP 面 (http_server) 与 UDS 面共用同一信号。
 pub async fn serve_with_shutdown(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     socket_path: &str,
     token: Option<String>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -28,7 +35,6 @@ pub async fn serve_with_shutdown(
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
     tracing::info!(sock = %socket_path, "rpc server listening (0600)");
-    let shutdown_tx = std::sync::Arc::new(tokio::sync::Mutex::new(shutdown_tx));
     loop {
         let (stream, _) = listener.accept().await?;
         let core = core.clone();
@@ -251,4 +257,27 @@ async fn dispatch(
             }
         }
     }
+}
+
+// issue #25: HTTP 面复用 UDS dispatch — 同一 token 语义、同一编排逻辑,
+// 不在 HTTP 层重写 up/down/restart/drain。
+pub async fn dispatch_http(
+    method: &str,
+    params: serde_json::Value,
+    core: &std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
+    token: &Option<String>,
+    shutdown_tx: &std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> RpcResponse {
+    dispatch(
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            method: method.into(),
+            params,
+            id: 1,
+        },
+        core,
+        token,
+        shutdown_tx,
+    )
+    .await
 }

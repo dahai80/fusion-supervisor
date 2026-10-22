@@ -1,0 +1,37 @@
+{
+    "id": "fusion-supervisor",
+    "title": "服务编排控制台",
+    "title_en": "Service Supervisor Console",
+    "description": "服务编排状态：启停/重启/排水/换版操作、健康历史、全局事件告警。",
+    "description_en": "Service orchestration: up/down/restart/drain/rollout actions, health history, global event alerts.",
+    "version": "0.1.0",
+    "path": "/supervisor",
+    "icon": "Activity",
+    "entry": "/shell/fusion-supervisor/",
+    "health": "http://127.0.0.1:9100/health",
+    "backend": "http://127.0.0.1:9100/",
+    "devices": [
+        "desktop",
+        "mobile-ready"
+    ],
+    "category": "infra",
+    "upstream": "http://127.0.0.1:11473",
+    "api_key_env": "FUSION_SV_TOKEN",
+    "pages": [
+        {
+            "route": "/services",
+            "title": "服务",
+            "title_en": "Services"
+        },
+        {
+            "route": "/health",
+            "title": "健康",
+            "title_en": "Health"
+        },
+        {
+            "route": "/alerts",
+            "title": "告警",
+            "title_en": "Alerts"
+        }
+    ]
+}

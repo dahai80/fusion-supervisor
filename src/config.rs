@@ -38,6 +38,10 @@ pub struct Config {
     // 仅 localhost 绑定是安全边界 (不对外暴露, 不加 auth)。
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
+    // issue #25: web 控制台静态产物目录 (web/dist)。
+    // Some → HTTP listener 同时服务 SPA 静态文件; None → 不服务 (默认)。
+    #[serde(default)]
+    pub web_dir: Option<String>,
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
@@ -104,6 +108,7 @@ impl Default for Config {
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
             metrics_addr: default_metrics_addr(),
+            web_dir: None,
         }
     }
 }
@@ -129,11 +134,21 @@ impl Config {
         cfg.compose.sidecar_file = expand_tilde(&cfg.compose.sidecar_file);
         cfg.compose.business_file = expand_tilde(&cfg.compose.business_file);
         cfg.compose.env_file = expand_tilde(&cfg.compose.env_file);
+        // issue #25: web_dir 同样展开 ~ (与 db_path 一致)。
+        if let Some(dir) = &cfg.web_dir {
+            cfg.web_dir = Some(expand_tilde(Path::new(dir)).to_string_lossy().into_owned());
+        }
         // issue #22: 空字符串 → None (禁用 metrics 端点)。
         if let Some(addr) = &cfg.metrics_addr
             && addr.trim().is_empty()
         {
             cfg.metrics_addr = None;
+        }
+        // issue #25: 空字符串 → None (不服务 web 静态面)。
+        if let Some(dir) = &cfg.web_dir
+            && dir.trim().is_empty()
+        {
+            cfg.web_dir = None;
         }
         Ok(cfg)
     }

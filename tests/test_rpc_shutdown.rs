@@ -66,7 +66,7 @@ async fn test_rpc_shutdown_sends_signal_and_returns_ok() {
             core_serve,
             &sock_clone,
             None,
-            Some(tx),
+            Arc::new(tokio::sync::Mutex::new(Some(tx))),
         )
         .await;
     });
@@ -100,7 +100,7 @@ async fn test_rpc_shutdown_idempotent_second_call_unavailable() {
             core_serve,
             &sock_clone,
             None,
-            Some(tx),
+            Arc::new(tokio::sync::Mutex::new(Some(tx))),
         )
         .await;
     });
@@ -138,7 +138,7 @@ async fn test_rpc_top_returns_32601_client_side_message() {
             core_serve,
             &sock_clone,
             None,
-            None,
+            Arc::new(tokio::sync::Mutex::new(None)),
         )
         .await;
     });

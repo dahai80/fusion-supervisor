@@ -150,6 +150,28 @@ impl HistoryStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    // issue #25: 全局事件流 (web 告警列表数据源) — 跨服务最近事件, 时间升序返回。
+    pub fn recent_events_all(&self, limit: u32) -> Result<Vec<EventRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, service, kind, detail, plane FROM (
+                 SELECT ts, service, kind, detail, plane FROM event
+                 ORDER BY ts DESC LIMIT ?
+             ) ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(EventRow {
+                ts: r.get::<_, i64>(0)? as u64,
+                service: r.get(1)?,
+                kind: r.get(2)?,
+                detail: r.get(3)?,
+                plane: r.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
 }
 
 // 迁移: 旧库表无 plane 列 → ALTER ADD COLUMN。SQLite 无 IF NOT EXISTS,
