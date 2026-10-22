@@ -45,6 +45,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 41 nati
 - **NAS backup (issue #10):** `fusion-sv backup` (CLI or RPC) dumps Postgres (`pg_dumpall` → gzip) and snapshots Qdrant (`storage` tar) to `FUSION_BACKUP_TARGET` (`{target}/fusion-pg-{date}.sql.gz`, `{target}/fusion-qdrant-{date}/`). Scheduled by the daemon tick loop via `backup_schedule_sec` (default daily); retention `backup_retention` (default 7) prunes older sets. **Fail-closed:** `FUSION_BACKUP_TARGET` unset → refuses + `BackupFailed` alert (production safety task never silently skipped). Outcome recorded in history.db as `kind=Backup`. See `src/backup.rs`.
 - **Remote shutdown (issue #20):** `fusion-sv shutdown` (CLI or RPC) sends a one-shot signal over the UDS socket. The daemon's main loop selects on `ctrl-c` OR this signal, so either triggers the same graceful path (abort tick loop, return). Idempotent: a second `shutdown` call returns `-32000 shutdown channel unavailable` (the signal can only be sent once). `top` is a client-side command (`fusion-sv top` loops `fusion-sv status` with a 1s clear-screen refresh) — its server RPC arm returns `-32601` with a message directing you to run `fusion-sv top` directly; no server RPC is needed.
 - **Prometheus /metrics (issue #22):** the daemon serves a `/metrics` HTTP endpoint (Prometheus text exposition format v0.0.4) on `metrics_addr` (default `127.0.0.1:9100`, localhost-only — no auth, the binding is the security boundary). Set `metrics_addr = ""` (or omit) to disable. Hand-rolled HTTP server (`tokio::net::TcpListener` + `tokio::io`) — no hyper/axum/prometheus crate added. Lock discipline: handler locks core → `metrics::render` (pure function) → releases immediately, same short-lock pattern as RPC; never held across `.await`. Metrics: `fusion_sv_up 1` (daemon alive), `fusion_sv_services_total{plane}` (count by plane), `fusion_sv_service_healthy{service,port,plane}` (1/0), `fusion_sv_service_state{service,port,plane,state}` (1 for current state), `fusion_sv_crash_count{service}` (sliding-window crash count, native only). See `src/metrics.rs`.
+- **Read-only HTTP status (issue #26):** the same HTTP listener also serves `GET /api/v1/status` — a JSON array mirroring the UDS `status` RPC (`[{name, state, port, plane}]`, wrapped as `{"ok": true, "services": [...]}`). Browser-reachable data source for web ops dashboards; loopback-bound with the metrics listener (the binding is the security boundary). Read-only by design: start/stop/restart stay on the token-authed UDS RPC; unknown paths 404. See `metrics::render_status_json` in `src/metrics.rs`.
 
 ## Config
 
@@ -63,7 +64,7 @@ backoff_max_sec = 30
 alert_url = ""        # empty = log only
 alert_dedup_sec = 300
 registry_path = "architecture/port-registry.yaml"
-metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22); "" = disable
+metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22) + read-only GET /api/v1/status (issue #26); "" = disable both
 
 # Compose plane orchestration (disabled by default — native-only)
 [compose]

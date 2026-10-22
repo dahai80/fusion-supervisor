@@ -146,8 +146,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
 }
 
 // issue #22: hand-rolled Prometheus /metrics HTTP server (无 hyper/axum 依赖)。
-// TcpListener accept 循环: 每连接读请求行, 仅响应 GET /metrics (200 text/plain),
-// 其他路径 404。锁纪律: 短持锁 (lock → render → release), 绝不持锁跨 await。
+// TcpListener accept 循环: 每连接读请求行, 响应 GET /metrics (200 text/plain) 与
+// issue #26 的 GET /api/v1/status (200 JSON), 其他路径 404。
+// 锁纪律: 短持锁 (lock → render → release), 绝不持锁跨 await。
 async fn serve_metrics(
     core: Arc<tokio::sync::Mutex<supervisor::SupervisorCore>>,
     addr: &str,
@@ -184,21 +185,33 @@ async fn handle_metrics_conn(
     }
     let req = String::from_utf8_lossy(&buf[..n]);
     let first_line = req.lines().next().unwrap_or("");
-    // 仅响应 GET /metrics, 其他 → 404。
+    // issue #26: GET /api/v1/status → 只读 JSON 状态面 (镜像 UDS status RPC);
+    // 其余仅响应 GET /metrics, 其他路径 → 404。变更操作 (start/stop) 仍只在 UDS。
+    let is_status = first_line.starts_with("GET /api/v1/status")
+        || first_line.starts_with("GET /api/v1/status?");
     let is_metrics =
         first_line.starts_with("GET /metrics") || first_line.starts_with("GET /metrics?");
-    if !is_metrics {
+    if !is_metrics && !is_status {
         let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         stream.write_all(resp.as_bytes()).await?;
         return Ok(());
     }
     // 短持锁: lock → render → 释放 (render 纯函数, 无 await)。
-    let body = {
-        let c = core.lock().await;
-        fusion_supervisor::metrics::render(&c)
+    let (content_type, body) = if is_status {
+        let body = {
+            let c = core.lock().await;
+            fusion_supervisor::metrics::render_status_json(&c)
+        };
+        ("application/json; charset=utf-8", body)
+    } else {
+        let body = {
+            let c = core.lock().await;
+            fusion_supervisor::metrics::render(&c)
+        };
+        ("text/plain; version=0.0.4; charset=utf-8", body)
     };
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
