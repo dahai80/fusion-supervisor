@@ -11,6 +11,7 @@ fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
         repo_dir: name.into(),
         purpose: "x".into(),
         fixed: false,
+        managed: true,
         layer,
     }
 }

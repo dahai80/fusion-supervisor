@@ -30,6 +30,16 @@ fusion-sv backup          # one-shot backup: Postgres (pg_dumpall→gzip) + Qdra
 fusion-sv shutdown        # gracefully shut down the daemon over the UDS socket — issue #20
 ```
 
+**FUSION_ROOT (required in practice).** Default start paths resolve as `bash $FUSION_ROOT/<repo>/start.sh`. `FUSION_ROOT` env wins; when unset the daemon falls back to its cwd — so `cd fusion-supervisor && fusion-sv daemon` resolves every default start path relative to the wrong directory and `up` fails closed with "脚本不存在" errors. Start the daemon from the monorepo root instead:
+
+```bash
+cd ~/fusion && FUSION_ROOT=~/fusion fusion-sv daemon
+```
+
+The daemon logs a one-line warning at boot when `FUSION_ROOT` is unset and the cwd does not look like the monorepo root (no `architecture/port-registry.yaml`).
+
+**Registry exemptions (issue #31).** Registry entries may set `supervise: false` — the supervisor skips them entirely (no runner, no probe, no restart, not in status): they are dev-only servers, k8s deploy artifacts, or not-yet-built ports that have nothing to supervise locally. Exempted today: `fusion-web-shell` (Vite dev server; production serves static dist from the gateway), `fusion-gateway-deploy` (k8s/helm artifact), `fusion-comfyui-frontend` (Phase 4, not built). `fusion-plugins-ecosystem` (:8765) is NOT exempt — it is daemonized via `start_map` as `fusion-plugin-server --transport sse --port 8765` (TCP probe; the MCP server has no `/health`).
+
 When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
 ## How it works
@@ -37,7 +47,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 nati
 - **Source of truth:** reads `architecture/port-registry.yaml` for the 53-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
 - **Dual-mode binary:** `daemon` = long-lived supervisor loop + UDS JSON-RPC server (`/tmp/fusion-sv.sock`, perms 0600); CLI subcommands = one-shot client over the same UDS.
 - **Health probing:** per-service `probe_map` normalizes liveness paths (HTTP `/health`/`/healthz`, UDS `ping`→`pong`, TCP fallback). 2s timeout.
-- **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset).
+- **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Backoff is scheduled, not slept in-lock (issue #31): the tick records a `restart_after` deadline and returns, so `/metrics` and status RPCs stay responsive while failing services churn. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset). `up [svc]` / `down [svc]` are true single-service operations (issue #31 — previously the service argument was silently ignored and `down <svc>` stopped everything).
 - **Anti-restart-storm:** a 404/405 (`BadPath`) = probe path wrong, NOT a crash signal → never restarts, only alerts. Only `ConnectionRefused`/`Timeout` trigger restart. The crash-window cap is the final backstop.
 - **History:** SQLite (`~/.fusion-sv/history.db`, WAL mode), `health_check` + `event` tables, 7-day retention.
 - **Alerts:** `ServiceDown` (deduped 5min/service), `ServiceBack`, `RestartFailed`, `RestartCapHit` → log + optional webhook.

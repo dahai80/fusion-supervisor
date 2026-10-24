@@ -192,6 +192,7 @@ impl Config {
             cfg.db_path = expand_tilde(&cfg.db_path);
             cfg.registry_path = expand_tilde(&cfg.registry_path);
             cfg.compose = ComposeConfig::default();
+            cfg.compose.env_file = resolve_env_file(&cfg.compose.env_file);
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(&expanded)?;
@@ -201,6 +202,7 @@ impl Config {
         cfg.compose.sidecar_file = expand_tilde(&cfg.compose.sidecar_file);
         cfg.compose.business_file = expand_tilde(&cfg.compose.business_file);
         cfg.compose.env_file = expand_tilde(&cfg.compose.env_file);
+        cfg.compose.env_file = resolve_env_file(&cfg.compose.env_file);
         // issue #25: web_dir 同样展开 ~ (与 db_path 一致)。
         if let Some(dir) = &cfg.web_dir {
             cfg.web_dir = Some(expand_tilde(Path::new(dir)).to_string_lossy().into_owned());
@@ -227,6 +229,23 @@ fn expand_tilde(p: &Path) -> PathBuf {
         && let Some(home) = dirs_or_home()
     {
         return PathBuf::from(s.replacen("~", &home, 1));
+    }
+    p.to_path_buf()
+}
+
+// issue #31: 相对 env_file 在 FUSION_ROOT 设置且该处存在时优先相对 monorepo 根解析。
+// README 引导从 monorepo 根启动 daemon (start.sh 路径解析依赖 FUSION_ROOT), 若 .env
+// 仍按 CWD 找, 密钥文件留在 fusion-supervisor/ 会读不到 → shell env fail-closed 拒启动。
+// 显式绝对路径 / ~ 展开后不受影响; FUSION_ROOT 下不存在则回退 CWD (旧行为)。
+fn resolve_env_file(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Ok(root) = std::env::var("FUSION_ROOT") {
+        let candidate = PathBuf::from(root).join(p);
+        if candidate.exists() {
+            return candidate;
+        }
     }
     p.to_path_buf()
 }
@@ -298,6 +317,12 @@ mod tests {
         let path = std::env::temp_dir().join("fusion-sv-config-partial-test.toml");
         std::fs::write(&path, "auto_up_on_start = true\n").unwrap();
         let _guard = EnvGuard::set("FUSION_SV_CONFIG", path.to_str().unwrap());
+        // issue #31: env 全局共享, config 测试也须与其它 env 测试共用锁串行
+        let _g0 = crate::env_map::tests::env_lock().lock().unwrap();
+        // 钉住 FUSION_ROOT 到无 .env 的临时目录, 断言不受宿主环境影响
+        let empty_root = std::env::temp_dir().join("fusion-sv-config-test-root");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        let _guard2 = EnvGuard::set("FUSION_ROOT", empty_root.to_str().unwrap());
         let cfg = Config::load().expect("部分配置应加载成功");
         assert!(cfg.auto_up_on_start, "覆盖项应生效");
         assert_eq!(cfg.socket_path, "/tmp/fusion-sv.sock");
@@ -311,5 +336,29 @@ mod tests {
             PathBuf::from("docker-compose.sidecar.yml")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // issue #31: 相对 env_file 优先解析到 FUSION_ROOT 下 (存在时), 否则回退 CWD
+    #[test]
+    fn test_resolve_env_file_fusion_root_priority() {
+        // issue #31: 同上, env 锁串行
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join("fusion-sv-envroot-test");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "K=V\n").unwrap();
+        let _guard = EnvGuard::set("FUSION_ROOT", root.to_str().unwrap());
+        assert_eq!(
+            resolve_env_file(Path::new(".env")),
+            root.join(".env"),
+            "FUSION_ROOT 下存在 .env 时应优先解析到根"
+        );
+        assert_eq!(
+            resolve_env_file(Path::new("other.env")),
+            PathBuf::from("other.env"),
+            "FUSION_ROOT 下不存在时回退 CWD 相对路径"
+        );
+        let abs = root.join("abs.env");
+        assert_eq!(resolve_env_file(&abs), abs, "绝对路径原样返回");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

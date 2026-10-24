@@ -13,6 +13,7 @@ fn def(name: &str, port: u16) -> ServiceDef {
         repo_dir: name.into(),
         purpose: "x".into(),
         fixed: false,
+        managed: true,
         layer: Layer::App,
     }
 }
@@ -37,9 +38,16 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
         move |_: &ProbeSpec| pc.lock().unwrap().clone(),
         |_, _, _| Ok(()),
     );
-    // 起始 Unhealthy: 首 tick_all 进重启流 → Restarting
+    // 起始 Unhealthy。issue #31: 退避改为排期 — 首 tick_all 排期不重启,
+    // 到点 tick_all (delay=1s) 才进重启流 → Restarting
     core.runners[0].state = State::Unhealthy;
     core.tick_all(1000).await;
+    assert!(
+        matches!(core.runners[0].state, State::Unhealthy),
+        "排期 tick 不应重启, 实测 {:?}",
+        core.runners[0].state
+    );
+    core.tick_all(1001).await;
     assert!(
         matches!(core.runners[0].state, State::Restarting),
         "tick_all 后应 Restarting, 实测 {:?}",

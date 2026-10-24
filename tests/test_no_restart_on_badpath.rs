@@ -14,6 +14,7 @@ async fn test_badpath_never_restarts() {
         repo_dir: "fusion-rag".into(),
         purpose: "x".into(),
         fixed: false,
+        managed: true,
         layer: Layer::App,
     };
     let calls = Arc::new(Mutex::new(Vec::<String>::new()));

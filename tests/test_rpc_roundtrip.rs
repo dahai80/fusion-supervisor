@@ -11,6 +11,7 @@ async fn test_rpc_ping_roundtrip() {
         repo_dir: "fusion-mlx".into(),
         purpose: "x".into(),
         fixed: true,
+        managed: true,
         layer: Layer::Core,
     }];
     let db_path = std::env::temp_dir().join(format!("fusion-sv-rpc-{}.db", std::process::id()));

@@ -51,9 +51,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // issue #31: RUST_LOG 未设时默认 info — 操作员须能看到启动告警
+    // (如 FUSION_ROOT 未设提示), 默认 error 会静默吞掉。
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let cli = Cli::parse();
     let cfg = Config::load()?;
     match cli.command {
@@ -77,6 +79,17 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     tracing::info!("fusion-sv daemon starting");
+    // issue #31: FUSION_ROOT 未设且 cwd 不像 monorepo 根时一次告警。
+    // start.sh 路径解析 env > cwd, cwd 错误时 up_native 会全量 fail-closed。
+    if std::env::var("FUSION_ROOT").is_err() {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if !cwd.join("architecture/port-registry.yaml").exists() {
+            tracing::warn!(
+                cwd = %cwd.display(),
+                "FUSION_ROOT 未设置且当前目录不是 fusion monorepo 根 — 默认 start.sh 路径将解析失败。请 FUSION_ROOT=<monorepo 根> fusion-sv daemon 启动"
+            );
+        }
+    }
     let defs = manifest::ServiceManifest::load(&cfg.registry_path)?;
     tracing::info!(services = defs.len(), "registry loaded");
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
