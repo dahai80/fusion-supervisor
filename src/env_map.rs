@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::path::Path;
 
 // 依赖 sidecar 的 native 服务及其所需连接 env key 列表。
 // 未在表中的服务 → 无注入, 保留现状。
@@ -16,6 +17,24 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
         "fusion-model-hub" => Some(&["DATABASE_URL", "REDIS_URL"]),
         _ => None,
     }
+}
+
+// issue #29: shell-ecosystem 模块服务的注册 env。
+// 这些服务启动时向 fusion-gateway 注册 + 心跳 (缺 admin key 则静默不注册 —
+// 正是 10-24 事故里 sidebar 丢失的根因), 故注入不受 compose 开关控制。
+fn shell_vars(svc: &str) -> Option<&'static [&'static str]> {
+    match svc {
+        "fusion-cowork-web" | "fusion-plugins-ecosystem-console" => {
+            Some(&["FUSION_SHELL_GATEWAY_URL", "FUSION_GATEWAY_ADMIN_KEY"])
+        }
+        "fusion-trainer-bridge" => Some(&["FUSION_TRAINER_BRIDGE_KEY"]),
+        _ => None,
+    }
+}
+
+// 该服务是否需要 shell 注册 env (调用方无条件注入, 不 gate 在 compose 上)。
+pub fn needs_shell_env(svc: &str) -> bool {
+    shell_vars(svc).is_some()
 }
 
 // 返回服务所需的全部连接变量名 (供调用方判断是否需注入)。
@@ -88,6 +107,76 @@ pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<S
     }
     tracing::info!(svc, keys = ?keys, "native env 注入解析完成");
     Ok(out)
+}
+
+// issue #29: 解析某服务的 shell 注册 env。
+// 解析顺序 (与 trainer-bridge.sh 自读 gateway config 的模式一致):
+//   进程 env → env_file → 兜底
+// - FUSION_SHELL_GATEWAY_URL: 兜底 http://127.0.0.1:11432 (本地网关固定端口)
+// - FUSION_GATEWAY_ADMIN_KEY: 兜底读 fusion-gateway config.yaml web_shell.admin_key
+//   (只读, 不改写上游), 路径由 FUSION_GATEWAY_CONFIG 覆盖
+// - FUSION_TRAINER_BRIDGE_KEY: 无兜底, env/env_file 均无 → fail-closed Err
+//   (bridge 自身要求此 key, 缺了起不来, 早失败早告警)
+// 非 shell 模块服务 → 空 map。
+pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, String>> {
+    let Some(keys) = shell_vars(svc) else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for k in keys {
+        match *k {
+            "FUSION_SHELL_GATEWAY_URL" => {
+                let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
+                out.insert(k.to_string(), v);
+            }
+            "FUSION_GATEWAY_ADMIN_KEY" => {
+                let v = match resolve(k, env_file) {
+                    Some(v) => v,
+                    None => read_gateway_admin_key()
+                        .with_context(|| {
+                            format!(
+                                "FUSION_GATEWAY_ADMIN_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
+                                 无法为 {svc} 注册 shell (fail-closed)"
+                            )
+                        })?,
+                };
+                out.insert(k.to_string(), v);
+            }
+            "FUSION_TRAINER_BRIDGE_KEY" => {
+                let v = resolve(k, env_file).with_context(|| {
+                    format!(
+                        "FUSION_TRAINER_BRIDGE_KEY 缺失 — bridge 拒绝启动 (fail-closed, svc {svc})"
+                    )
+                })?;
+                out.insert(k.to_string(), v);
+            }
+            other => bail!("env_map: 未知 shell 注册 key {other} for {svc}"),
+        }
+    }
+    tracing::info!(svc, keys = ?keys, "shell 注册 env 解析完成");
+    Ok(out)
+}
+
+// 只读 fusion-gateway config.yaml 的 web_shell.admin_key。
+// 路径: FUSION_GATEWAY_CONFIG 覆盖, 默认 ~/fusion/fusion-gateway/config.yaml。
+fn read_gateway_admin_key() -> Result<String> {
+    let path = std::env::var("FUSION_GATEWAY_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join("fusion/fusion-gateway/config.yaml")
+        });
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("读 gateway config 失败: {}", path.display()))?;
+    let cfg: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("解析 gateway config 失败: {}", path.display()))?;
+    let key = cfg
+        .get("web_shell")
+        .and_then(|w| w.get("admin_key"))
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty())
+        .with_context(|| format!("gateway config 无 web_shell.admin_key: {}", path.display()))?;
+    Ok(key.to_string())
 }
 
 // 据服务名决定 PG 库名: modelhub/cowork 用各自 env, identity/rag 用服务名。
@@ -208,5 +297,112 @@ pub(crate) mod tests {
         assert_eq!(map.get("KEY").unwrap(), "val");
         assert_eq!(map.get("OTHER").unwrap(), "2");
         assert!(!map.contains_key("# comment"));
+    }
+
+    // ---- issue #29: shell 注册 env ----
+
+    // 进程 env 直接给 admin key → 注入成功, 不读 gateway config
+    #[test]
+    fn test_shell_env_from_process_env() {
+        let _g = env_lock().lock().unwrap();
+        let _c = EnvGuard::set("FUSION_GATEWAY_ADMIN_KEY", "fromproc");
+        let f = env_file("");
+        let env = shell_env_for("fusion-cowork-web", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_GATEWAY_ADMIN_KEY").unwrap(), "fromproc");
+        assert_eq!(
+            env.get("FUSION_SHELL_GATEWAY_URL").unwrap(),
+            "http://127.0.0.1:11432",
+            "URL 未配置应兜底本地网关"
+        );
+    }
+
+    // .env 给 admin key → 进程 env 缺失时从文件解析
+    #[test]
+    fn test_shell_env_from_env_file() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_GATEWAY_ADMIN_KEY") };
+        let f = env_file("FUSION_GATEWAY_ADMIN_KEY=fromfile\n");
+        let env = shell_env_for("fusion-plugins-ecosystem-console", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_GATEWAY_ADMIN_KEY").unwrap(), "fromfile");
+    }
+
+    // admin key 全缺 + gateway config 不可读 (指到不存在路径) → fail-closed Err
+    #[test]
+    fn test_shell_env_fail_closed_no_admin_key() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_GATEWAY_ADMIN_KEY") };
+        let _c = EnvGuard::set(
+            "FUSION_GATEWAY_CONFIG",
+            "/nonexistent/fusion-gateway-config-test.yaml",
+        );
+        let f = env_file("");
+        let r = shell_env_for("fusion-cowork-web", f.path());
+        assert!(r.is_err(), "admin key 全缺应 fail-closed");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("FUSION_GATEWAY_ADMIN_KEY"),
+            "err 应点名缺失 key: {msg}"
+        );
+    }
+
+    // trainer-bridge key 无兜底: env/.env 均无 → fail-closed Err
+    #[test]
+    fn test_shell_env_bridge_key_fail_closed() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
+        let f = env_file("");
+        let r = shell_env_for("fusion-trainer-bridge", f.path());
+        assert!(r.is_err(), "bridge key 缺失应 fail-closed");
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("FUSION_TRAINER_BRIDGE_KEY")
+        );
+    }
+
+    // trainer-bridge key 从 .env 解析成功
+    #[test]
+    fn test_shell_env_bridge_key_from_file() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
+        let f = env_file("FUSION_TRAINER_BRIDGE_KEY=bridge-k\n");
+        let env = shell_env_for("fusion-trainer-bridge", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_TRAINER_BRIDGE_KEY").unwrap(), "bridge-k");
+        assert!(
+            !env.contains_key("FUSION_SHELL_GATEWAY_URL"),
+            "bridge 只需自身 key"
+        );
+    }
+
+    // 非 shell 模块服务 → 空 map (保留现状)
+    #[test]
+    fn test_shell_env_unknown_service_empty() {
+        let f = env_file("");
+        let env = shell_env_for("fusion-mlx", f.path()).unwrap();
+        assert!(env.is_empty());
+        assert!(!needs_shell_env("fusion-mlx"));
+        assert!(needs_shell_env("fusion-cowork-web"));
+        assert!(needs_shell_env("fusion-trainer-bridge"));
+    }
+
+    // env guard (RAII 恢复进程 env), 与 config.rs EnvGuard 同构
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }

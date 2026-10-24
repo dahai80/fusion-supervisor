@@ -55,6 +55,10 @@ pub fn name_to_dir(name: &str) -> &str {
         "fusion-agent-studio",
         "fusion-simulation",
         "fusion-bench",
+        // issue #29: fusion-trainer-bridge → fusion-trainer;
+        // fusion-plugins-ecosystem-console → fusion-plugins-ecosystem
+        "fusion-trainer",
+        "fusion-plugins-ecosystem",
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
             return parent;
@@ -190,6 +194,35 @@ external_tools: []
         );
         assert_eq!(name_to_dir("fusion-mlx"), "fusion-mlx");
         assert_eq!(name_to_dir("fusion-cowork-ws"), "fusion-cowork");
+    }
+
+    // issue #29: shell-ecosystem 子服务 → 父 repo; 父名本身 → 自身
+    #[test]
+    fn test_name_to_dir_shell_ecosystem() {
+        assert_eq!(name_to_dir("fusion-trainer-bridge"), "fusion-trainer");
+        assert_eq!(
+            name_to_dir("fusion-plugins-ecosystem-console"),
+            "fusion-plugins-ecosystem"
+        );
+        assert_eq!(name_to_dir("fusion-cowork-web"), "fusion-cowork");
+        assert_eq!(
+            name_to_dir("fusion-plugins-ecosystem"),
+            "fusion-plugins-ecosystem"
+        );
+    }
+
+    // issue #29: 四个 shell 模块服务应落 App 层 (gateway 在 Core 层先起,
+    // 满足 "gateway 先于模块" 的注册依赖顺序)
+    #[test]
+    fn test_shell_ecosystem_layer_app_after_core() {
+        assert!(matches!(layer_of("fusion-cowork-web"), Layer::App));
+        assert!(matches!(layer_of("fusion-trainer-bridge"), Layer::App));
+        assert!(matches!(
+            layer_of("fusion-plugins-ecosystem-console"),
+            Layer::App
+        ));
+        assert!(matches!(layer_of("fusion-agent-studio"), Layer::App));
+        assert!(matches!(layer_of("fusion-gateway"), Layer::Core));
     }
 
     #[test]

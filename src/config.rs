@@ -4,16 +4,29 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    // 全字段 serde default: 配置文件可只写覆盖项 (文档承诺 "all fields have defaults",
+    // 之前无 default 的字段会让部分配置文件直接 parse 失败 — 与文档矛盾)。
+    #[serde(default = "default_socket_path")]
     pub socket_path: String,
+    #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    #[serde(default = "default_poll_healthy_sec")]
     pub poll_healthy_sec: u64,
+    #[serde(default = "default_poll_unhealthy_sec")]
     pub poll_unhealthy_sec: u64,
+    #[serde(default = "default_max_concurrent_start")]
     pub max_concurrent_start: usize,
+    #[serde(default = "default_start_timeout_sec")]
     pub start_timeout_sec: u64,
+    #[serde(default = "default_restart_window_sec")]
     pub restart_window_sec: u64,
+    #[serde(default = "default_restart_max")]
     pub restart_max: u32,
+    #[serde(default = "default_backoff_max_sec")]
     pub backoff_max_sec: u64,
+    #[serde(default)]
     pub alert_url: String,
+    #[serde(default = "default_alert_dedup_sec")]
     pub alert_dedup_sec: u64,
     // compose 容器连续失败达此次数 → 升级告警 (ContainerCrashLoop, issue #6)
     #[serde(default = "default_container_crash_escalation")]
@@ -30,6 +43,7 @@ pub struct Config {
     // issue #10: 备份保留份数。新备份后裁剪超出 N 份的旧备份, 默认 7。
     #[serde(default = "default_backup_retention")]
     pub backup_retention: u32,
+    #[serde(default = "default_registry_path")]
     pub registry_path: PathBuf,
     #[serde(default)]
     pub compose: ComposeConfig,
@@ -42,10 +56,18 @@ pub struct Config {
     // Some → HTTP listener 同时服务 SPA 静态文件; None → 不服务 (默认)。
     #[serde(default)]
     pub web_dir: Option<String>,
+    // issue #29: daemon 启动时自动执行一次 up_all (探活跳过已健康, 不双启)。
+    // 主机重启后 launchd/操作员拉起 daemon → 全量服务按 layer 序自愈。
+    // 默认 false (开发机手动 fusion-sv up 的行为不变)。
+    #[serde(default)]
+    pub auto_up_on_start: bool,
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
-#[derive(Debug, Clone, Deserialize, Default)]
+// 注意不能 derive(Default): derive 给 PathBuf 的默认是空串, 而 serde default = "..."
+// 函数只在 toml 显式缺 key 时生效 — derive(Default) 会让无 [compose] 段的配置文件
+// 拿到空 env_file/sidecar_file, 破坏 .env 解析。手动 impl 走真正的默认值。
+#[derive(Debug, Clone, Deserialize)]
 pub struct ComposeConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -55,6 +77,17 @@ pub struct ComposeConfig {
     pub business_file: PathBuf,
     #[serde(default = "default_env")]
     pub env_file: PathBuf,
+}
+
+impl Default for ComposeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sidecar_file: default_sidecar(),
+            business_file: default_business(),
+            env_file: default_env(),
+        }
+    }
 }
 
 fn default_sidecar() -> PathBuf {
@@ -68,6 +101,39 @@ fn default_env() -> PathBuf {
 }
 fn default_container_crash_escalation() -> u32 {
     5
+}
+fn default_socket_path() -> String {
+    "/tmp/fusion-sv.sock".to_string()
+}
+fn default_db_path() -> PathBuf {
+    PathBuf::from("~/.fusion-sv/history.db")
+}
+fn default_poll_healthy_sec() -> u64 {
+    15
+}
+fn default_poll_unhealthy_sec() -> u64 {
+    2
+}
+fn default_max_concurrent_start() -> usize {
+    4
+}
+fn default_start_timeout_sec() -> u64 {
+    30
+}
+fn default_restart_window_sec() -> u64 {
+    300
+}
+fn default_restart_max() -> u32 {
+    5
+}
+fn default_backoff_max_sec() -> u64 {
+    30
+}
+fn default_alert_dedup_sec() -> u64 {
+    300
+}
+fn default_registry_path() -> PathBuf {
+    PathBuf::from("architecture/port-registry.yaml")
 }
 fn default_drain_grace_sec() -> u64 {
     30
@@ -109,6 +175,7 @@ impl Default for Config {
             compose: ComposeConfig::default(),
             metrics_addr: default_metrics_addr(),
             web_dir: None,
+            auto_up_on_start: false,
         }
     }
 }
@@ -222,5 +289,27 @@ mod tests {
             cfg.registry_path
         );
         let _ = std::fs::remove_file(&nonexistent);
+    }
+
+    // 部分配置文件 (只写覆盖项) 应可加载, 其余字段取默认 —
+    // 文档承诺 "all fields have defaults", 之前无 serde default 的字段直接 parse 失败。
+    #[test]
+    fn test_partial_config_file_uses_defaults() {
+        let path = std::env::temp_dir().join("fusion-sv-config-partial-test.toml");
+        std::fs::write(&path, "auto_up_on_start = true\n").unwrap();
+        let _guard = EnvGuard::set("FUSION_SV_CONFIG", path.to_str().unwrap());
+        let cfg = Config::load().expect("部分配置应加载成功");
+        assert!(cfg.auto_up_on_start, "覆盖项应生效");
+        assert_eq!(cfg.socket_path, "/tmp/fusion-sv.sock");
+        assert_eq!(cfg.poll_healthy_sec, 15);
+        assert_eq!(cfg.max_concurrent_start, 4);
+        assert!(!cfg.compose.enabled);
+        // 回归: 无 [compose] 段时 env_file 应为 ".env" 而非 derive(Default) 的空串
+        assert_eq!(cfg.compose.env_file, PathBuf::from(".env"));
+        assert_eq!(
+            cfg.compose.sidecar_file,
+            PathBuf::from("docker-compose.sidecar.yml")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
