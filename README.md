@@ -112,7 +112,7 @@ cargo fmt --all --check
 
 ## Non-goals (v1)
 
-Cross-node Prometheus aggregation (v2), cross-node cluster orchestration, rewriting start.sh, Web UI, launchd self-guard (v1.1), config hot-reload, multi-user.
+Cross-node Prometheus aggregation (v2), cross-node cluster orchestration, rewriting start.sh, launchd self-guard (v1.1), config hot-reload, multi-user. (Web console shipped anyway — see `web/`.)
 
 ## Container Multi-Node Deploy
 
@@ -162,19 +162,11 @@ lock — see upstream issue dahai80/fusion-models-hub#52).
 
 ### Run smoke validation
 
-```bash
-cd fusion-supervisor
-export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
-export FUSION_MLX_API_KEY=fg-admin-key
-export FUSION_MULTI_NODE_DIR=$(cd ../fusion-multi-node && pwd)
-export SMOKE_MODEL=mlx-community-Llama-3.2-1B-Instruct-4bit
-bash scripts/smoke-container-multinode.sh
-```
-
-Runs 5 steps (design §5.1): precheck → cluster up → business up → routed
-inference (Master→Agent→`host.docker.internal`→MLX) → auth handshake. Logs to
-`/tmp/fusion-smoke.*/smoke.log`. Pass banner = `SMOKE PASS`. Teardown is
-automatic via a `trap` (both planes `down --remove-orphans`).
+The multi-node smoke harness (`scripts/smoke-container-multinode.sh`) was
+**removed** in PR #24 — it depended on `fusion-multi-node/docker-compose.yml`,
+which is no longer tested on the local single-machine deployment. The
+sidecar-plane smoke (`bash scripts/smoke-sidecar.sh` + unit-only
+`bash scripts/smoke-sidecar.test.sh`) remains the validated path.
 
 ### Bring up topology without smoke
 
