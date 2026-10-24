@@ -99,15 +99,26 @@ async fn dispatch(
             make_result(json!(entries), req.id)
         }
         Some(Method::Up) => {
+            // issue #31: service 参数此前被忽略 (up <svc> 实际跑全量 up_all)。
+            // 有 service → 单服务 up_one; 无 → 全量 up_all。
             let mut c = core.lock().await;
-            match c.up_all().await {
+            let res = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(svc) if !svc.is_empty() => c.up_one(svc).await,
+                _ => c.up_all().await,
+            };
+            match res {
                 Ok(()) => make_result(json!("ok"), req.id),
                 Err(e) => make_error(-32000, &e.to_string(), req.id),
             }
         }
         Some(Method::Down) => {
+            // issue #31: 同 Up — service 参数此前被忽略, down <svc> 会全停, 危险。
             let mut c = core.lock().await;
-            match c.down_all().await {
+            let res = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(svc) if !svc.is_empty() => c.down_one(svc).await,
+                _ => c.down_all().await,
+            };
+            match res {
                 Ok(()) => make_result(json!("ok"), req.id),
                 Err(e) => make_error(-32000, &e.to_string(), req.id),
             }

@@ -43,6 +43,16 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             bin: "fusion-plugin-console".into(),
             args: vec!["--port".into(), "8795".into()],
         }),
+        // issue #31: MCP server 主入口 (registry :8765), 前台 sse 进程 daemonize
+        "fusion-plugins-ecosystem" => Some(StartSpec::Daemon {
+            bin: "fusion-plugin-server".into(),
+            args: vec![
+                "--transport".into(),
+                "sse".into(),
+                "--port".into(),
+                "8765".into(),
+            ],
+        }),
         _ => None,
     }
 }
@@ -74,7 +84,10 @@ pub fn log_path(svc: &str) -> PathBuf {
         .join(format!("{svc}.log"))
 }
 
-// daemonize start 命令 (bash -c 执行): nohup 后台 + 日志重定向 + pidfile
+// daemonize start 命令 (bash -c 执行): nohup 后台 + 日志重定向 + pidfile。
+// 注意 mkdir 用 `;` 分隔而非 `&&`: `A && B &` 会把整个列表后台化为子 shell,
+// $! 拿到的是子 shell pid 而非真实进程 pid — stop 时 kill 掉的是壳, 服务进程
+// 变孤儿继续占口。`;` 分隔后 nohup 单独后台, $! 即 nohup exec 后的真实 pid。
 pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     let StartSpec::Daemon { bin, args } = spec else {
         return None;
@@ -83,7 +96,7 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     let log = log_path(svc);
     let pid = pid_path(svc);
     Some(format!(
-        "mkdir -p '{dir}' && nohup '{bin}' {args} >> '{log}' 2>&1 & echo $! > '{pid}'",
+        "mkdir -p '{dir}'; nohup '{bin}' {args} >> '{log}' 2>&1 & echo $! > '{pid}'",
         dir = pid.parent().unwrap().display(),
         args = args.join(" "),
         log = log.display(),
@@ -150,6 +163,44 @@ mod tests {
     fn test_daemon_start_cmd_none_for_script_spec() {
         let spec = start_spec_for("fusion-trainer-bridge").unwrap();
         assert!(daemon_start_cmd(&spec, "fusion-trainer-bridge").is_none());
+    }
+
+    // issue #31: pidfile 必须记真实进程 pid — mkdir 不得与 nohup 用 && 连接
+    // (`&& ... &` 整列表后台化, $! = 子 shell pid, stop kill 掉壳留孤儿进程)
+    #[test]
+    fn test_daemon_start_cmd_no_subshell_pid() {
+        let Some(spec) = start_spec_for("fusion-cowork-web") else {
+            panic!("cowork-web 应有 spec");
+        };
+        let cmd = daemon_start_cmd(&spec, "fusion-cowork-web").unwrap();
+        assert!(
+            !cmd.contains("&& nohup"),
+            "mkdir 与 nohup 不得用 && 连接 (pidfile 会记子 shell pid): {cmd}"
+        );
+        assert!(
+            cmd.contains("; nohup"),
+            "mkdir 应以 ; 分隔, nohup 单独后台: {cmd}"
+        );
+    }
+
+    // issue #31: plugins-ecosystem MCP server (:8765) Daemon spec
+    #[test]
+    fn test_plugins_ecosystem_mcp_daemon_spec() {
+        let spec = start_spec_for("fusion-plugins-ecosystem").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-plugin-server");
+                assert!(args.contains(&"--transport".to_string()));
+                assert!(args.contains(&"sse".to_string()));
+                assert!(args.contains(&"8765".to_string()));
+            }
+            _ => panic!("plugins-ecosystem 应为 Daemon spec"),
+        }
+        let cmd = daemon_start_cmd(&spec, "fusion-plugins-ecosystem").unwrap();
+        assert!(
+            cmd.contains("--transport sse --port 8765"),
+            "应带 MCP server 参数: {cmd}"
+        );
     }
 
     #[test]

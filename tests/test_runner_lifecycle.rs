@@ -14,6 +14,7 @@ async fn test_lifecycle_crash_then_recover() {
         repo_dir: "fusion-rag".into(),
         purpose: "x".into(),
         fixed: false,
+        managed: true,
         layer: Layer::App,
     };
     let probe_cell = Arc::new(Mutex::new(ProbeResult::Healthy { latency_ms: 1 }));
@@ -45,13 +46,16 @@ async fn test_lifecycle_crash_then_recover() {
     };
     r.tick(1001, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
-    // 再次宕机: 进重启流
+    // issue #31: 退避改为排期 — 再次宕机 tick 排期, 到点 tick (delay=1s) 重启
     r.tick(1002, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Unhealthy));
+    assert_eq!(calls.lock().unwrap().len(), 0);
+    r.tick(1003, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Restarting));
     assert_eq!(calls.lock().unwrap().len(), 1);
     // 恢复
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 5 };
-    r.tick(1003, &store, &mut al).await.unwrap();
+    r.tick(1004, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Healthy));
     cleanup_db(&path);
 }

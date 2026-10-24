@@ -30,6 +30,11 @@ pub struct ServiceRunner {
     pub restart_cmd: String, // "restart" | "stop+start"
     // issue #9: drain 宽限期截止 (unix sec)。None=非 draining 或无 grace。
     pub drain_grace_until: Option<u64>,
+    // issue #31: 退避重启截止 (unix sec)。None=无待执行的重启。
+    // 此前退避是持锁 sleep — 多个故障服务会把 SupervisorCore Mutex 扣住
+    // 数十秒, 饿死 RPC/HTTP status。改为记截止时间本 tick 直接返回,
+    // 后续 tick 到点再真正 invoke_start (poll_unhealthy_sec=2s, 误差 ≤2s)。
+    pub restart_after: Option<u64>,
     probe_fn: ProbeFn,
     start_fn: StartFn,
 }
@@ -48,6 +53,7 @@ impl ServiceRunner {
             policy,
             restart_cmd: restart_cmd.to_string(),
             drain_grace_until: None,
+            restart_after: None,
             probe_fn: Box::new(probe_fn),
             start_fn: Box::new(start_fn),
         }
@@ -157,35 +163,49 @@ impl ServiceRunner {
                 // 首次宕机不立即重启, 等下一 tick (避免抖动误判)
             }
             State::Unhealthy | State::Restarting => {
-                let capped = self.policy.record_crash(now_ts);
-                if capped {
-                    tracing::error!(svc = %self.def.name, "crash-window 封顶, 标 Failed 停重启");
-                    self.state = State::Failed;
-                    let _ = alerter
-                        .alert(Alert {
-                            service: self.def.name.clone(),
-                            kind: AlertKind::RestartCapHit,
-                            detail: format!("cap {} hit", self.policy.crash_count()),
-                            ts: now_ts,
-                        })
-                        .await;
-                    return;
-                }
-                let delay = self.policy.next_delay();
-                tracing::info!(svc = %self.def.name, delay, "退避后重启");
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                if let Err(e) = self.invoke_start() {
-                    tracing::warn!(svc = %self.def.name, err = %e, "start.sh fail");
-                    let _ = alerter
-                        .alert(Alert {
-                            service: self.def.name.clone(),
-                            kind: AlertKind::RestartFailed,
-                            detail: e.to_string(),
-                            ts: now_ts,
-                        })
-                        .await;
-                } else {
-                    self.state = State::Restarting;
+                // issue #31: 退避不持锁 sleep (旧实现扣锁数十秒饿死 status/metrics),
+                // 改为记截止时间本 tick 返回, 到点 tick 再真正重启。
+                // crash 记账语义与旧版一致: 每次实际重启尝试记 1 次。
+                match self.restart_after {
+                    None => {
+                        // 首次进入退避: 排期, 本 tick 不重启
+                        let delay = self.policy.next_delay();
+                        self.restart_after = Some(now_ts + delay);
+                        tracing::info!(svc = %self.def.name, delay, "退避后重启 (scheduled)");
+                    }
+                    Some(due) if now_ts < due => {
+                        // 未到点, 等后续 tick
+                    }
+                    Some(_) => {
+                        self.restart_after = None;
+                        let capped = self.policy.record_crash(now_ts);
+                        if capped {
+                            tracing::error!(svc = %self.def.name, "crash-window 封顶, 标 Failed 停重启");
+                            self.state = State::Failed;
+                            let _ = alerter
+                                .alert(Alert {
+                                    service: self.def.name.clone(),
+                                    kind: AlertKind::RestartCapHit,
+                                    detail: format!("cap {} hit", self.policy.crash_count()),
+                                    ts: now_ts,
+                                })
+                                .await;
+                            return;
+                        }
+                        if let Err(e) = self.invoke_start() {
+                            tracing::warn!(svc = %self.def.name, err = %e, "start.sh fail");
+                            let _ = alerter
+                                .alert(Alert {
+                                    service: self.def.name.clone(),
+                                    kind: AlertKind::RestartFailed,
+                                    detail: e.to_string(),
+                                    ts: now_ts,
+                                })
+                                .await;
+                        } else {
+                            self.state = State::Restarting;
+                        }
+                    }
                 }
             }
             State::Failed | State::Stopped => {
@@ -265,6 +285,7 @@ mod tests {
             repo_dir: "fusion-rag".into(),
             purpose: "kb".into(),
             fixed: false,
+            managed: true,
             layer: Layer::App,
         }
     }
@@ -333,7 +354,13 @@ mod tests {
         r.state = State::Unhealthy; // 已标 down, 这次进重启流
         let s = store();
         let mut al = Alerter::new(300, String::new());
+        // issue #31: 退避不再持锁 sleep — 第一 tick 排期, 未到点不重启
         r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy), "排期 tick 不应重启");
+        assert_eq!(r.policy.crash_count(), 0);
+        assert!(calls.lock().unwrap().is_empty());
+        // 到点 tick (首退避 delay=1s): 真正重启 + 记 1 次 crash
+        r.tick(1001, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Restarting));
         assert_eq!(r.policy.crash_count(), 1);
         assert_eq!(*calls.lock().unwrap(), vec!["restart".to_string()]);
@@ -352,7 +379,10 @@ mod tests {
         r.state = State::Unhealthy;
         let s = store();
         let mut al = Alerter::new(300, String::new());
+        // issue #31: 第一 tick 排期 (5 crash → 退避 30s), 到点 tick 封顶 → Failed 不重启
         r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy), "排期 tick 不应重启");
+        r.tick(1031, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Failed));
         assert!(calls.lock().unwrap().is_empty()); // 封顶不重启
     }
@@ -403,7 +433,10 @@ mod tests {
         r.state = State::Unhealthy;
         let s = store();
         let mut al = Alerter::new(300, String::new());
+        // issue #31: 第一 tick 排期 (delay=1s), 到点 tick 执行 stop+start
         r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(calls.lock().unwrap().is_empty(), "排期 tick 不应重启");
+        r.tick(1001, &s, &mut al).await.unwrap();
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["stop".to_string(), "start".to_string()]

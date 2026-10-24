@@ -49,6 +49,7 @@ impl SupervisorCore {
         let env_file = cfg.compose.env_file.clone();
         let runners: Vec<_> = defs
             .into_iter()
+            .filter(|d| d.managed)
             .map(|d| {
                 let spec = probe_map::probe_spec_for(&d.name, d.port);
                 let cmd = probe_map::restart_cmd_for(&d.name).to_string();
@@ -128,6 +129,7 @@ impl SupervisorCore {
         let probe_fn = Arc::new(probe_fn);
         let runners: Vec<_> = defs
             .into_iter()
+            .filter(|d| d.managed)
             .map(|d| {
                 let pf = probe_fn.clone();
                 runner::ServiceRunner::new(
@@ -324,6 +326,95 @@ impl SupervisorCore {
                     r.state = runner::State::Stopped;
                 }
             }
+        }
+        Ok(())
+    }
+
+    // issue #31: 单服务 up/down。RPC up/down 的 service 参数此前被忽略 —
+    // `fusion-sv down <svc>` 实际跑 down_all 全停, 与 CLI 文档 `down [svc]` 不符且危险。
+    // 语义与 up_native/down_native 单条目一致: 探活跳过已健康 / env 注入 fail-closed / 状态机同款。
+    pub async fn up_one(&mut self, name: &str) -> Result<()> {
+        let d = self
+            .runners
+            .iter()
+            .find(|r| r.def.name == name)
+            .map(|r| r.def.clone())
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
+        if !self.dep_gate_ok(&d.name).await {
+            // 与 up_native 一致: 依赖问题非崩溃, 标 Stopped 跳过
+            if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+                r.state = runner::State::Stopped;
+            }
+            anyhow::bail!("dep gate 未就绪, 跳过启动: {}", d.name);
+        }
+        // 先探活: 已健康跳过 (避双启)
+        let spec = ProbeSpec::tcp(d.port);
+        if matches!((self.probe_fn)(&spec), ProbeResult::Healthy { .. }) {
+            if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+                r.state = runner::State::Healthy;
+            }
+            tracing::info!(svc = %d.name, "skip start (already up)");
+            return Ok(());
+        }
+        // env 注入: shell 注册 (无条件) + sidecar 连接 (compose 开启), 均 fail-closed
+        let env_file = self.cfg.compose.env_file.clone();
+        let mut env_overrides: Vec<(String, String)> = Vec::new();
+        if crate::env_map::needs_shell_env(&d.name) {
+            let m = crate::env_map::shell_env_for(&d.name, &env_file).map_err(|e| {
+                tracing::error!(svc = %d.name, err = %e, "shell env 解析失败, fail-closed 拒绝启动");
+                e
+            })?;
+            env_overrides.extend(m);
+        }
+        if self.cfg.compose.enabled && crate::env_map::needs_injection(&d.name) {
+            let m = crate::env_map::native_env_for(&d.name, &env_file).map_err(|e| {
+                tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
+                e
+            })?;
+            env_overrides.extend(m);
+        }
+        tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start (single)");
+        let start_fn = self.start_fn.clone();
+        let timeout = self.cfg.start_timeout_sec;
+        let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
+        let res = tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await;
+        let r = self
+            .runners
+            .iter_mut()
+            .find(|r| r.def.name == name)
+            .expect("前面已确认存在");
+        match res {
+            Ok(Ok(())) => {
+                r.state = runner::State::Starting;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(svc = %d.name, err = %e, "start fail");
+                r.state = runner::State::Failed;
+                Err(e)
+            }
+            Err(_) => {
+                let e = anyhow::anyhow!("start timeout {timeout}s");
+                tracing::warn!(svc = %d.name, "start timeout {timeout}s");
+                r.state = runner::State::Failed;
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn down_one(&mut self, name: &str) -> Result<()> {
+        let d = self
+            .runners
+            .iter()
+            .find(|r| r.def.name == name)
+            .map(|r| r.def.clone())
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
+        tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop (single)");
+        if let Err(e) = (self.start_fn)(&d.name, "stop", &[]) {
+            tracing::warn!(svc = %d.name, err = %e, "stop fail");
+        }
+        if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+            r.state = runner::State::Stopped;
         }
         Ok(())
     }
@@ -826,6 +917,7 @@ mod tests {
             repo_dir: name.into(),
             purpose: "x".into(),
             fixed: false,
+            managed: true,
             layer,
         }
     }
@@ -836,6 +928,91 @@ mod tests {
             start_timeout_sec: 5,
             ..Config::default()
         }
+    }
+
+    // issue #31: up_one/down_one — service 级操作只动目标服务
+    #[tokio::test]
+    async fn test_up_one_down_one_single_service() {
+        let defs = vec![
+            def("fusion-mlx", Layer::Core, 11434),
+            def("fusion-rag", Layer::App, 11436),
+        ];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        core.up_one("fusion-rag").await.unwrap();
+        let got: Vec<String> = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-rag/start"],
+            "up_one 只应启动目标服务: {got:?}"
+        );
+        assert!(matches!(core.runners[1].state, runner::State::Starting));
+
+        calls.lock().unwrap().clear();
+        core.down_one("fusion-rag").await.unwrap();
+        let got: Vec<String> = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-rag/stop"],
+            "down_one 只应停目标服务: {got:?}"
+        );
+        assert!(matches!(core.runners[1].state, runner::State::Stopped));
+
+        // 未知服务 → Err
+        assert!(core.up_one("fusion-nope").await.is_err());
+        assert!(core.down_one("fusion-nope").await.is_err());
+    }
+
+    // issue #31: up_one 已健康跳过 (与 up_native 避双启一致)
+    #[tokio::test]
+    async fn test_up_one_skips_healthy() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        core.up_one("fusion-mlx").await.unwrap();
+        assert!(calls.lock().unwrap().is_empty(), "已健康应跳过 start");
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+    }
+
+    // issue #31: supervise: false 条目不建 runner — up/down/tick/status 全跳过
+    #[tokio::test]
+    async fn test_unmanaged_services_excluded_from_runners() {
+        let mut d1 = def("fusion-mlx", Layer::Core, 11434);
+        d1.managed = true;
+        let mut d2 = def("fusion-web-shell", Layer::App, 11430);
+        d2.managed = false;
+        let mut d3 = def("fusion-gateway-deploy", Layer::Platform, 8100);
+        d3.managed = false;
+        let core = SupervisorCore::new_with_fns(
+            vec![d1, d2, d3],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        assert_eq!(core.runners.len(), 1, "豁免条目不应建 runner");
+        assert_eq!(core.runners[0].def.name, "fusion-mlx");
+        let status = core.status_all();
+        assert_eq!(status.len(), 1, "status 不含豁免条目");
     }
 
     #[tokio::test]
@@ -980,9 +1157,15 @@ mod tests {
             move |_: &ProbeSpec| pc.lock().unwrap().clone(),
             |_svc, _cmd, _env| Ok(()),
         );
-        // 起始: 已 Unhealthy (首 tick 进重启流 → Restarting)
+        // 起始: 已 Unhealthy。issue #31: 退避不再持锁 sleep —
+        // 首 tick 排期, 到点 tick (delay=1s) 重启 → Restarting
         core.runners[0].state = runner::State::Unhealthy;
         core.tick_all(1000).await;
+        assert!(
+            matches!(core.runners[0].state, runner::State::Unhealthy),
+            "排期 tick 不应重启"
+        );
+        core.tick_all(1001).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Restarting),
             "tick_all 后应 Restarting"

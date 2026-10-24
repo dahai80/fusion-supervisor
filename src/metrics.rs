@@ -145,6 +145,7 @@ mod tests {
             repo_dir: name.into(),
             purpose: "x".into(),
             fixed: false,
+            managed: true,
             layer,
         }
     }

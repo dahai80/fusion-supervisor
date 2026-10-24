@@ -18,6 +18,9 @@ pub struct ServiceDef {
     pub repo_dir: String,
     pub purpose: String,
     pub fixed: bool,
+    // issue #31: supervise: false 条目 (dev-only/k8s artifact/未建) 不进 runner,
+    // up/down/tick/status 全跳过 — 注册表噪声与真实故障分离。
+    pub managed: bool,
     pub layer: Layer,
 }
 
@@ -34,6 +37,13 @@ struct ServiceEntry {
     purpose: String,
     #[serde(default)]
     fixed: bool,
+    // issue #31: 显式豁免标记。默认 true (可托管); false = 不建 runner。
+    #[serde(default = "default_supervise")]
+    supervise: bool,
+}
+
+fn default_supervise() -> bool {
+    true
 }
 
 // registry key → 本地 repo 目录。绝大多数 key==dir, 例外在此。
@@ -116,13 +126,19 @@ impl ServiceManifest {
         let defs = reg
             .services
             .into_iter()
-            .map(|(name, entry)| ServiceDef {
-                repo_dir: name_to_dir(&name).to_string(),
-                layer: layer_of(&name),
-                name,
-                port: entry.port,
-                purpose: entry.purpose,
-                fixed: entry.fixed,
+            .map(|(name, entry)| {
+                if !entry.supervise {
+                    tracing::info!(svc = %name, "registry 标记 supervise: false, 跳过托管 (dev-only/external/planned)");
+                }
+                ServiceDef {
+                    repo_dir: name_to_dir(&name).to_string(),
+                    layer: layer_of(&name),
+                    name,
+                    port: entry.port,
+                    purpose: entry.purpose,
+                    fixed: entry.fixed,
+                    managed: entry.supervise,
+                }
             })
             .collect();
         Ok(defs)
@@ -168,6 +184,11 @@ services:
     port: 11452
     purpose: 集群 Master
     fixed: false
+  fusion-web-shell:
+    port: 11430
+    purpose: 样例豁免条目
+    fixed: false
+    supervise: false
 reserved: []
 external_tools: []
 "#;
@@ -177,13 +198,25 @@ external_tools: []
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), FAKE_REGISTRY).unwrap();
         let defs = ServiceManifest::load(tmp.path()).unwrap();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
         let mlx = defs.iter().find(|d| d.name == "fusion-mlx").unwrap();
         assert_eq!(mlx.port, 11434);
         assert!(mlx.fixed);
         let rag = defs.iter().find(|d| d.name == "fusion-rag").unwrap();
         assert_eq!(rag.port, 11436);
         assert!(!rag.fixed);
+    }
+
+    // issue #31: supervise 标记 — 默认 true, 显式 false 豁免
+    #[test]
+    fn test_supervise_flag_default_and_exemption() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), FAKE_REGISTRY).unwrap();
+        let defs = ServiceManifest::load(tmp.path()).unwrap();
+        let rag = defs.iter().find(|d| d.name == "fusion-rag").unwrap();
+        assert!(rag.managed, "未标 supervise 的条目默认可托管");
+        let web_shell = defs.iter().find(|d| d.name == "fusion-web-shell").unwrap();
+        assert!(!web_shell.managed, "supervise: false 应豁免");
     }
 
     #[test]

@@ -32,6 +32,8 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
         ProbeSpec::http(8795, "/health"),
     );
     m.insert("fusion-agent-studio", ProbeSpec::http(11442, "/health"));
+    // issue #31: MCP server (sse) 无 /health 端点, TCP 端口探活
+    m.insert("fusion-plugins-ecosystem", ProbeSpec::tcp(8765));
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -105,6 +107,13 @@ mod tests {
             restart_cmd_for("fusion-plugins-ecosystem-console"),
             "stop+start"
         );
+    }
+
+    // issue #31: MCP server 无 /health, TCP 探活
+    #[test]
+    fn test_plugins_ecosystem_tcp_probe() {
+        let s = probe_spec_for("fusion-plugins-ecosystem", 8765);
+        assert!(matches!(s.kind, ProbeKind::Tcp));
     }
 
     #[test]

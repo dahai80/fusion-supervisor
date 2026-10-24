@@ -357,7 +357,12 @@ mod tests {
 
     // test_backup_pg_dump_success: mock exec 返回 dump bytes → 文件写入 target, Backup event 记录, 成功。
     #[tokio::test]
+    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
+    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    #[allow(clippy::await_holding_lock)]
     async fn test_backup_pg_dump_success() {
+        // issue #31: env 全局共享, 并行测试 Drop 会移走本测试依赖的 DATE — 共享锁串行
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -380,7 +385,12 @@ mod tests {
 
     // test_backup_fail_closed_no_target: FUSION_BACKUP_TARGET 未设 → 拒绝 + 告警。
     #[tokio::test]
+    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
+    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    #[allow(clippy::await_holding_lock)]
     async fn test_backup_fail_closed_no_target() {
+        // issue #31: 同上, env 锁串行 (env_map/supervisor 测试共用同一锁)
+        let _g0 = crate::env_map::tests::env_lock().lock().unwrap();
         let _g1 = EnvGuard::remove("FUSION_BACKUP_TARGET");
         let _g2 = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let store = mem_store();
@@ -401,7 +411,12 @@ mod tests {
 
     // test_backup_retention_prunes_old: 8 份备份 + retention=7 → 最旧被裁剪。
     #[tokio::test]
+    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
+    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    #[allow(clippy::await_holding_lock)]
     async fn test_backup_retention_prunes_old() {
+        // issue #31: 同上, env 锁串行
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
