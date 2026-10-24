@@ -24,7 +24,15 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-k12-teacher", ProbeSpec::http(11448, "/health"));
     // speech = UDS daemon
     m.insert("fusion-speech", ProbeSpec::uds("/tmp/fusion-speech.sock"));
-    // 其余 41 服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
+    // issue #29: shell-ecosystem 模块服务 (实探 /health 均已验证)
+    m.insert("fusion-cowork-web", ProbeSpec::http(11461, "/health"));
+    m.insert("fusion-trainer-bridge", ProbeSpec::http(8790, "/health"));
+    m.insert(
+        "fusion-plugins-ecosystem-console",
+        ProbeSpec::http(8795, "/health"),
+    );
+    m.insert("fusion-agent-studio", ProbeSpec::http(11442, "/health"));
+    // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
 
@@ -40,9 +48,11 @@ pub fn probe_spec_for(name: &str, port: u16) -> ProbeSpec {
     ProbeSpec::tcp(port)
 }
 
-// fusion-store deploy/start.sh 仅 start, 无 restart → 退化为 stop+start
+// fusion-store deploy/start.sh 仅 start, 无 restart → 退化为 stop+start。
+// issue #29: start_map 覆盖服务 (trainer-bridge 脚本无 restart 子命令;
+// daemonize 进程无 restart 语义) 一律 stop+start。
 pub fn restart_cmd_for(name: &str) -> &'static str {
-    if name == "fusion-store" {
+    if name == "fusion-store" || crate::start_map::start_spec_for(name).is_some() {
         "stop+start"
     } else {
         "restart"
@@ -84,5 +94,34 @@ mod tests {
     fn test_restart_cmd_store_special() {
         assert_eq!(restart_cmd_for("fusion-store"), "stop+start");
         assert_eq!(restart_cmd_for("fusion-mlx"), "restart");
+    }
+
+    // issue #29: start_map 覆盖服务 → stop+start (无 restart 语义)
+    #[test]
+    fn test_restart_cmd_start_map_overrides() {
+        assert_eq!(restart_cmd_for("fusion-trainer-bridge"), "stop+start");
+        assert_eq!(restart_cmd_for("fusion-cowork-web"), "stop+start");
+        assert_eq!(
+            restart_cmd_for("fusion-plugins-ecosystem-console"),
+            "stop+start"
+        );
+    }
+
+    #[test]
+    fn test_shell_ecosystem_probe_specs() {
+        for (name, port) in [
+            ("fusion-cowork-web", 11461),
+            ("fusion-trainer-bridge", 8790),
+            ("fusion-plugins-ecosystem-console", 8795),
+            ("fusion-agent-studio", 11442),
+        ] {
+            let s = probe_spec_for(name, port);
+            assert!(matches!(s.kind, ProbeKind::Http), "{name} 应 HTTP 探活");
+            assert_eq!(
+                s.path.as_deref(),
+                Some("/health"),
+                "{name} 路径应为 /health"
+            );
+        }
     }
 }

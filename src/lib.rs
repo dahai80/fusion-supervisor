@@ -12,5 +12,6 @@ pub mod metrics;
 pub mod probe;
 pub mod probe_map;
 pub mod rpc;
+pub mod start_map;
 pub mod store;
 pub mod supervisor;

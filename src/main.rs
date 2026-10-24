@@ -142,6 +142,20 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     } else {
         None
     };
+    // issue #29: daemon 启动即自动 up_all (探活跳过已健康, 不双启)。
+    // 主机重启后操作员/launchd 拉起 daemon → 全量服务按 layer 序自愈
+    // (gateway Core 层先起, shell 模块 App 层后注册)。
+    // 持锁跨 up_all 与 RPC up 行为一致; 默认 false, 开发机手动行为不变。
+    if cfg.auto_up_on_start {
+        let core_boot = core.clone();
+        tokio::spawn(async move {
+            tracing::info!("auto_up_on_start: 启动即 up_all (layer 序, 探活跳过已健康)");
+            let mut c = core_boot.lock().await;
+            if let Err(e) = c.up_all().await {
+                tracing::error!(err = %e, "auto_up_on_start up_all 部分失败 (tick 兜底)");
+            }
+        });
+    }
     // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

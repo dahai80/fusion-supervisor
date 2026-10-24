@@ -1,10 +1,10 @@
 # fusion-supervisor
 
-Local-first fusion service supervisor and monitor. Long-lived Rust daemon `fusion-sv` supervises all 41 fusion services registered in `architecture/port-registry.yaml`: start/stop/restart, health probing, crash auto-recovery (crash-window + exponential backoff), health history in SQLite, and alerting.
+Local-first fusion service supervisor and monitor. Long-lived Rust daemon `fusion-sv` supervises all 53 fusion services registered in `architecture/port-registry.yaml`: start/stop/restart, health probing, crash auto-recovery (crash-window + exponential backoff), health history in SQLite, and alerting.
 
 ## Why
 
-The fusion monorepo had no persistent supervisor. Existing tools are one-shot or display-only: `fusion service status --watch` (6 services, no restart), `fusion doctor` (5 services), `fusion-autotest` (~20, exits on completion), `fusion-studio/Scripts/start.sh` (14, ends after start). 41 services with no continuous watcher, no crash restart, no health history aggregation, no unified liveness path (`/health` vs `/healthz` vs UDS-ping chaos). fusion-supervisor fills this gap.
+The fusion monorepo had no persistent supervisor. Existing tools are one-shot or display-only: `fusion service status --watch` (6 services, no restart), `fusion doctor` (5 services), `fusion-autotest` (~20, exits on completion), `fusion-studio/Scripts/start.sh` (14, ends after start). 53 services with no continuous watcher, no crash restart, no health history aggregation, no unified liveness path (`/health` vs `/healthz` vs UDS-ping chaos). fusion-supervisor fills this gap.
 
 ## Install
 
@@ -30,11 +30,11 @@ fusion-sv backup          # one-shot backup: Postgres (pg_dumpall→gzip) + Qdra
 fusion-sv shutdown        # gracefully shut down the daemon over the UDS socket — issue #20
 ```
 
-When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 41 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
+When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
 ## How it works
 
-- **Source of truth:** reads `architecture/port-registry.yaml` for the 41-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
+- **Source of truth:** reads `architecture/port-registry.yaml` for the 53-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
 - **Dual-mode binary:** `daemon` = long-lived supervisor loop + UDS JSON-RPC server (`/tmp/fusion-sv.sock`, perms 0600); CLI subcommands = one-shot client over the same UDS.
 - **Health probing:** per-service `probe_map` normalizes liveness paths (HTTP `/health`/`/healthz`, UDS `ping`→`pong`, TCP fallback). 2s timeout.
 - **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset).
@@ -67,6 +67,7 @@ alert_dedup_sec = 300
 registry_path = "architecture/port-registry.yaml"
 metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22) + /api/v1/* face + web console (issue #25); "" = disable all
 web_dir = "~/fusion/fusion-supervisor/web/dist"  # optional: serve the built web console from the same listener; "" = off
+auto_up_on_start = true            # issue #29: daemon boot runs up_all once (probe-skips already-healthy); host-reboot self-healing when the daemon itself is launched at boot. Default false.
 
 # Compose plane orchestration (disabled by default — native-only)
 [compose]
@@ -80,18 +81,33 @@ backup_schedule_sec = 86400        # daemon tick checks; 0 = first run always du
 backup_retention = 7               # keep newest N pg+qdrant backup sets, prune older
 ```
 
+Every field is optional in the file — write only the keys you want to override (all have serde defaults since v0.1.1; partial configs used to fail with `missing field socket_path`).
+
 Optional auth: set `FUSION_SV_TOKEN` env on daemon; CLI/clients pass `params.token`.
+
+## Shell-ecosystem takeover (issue #29)
+
+Four shell module services are supervised with custom start commands + registration env (the 2026-10-24 incident: a host reboot silently killed them and the shell sidebar lost every product entry):
+
+| Service | Port | Start command | Required env (injected, fail-closed) |
+|---|---|---|---|
+| fusion-cowork-web | 11461 | `fusion-cowork web serve --port 11461` (daemonized w/ pidfile) | `FUSION_SHELL_GATEWAY_URL`, `FUSION_GATEWAY_ADMIN_KEY` |
+| fusion-trainer-bridge | 8790 | `fusion-trainer/scripts/trainer-bridge.sh start` | `FUSION_TRAINER_BRIDGE_KEY` |
+| fusion-plugins-ecosystem-console | 8795 | `fusion-plugin-console --port 8795` (daemonized w/ pidfile) | `FUSION_SHELL_GATEWAY_URL`, `FUSION_GATEWAY_ADMIN_KEY` |
+| fusion-agent-studio | 11442 | `start.sh start` (default path) | — |
+
+Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSION_GATEWAY_ADMIN_KEY` falls back to read-only `web_shell.admin_key` from `fusion-gateway/config.yaml` (same pattern as trainer-bridge.sh); `FUSION_TRAINER_BRIDGE_KEY` has no fallback — put it in `.env` (git-ignored). Gateway is Core layer, modules are App layer, so `up_all` brings up the gateway before the modules register against it.
 
 ## Boundary with existing supervisors
 
-- **fusion-gateway** stays the inference routing entry. Its `auto_start` only starts fusion-mlx; supervisor manages all 41 (including mlx). Double-start avoided: supervisor probes first, skips if already healthy. (Boundary tracked in fusion-gateway issue.)
+- **fusion-gateway** stays the inference routing entry. Its `auto_start` only starts fusion-mlx; supervisor manages all 53 (including mlx). Double-start avoided: supervisor probes first, skips if already healthy. (Boundary tracked in fusion-gateway issue.)
 - **fusion-studio/Scripts/start.sh** → legacy. Supervisor uses registry truth, does not inherit the script's stale values. (Studio migration tracked in fusion-studio issue.)
 - **fusion-cli** `service`/`rag`/`doc` start/stop remain for interactive convenience; supervisor is authoritative. (Optional thin `fusion net` subcommand tracked in fusion-cli issue, v1.1.)
 
 ## Test
 
 ```bash
-cargo test --all-targets          # ~120 unit + 14 integration (124 total)
+cargo test --all-targets          # 150 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -100,7 +116,7 @@ cargo fmt --all --check
 
 - [x] `cargo build --release` → `fusion-sv`, 0 warnings (clippy -D warnings)
 - [x] `cargo test` layer 1+2 all pass (49 tests)
-- [ ] `fusion-sv daemon` then `fusion-sv status` lists all 41 services (real registry)
+- [ ] `fusion-sv daemon` then `fusion-sv status` lists all 53 services (real registry)
 - [ ] `fusion-sv up` starts core (mlx+gateway), skips already-running (no double-start)
 - [ ] Manually kill a non-core service → recovers within 30s, history recorded
 - [ ] Kill same service 5x → `Failed` state, stops restart, `RestartCapHit` alert
@@ -201,7 +217,7 @@ DB in containers.
 | qdrant | qdrant/qdrant:v1.12.4 | 6333/6334 | fusion-rag vector DB, tenant-prefix isolation |
 
 Ports respect `architecture/port-registry.yaml` — sidecar middleware uses the
-reserved standard ports, none collide with the 41 fusion service ports (11xxx).
+reserved standard ports, none collide with the 53 fusion service ports (11xxx).
 
 ### One-command bring-up
 

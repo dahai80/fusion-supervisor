@@ -46,12 +46,14 @@ impl SupervisorCore {
     pub fn new(defs: Vec<ServiceDef>, cfg: Config) -> Result<Self> {
         let store = HistoryStore::open(&cfg.db_path)?;
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
+        let env_file = cfg.compose.env_file.clone();
         let runners: Vec<_> = defs
             .into_iter()
             .map(|d| {
                 let spec = probe_map::probe_spec_for(&d.name, d.port);
                 let cmd = probe_map::restart_cmd_for(&d.name).to_string();
-                let repo_dir = d.repo_dir.clone();
+                let name = d.name.clone();
+                let env_file = env_file.clone();
                 let policy = policy::RestartPolicy::new(
                     cfg.restart_window_sec,
                     cfg.restart_max,
@@ -61,7 +63,20 @@ impl SupervisorCore {
                     d,
                     &cmd,
                     move || real_probe_spec(&spec),
-                    move |c: &str| real_start_pair(&repo_dir, c, &[]),
+                    move |c: &str| {
+                        // issue #29: crash 自动重启路径也注入 shell 注册 env。
+                        // 解析失败仅 ERROR + 空注入 (不 bail): 服务真起不来时探活失败
+                        // 告警兜底; 首次启动路径 up_native 才是严格 fail-closed。
+                        let env: Vec<(String, String)> =
+                            match crate::env_map::shell_env_for(&name, &env_file) {
+                                Ok(m) => m.into_iter().collect(),
+                                Err(e) => {
+                                    tracing::error!(svc = %name, err = %e, "shell env 解析失败, 重启以空 env 继续");
+                                    Vec::new()
+                                }
+                            };
+                        real_start_pair(&name, c, &env)
+                    },
                     policy,
                 )
             })
@@ -200,23 +215,30 @@ impl SupervisorCore {
                         tracing::info!(svc = %d.name, "skip start (already up)");
                         return (d.name, true, Ok(()));
                     }
-                    // issue #8: compose enabled 时, 依赖 sidecar 的服务注入连接 env。
-                    // fail-closed: 解析失败 → 拒绝启动 (非静默降级)。
-                    let env_overrides: Vec<(String, String)> = if compose_enabled
-                        && crate::env_map::needs_injection(&d.name)
-                    {
+                    // env 注入分两类, 均解析失败 fail-closed 拒绝启动:
+                    // - issue #29: shell 注册 env (无条件, 不 gate 在 compose 上)
+                    // - issue #8: compose enabled 时 sidecar 连接 env
+                    let mut env_overrides: Vec<(String, String)> = Vec::new();
+                    if crate::env_map::needs_shell_env(&d.name) {
+                        match crate::env_map::shell_env_for(&d.name, &env_file) {
+                            Ok(m) => env_overrides.extend(m),
+                            Err(e) => {
+                                tracing::error!(svc = %d.name, err = %e, "shell env 解析失败, fail-closed 拒绝启动");
+                                return (d.name, false, Err(e));
+                            }
+                        }
+                    }
+                    if compose_enabled && crate::env_map::needs_injection(&d.name) {
                         match crate::env_map::native_env_for(&d.name, &env_file) {
-                            Ok(m) => m.into_iter().collect(),
+                            Ok(m) => env_overrides.extend(m),
                             Err(e) => {
                                 tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
                                 return (d.name, false, Err(e));
                             }
                         }
-                    } else {
-                        Vec::new()
-                    };
+                    }
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start");
-                    let cmd = async { (start_fn)(&d.repo_dir, "start", &env_overrides) };
+                    let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
                     match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
                         Ok(Ok(())) => (d.name, false, Ok(())),
                         Ok(Err(e)) => {
@@ -289,7 +311,7 @@ impl SupervisorCore {
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop");
-                    if let Err(e) = (start_fn)(&d.repo_dir, "stop", &[]) {
+                    if let Err(e) = (start_fn)(&d.name, "stop", &[]) {
                         tracing::warn!(svc = %d.name, err = %e, "stop fail");
                     }
                     d.name
@@ -688,29 +710,82 @@ fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
     )))
 }
 
-// 真 start.sh 调用: bash {repo}/start.sh {cmd}, stderr → 每服务日志。
-// env_overrides: 注入连接 env (issue #8, compose enabled 时依赖 sidecar 的服务)。
-fn real_start_pair(repo_dir: &str, cmd: &str, env_overrides: &[(String, String)]) -> Result<()> {
-    let sh = probe_map::start_sh_path(repo_dir);
-    if !sh.exists() {
-        anyhow::bail!("start.sh 不存在: {}", sh.display());
+// 真启动调用 (生产)。svc=服务名: start_map 有覆盖 (issue #29) 走覆盖命令,
+// 否则默认 bash {repo}/start.sh {cmd}。stderr → 每服务日志。
+// env_overrides: 注入 env (issue #8 sidecar 连接 + issue #29 shell 注册)。
+fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> Result<()> {
+    match crate::start_map::start_spec_for(svc) {
+        Some(spec) => exec_start_spec(svc, &spec, cmd, env_overrides),
+        None => {
+            let repo_dir = crate::manifest::name_to_dir(svc);
+            let sh = probe_map::start_sh_path(repo_dir);
+            exec_bash_script(svc, &sh, cmd, env_overrides)
+        }
     }
-    let log_dir = std::env::var("HOME")
-        .map(|h| format!("{h}/.fusion-sv/logs"))
-        .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
-    std::fs::create_dir_all(&log_dir).ok();
-    let svc_log = format!("{log_dir}/{repo_dir}.log");
-    tracing::info!(sh = %sh.display(), cmd, log = %svc_log, env_n = env_overrides.len(), "exec start.sh");
+}
+
+// issue #29: 覆盖服务的启动分派。
+// Script: bash <script> <cmd> (trainer-bridge 自带 start/stop)。
+// Daemon: start → nohup 后台 + pidfile; stop → pidfile kill; restart 上游已退化为 stop+start。
+fn exec_start_spec(
+    svc: &str,
+    spec: &crate::start_map::StartSpec,
+    cmd: &str,
+    env_overrides: &[(String, String)],
+) -> Result<()> {
+    match spec {
+        crate::start_map::StartSpec::Script(sh) => exec_bash_script(svc, sh, cmd, env_overrides),
+        crate::start_map::StartSpec::Daemon { .. } => {
+            let shell_cmd = match cmd {
+                "start" => crate::start_map::daemon_start_cmd(spec, svc)
+                    .ok_or_else(|| anyhow::anyhow!("daemon spec 缺 start 命令: {svc}"))?,
+                "stop" => crate::start_map::daemon_stop_cmd(svc),
+                other => {
+                    anyhow::bail!("daemon spec 不支持 {other} (restart 应为 stop+start): {svc}");
+                }
+            };
+            tracing::info!(svc, cmd, shell = %shell_cmd, env_n = env_overrides.len(), "exec start_map daemon cmd");
+            let mut command = std::process::Command::new("bash");
+            command.arg("-c").arg(&shell_cmd);
+            for (k, v) in env_overrides {
+                command.env(k, v);
+            }
+            let status = command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| anyhow::anyhow!("spawn daemon cmd: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("daemon cmd {cmd} exit {:?}", status.code());
+            }
+            Ok(())
+        }
+    }
+}
+
+// bash <script> <cmd>, stderr → 每服务日志 (~/.fusion-sv/logs/<svc>.log)。
+fn exec_bash_script(
+    svc: &str,
+    sh: &std::path::Path,
+    cmd: &str,
+    env_overrides: &[(String, String)],
+) -> Result<()> {
+    if !sh.exists() {
+        anyhow::bail!("脚本不存在: {}", sh.display());
+    }
+    std::fs::create_dir_all(crate::start_map::log_path(svc).parent().unwrap()).ok();
+    let svc_log = crate::start_map::log_path(svc);
+    tracing::info!(sh = %sh.display(), cmd, log = %svc_log.display(), env_n = env_overrides.len(), "exec start script");
     let stderr: std::process::Stdio = match std::fs::File::create(&svc_log) {
         Ok(f) => f.into(),
         Err(e) => {
-            tracing::warn!(err = %e, log = %svc_log, "open svc log fail, stderr → null");
+            tracing::warn!(err = %e, log = %svc_log.display(), "open svc log fail, stderr → null");
             std::process::Stdio::null()
         }
     };
     let mut command = std::process::Command::new("bash");
-    command.arg(&sh).arg(cmd);
-    // 注入连接 env (覆盖/新增), 继承父进程其余 env
+    command.arg(sh).arg(cmd);
+    // 注入 env (覆盖/新增), 继承父进程其余 env
     for (k, v) in env_overrides {
         command.env(k, v);
     }
@@ -718,9 +793,9 @@ fn real_start_pair(repo_dir: &str, cmd: &str, env_overrides: &[(String, String)]
         .stdout(std::process::Stdio::null())
         .stderr(stderr)
         .status()
-        .map_err(|e| anyhow::anyhow!("spawn start.sh: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("spawn start script: {e}"))?;
     if !status.success() {
-        anyhow::bail!("start.sh {cmd} exit {:?}", status.code());
+        anyhow::bail!("script {cmd} exit {:?}", status.code());
     }
     Ok(())
 }
