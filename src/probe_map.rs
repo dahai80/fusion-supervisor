@@ -34,6 +34,12 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-agent-studio", ProbeSpec::http(11442, "/health"));
     // issue #31: MCP server (sse) 无 /health 端点, TCP 端口探活
     m.insert("fusion-plugins-ecosystem", ProbeSpec::tcp(8765));
+    // issue #33: fs-serve /health (deploy/start.sh, :11463)
+    m.insert("fusion-store", ProbeSpec::http(11463, "/health"));
+    // issue #33: fsb uvicorn /health (:11490)
+    m.insert("fusion-smallbusiness", ProbeSpec::http(11490, "/health"));
+    // issue #33: 仿真 gRPC 服务无 HTTP 面, TCP 端口探活 (:11447)
+    m.insert("fusion-simulation", ProbeSpec::tcp(11447));
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -50,7 +56,7 @@ pub fn probe_spec_for(name: &str, port: u16) -> ProbeSpec {
     ProbeSpec::tcp(port)
 }
 
-// fusion-store deploy/start.sh 仅 start, 无 restart → 退化为 stop+start。
+// fusion-store (issue #33 起 daemonize 直跑) 无 restart 语义 → 退化为 stop+start。
 // issue #29: start_map 覆盖服务 (trainer-bridge 脚本无 restart 子命令;
 // daemonize 进程无 restart 语义) 一律 stop+start。
 pub fn restart_cmd_for(name: &str) -> &'static str {
@@ -114,6 +120,30 @@ mod tests {
     fn test_plugins_ecosystem_tcp_probe() {
         let s = probe_spec_for("fusion-plugins-ecosystem", 8765);
         assert!(matches!(s.kind, ProbeKind::Tcp));
+    }
+
+    // issue #33: 新托管服务探活 — store/fsb HTTP /health, simulation gRPC TCP
+    #[test]
+    fn test_issue33_probe_specs() {
+        for (name, port) in [("fusion-store", 11463), ("fusion-smallbusiness", 11490)] {
+            let s = probe_spec_for(name, port);
+            assert!(matches!(s.kind, ProbeKind::Http), "{name} 应 HTTP 探活");
+            assert_eq!(
+                s.path.as_deref(),
+                Some("/health"),
+                "{name} 路径应为 /health"
+            );
+        }
+        let s = probe_spec_for("fusion-simulation", 11447);
+        assert!(matches!(s.kind, ProbeKind::Tcp), "simulation 应 TCP 探活");
+    }
+
+    // issue #33: 三个新托管服务均为 start_map 覆盖 → restart 退化为 stop+start
+    #[test]
+    fn test_issue33_restart_cmd_stop_start() {
+        for name in ["fusion-store", "fusion-smallbusiness", "fusion-simulation"] {
+            assert_eq!(restart_cmd_for(name), "stop+start", "{name}");
+        }
     }
 
     #[test]
