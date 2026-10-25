@@ -43,6 +43,13 @@ pub struct Config {
     // issue #10: 备份保留份数。新备份后裁剪超出 N 份的旧备份, 默认 7。
     #[serde(default = "default_backup_retention")]
     pub backup_retention: u32,
+    // issue #37: history.db 健康史/事件保留天数。daemon 周期 sweep 清除过期行。
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
+    // issue #37: sweep 调度间隔 (秒)。到期执行一次 cleanup_old; 失败也更新时间戳
+    // (避免每 tick 重试风暴, 同 backup 调度语义)。
+    #[serde(default = "default_prune_schedule_sec")]
+    pub prune_schedule_sec: u64,
     #[serde(default = "default_registry_path")]
     pub registry_path: PathBuf,
     #[serde(default)]
@@ -101,6 +108,12 @@ fn default_env() -> PathBuf {
 }
 fn default_container_crash_escalation() -> u32 {
     5
+}
+fn default_history_retention_days() -> u32 {
+    7
+}
+fn default_prune_schedule_sec() -> u64 {
+    3600
 }
 fn default_socket_path() -> String {
     "/tmp/fusion-sv.sock".to_string()
@@ -171,6 +184,8 @@ impl Default for Config {
             rollout_prewarm_timeout_sec: 60,
             backup_schedule_sec: 86400,
             backup_retention: 7,
+            history_retention_days: 7,
+            prune_schedule_sec: 3600,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             compose: ComposeConfig::default(),
             metrics_addr: default_metrics_addr(),

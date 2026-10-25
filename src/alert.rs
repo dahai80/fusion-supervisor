@@ -1,4 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+// issue #37: 事件落库 sink — 每次真实发出的告警同步写 history.db event 表。
+// (service, kind, detail, ts, plane, severity) 六元组, 由构造方闭包决定落库细节。
+pub type EventSink = Arc<dyn Fn(&str, &str, &str, u64, &str, &str) + Send + Sync>;
 
 // 告警: ServiceDown 去抖 (5min/服务), 其余每次发。sink = tracing WARN + 可选 webhook。
 // webhook 投递失败重试 3 次退回仅日志, 不影响监督 (spec §6.1)。
@@ -48,6 +53,10 @@ pub struct Alerter {
     dedup_sec: u64,
     last_down: HashMap<String, u64>,
     webhook_url: String,
+    // issue #37: 告警 → event 表的落库 sink (可选; 未设置则不落库, 测试用)
+    event_sink: Option<EventSink>,
+    // issue #37: 真实发出 (去抖后) 的告警累计数 (/metrics fusion_sv_alerts_total)
+    alerts_emitted: u64,
 }
 
 impl Alerter {
@@ -56,6 +65,27 @@ impl Alerter {
             dedup_sec,
             last_down: HashMap::new(),
             webhook_url,
+            event_sink: None,
+            alerts_emitted: 0,
+        }
+    }
+
+    // issue #37: 注入事件落库 sink (builder 风格, 生产构造处调用)
+    pub fn with_event_sink(mut self, sink: EventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    pub fn alerts_emitted(&self) -> u64 {
+        self.alerts_emitted
+    }
+
+    // issue #37: kind → severity 映射 (crash-loop 升级=error, 恢复/正常事件=info, 其余 warn)
+    fn severity_of(kind: &AlertKind) -> &'static str {
+        match kind {
+            AlertKind::ContainerCrashLoop => "error",
+            AlertKind::ServiceBack | AlertKind::ServiceDrained => "info",
+            _ => "warn",
         }
     }
 
@@ -100,6 +130,18 @@ impl Alerter {
             );
         }
         self.record_emitted(&alert.service, &alert.kind, alert.ts);
+        // issue #37: 真实发出的告警 → 计数 + 事件落库 (dedup 通过才到这, 不重复记录)
+        self.alerts_emitted += 1;
+        if let Some(sink) = &self.event_sink {
+            sink(
+                &alert.service,
+                alert.kind.label(),
+                &alert.detail,
+                alert.ts,
+                "native",
+                Self::severity_of(&alert.kind),
+            );
+        }
         if !self.webhook_url.is_empty()
             && let Err(e) = self.send_webhook(&alert).await
         {
