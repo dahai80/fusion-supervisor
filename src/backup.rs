@@ -230,7 +230,7 @@ async fn record_outcome(
         ),
         Err(e) => ("fail", format!("{} backup fail: {e}", svc)),
     };
-    if let Err(e) = store.record_event(svc, "Backup", &detail, now_ts, "backup") {
+    if let Err(e) = store.record_event(svc, "Backup", &detail, now_ts, "backup", "info") {
         tracing::warn!(svc, err = %e, "backup event write fail (非致命)");
     }
     if res.is_err() {

@@ -35,6 +35,8 @@ fn state_label(s: State) -> &'static str {
 //   fusion_sv_service_healthy{service,port,plane} — 1=Healthy, 0=其他态
 //   fusion_sv_service_state{service,port,plane,state} — 1=当前态 (每服务仅其当前态为 1)
 //   fusion_sv_crash_count{service}              — 滑动窗内崩溃次数 (native only)
+//   fusion_sv_alerts_total                      — 去抖后真实发出的告警累计 (issue #37)
+//   fusion_sv_events_pruned_total               — retention sweep 累计清除行数 (issue #37)
 pub fn render(core: &SupervisorCore) -> String {
     let mut out = String::with_capacity(4096);
     // daemon up (端点能响应即活)
@@ -61,6 +63,22 @@ pub fn render(core: &SupervisorCore) -> String {
     };
     out.push_str(&format!(
         "fusion_sv_services_total{{plane=\"compose\"}} {compose_n}\n"
+    ));
+
+    // issue #37: 告警 + retention sweep 累计计数 (daemon 生命周期内单调递增)
+    out.push_str(
+        "# HELP fusion_sv_alerts_total Alerts actually emitted (post-dedup), cumulative.\n",
+    );
+    out.push_str("# TYPE fusion_sv_alerts_total counter\n");
+    out.push_str(&format!(
+        "fusion_sv_alerts_total {}\n",
+        core.alerter.alerts_emitted()
+    ));
+    out.push_str("# HELP fusion_sv_events_pruned_total History rows pruned by retention sweeps, cumulative.\n");
+    out.push_str("# TYPE fusion_sv_events_pruned_total counter\n");
+    out.push_str(&format!(
+        "fusion_sv_events_pruned_total {}\n",
+        core.events_pruned_total
     ));
 
     // 每服务 healthy gauge + state gauge + crash_count
@@ -233,6 +251,27 @@ mod tests {
         assert!(
             out.contains("fusion_sv_crash_count{service=\"fusion-mlx\"} 2"),
             "crash_count 应为 2"
+        );
+    }
+
+    // issue #37: 告警 + retention sweep 计数器
+    #[test]
+    fn test_render_alerts_and_pruned_counters() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        core.events_pruned_total = 5;
+        let out = render(&core);
+        assert!(
+            out.contains("fusion_sv_alerts_total 0"),
+            "初始告警计数应为 0: {out}"
+        );
+        assert!(
+            out.contains("fusion_sv_events_pruned_total 5"),
+            "sweep 计数应为 5: {out}"
         );
     }
 

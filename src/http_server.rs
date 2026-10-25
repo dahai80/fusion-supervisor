@@ -203,7 +203,7 @@ async fn route(
                                 json!({
                                     "ts": r.ts, "service": r.service,
                                     "kind": r.kind, "detail": r.detail,
-                                    "plane": r.plane,
+                                    "plane": r.plane, "severity": r.severity,
                                 })
                             })
                             .collect();

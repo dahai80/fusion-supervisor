@@ -24,6 +24,8 @@ pub struct EventRow {
     pub kind: String,
     pub detail: String,
     pub plane: String,
+    // issue #37: 事件严重级 (warn/error/info), 旧库迁移默认 warn
+    pub severity: String,
 }
 
 impl HistoryStore {
@@ -50,7 +52,8 @@ impl HistoryStore {
                  service TEXT NOT NULL,
                  kind TEXT NOT NULL,
                  detail TEXT NOT NULL,
-                 plane TEXT NOT NULL DEFAULT 'native'
+                 plane TEXT NOT NULL DEFAULT 'native',
+                 severity TEXT NOT NULL DEFAULT 'warn'
              );
              CREATE INDEX IF NOT EXISTS idx_health_svc ON health_check(service, ts);
              CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
@@ -58,6 +61,8 @@ impl HistoryStore {
         // 迁移: 旧库表无 plane 列 → ALTER 补列 (幂等, SQLite 无 ADD COLUMN IF NOT EXISTS,
         // 靠错误吞掉重复列)。旧行默认 'native' (DEFAULT 子句)。
         migrate_add_plane(&conn)?;
+        // issue #37: 旧库 event 表无 severity 列 → 同法补列, 旧行默认 'warn'。
+        migrate_add_severity(&conn)?;
         tracing::info!(db = %path.display(), "history store open (WAL)");
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
@@ -86,10 +91,11 @@ impl HistoryStore {
         detail: &str,
         ts: u64,
         plane: &str,
+        severity: &str,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO event(ts, service, kind, detail, plane) VALUES (?,?,?,?,?)",
-            params![ts as i64, service, kind, detail, plane],
+            "INSERT INTO event(ts, service, kind, detail, plane, severity) VALUES (?,?,?,?,?,?)",
+            params![ts as i64, service, kind, detail, plane, severity],
         )?;
         Ok(())
     }
@@ -133,8 +139,8 @@ impl HistoryStore {
     pub fn recent_events(&self, service: &str, limit: u32) -> Result<Vec<EventRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT ts, service, kind, detail, plane FROM (
-                 SELECT ts, service, kind, detail, plane FROM event
+            "SELECT ts, service, kind, detail, plane, severity FROM (
+                 SELECT ts, service, kind, detail, plane, severity FROM event
                  WHERE service = ? ORDER BY ts DESC LIMIT ?
              ) ORDER BY ts ASC",
         )?;
@@ -145,6 +151,7 @@ impl HistoryStore {
                 kind: r.get(2)?,
                 detail: r.get(3)?,
                 plane: r.get(4)?,
+                severity: r.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -155,8 +162,8 @@ impl HistoryStore {
     pub fn recent_events_all(&self, limit: u32) -> Result<Vec<EventRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT ts, service, kind, detail, plane FROM (
-                 SELECT ts, service, kind, detail, plane FROM event
+            "SELECT ts, service, kind, detail, plane, severity FROM (
+                 SELECT ts, service, kind, detail, plane, severity FROM event
                  ORDER BY ts DESC LIMIT ?
              ) ORDER BY ts ASC",
         )?;
@@ -167,6 +174,7 @@ impl HistoryStore {
                 kind: r.get(2)?,
                 detail: r.get(3)?,
                 plane: r.get(4)?,
+                severity: r.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -191,6 +199,24 @@ fn migrate_add_plane(conn: &Connection) -> Result<()> {
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+// issue #37: 旧库 event 表无 severity 列 → ALTER ADD COLUMN, 同 migrate_add_plane 模式。
+// 旧行默认 'warn' (DEFAULT 子句)。
+fn migrate_add_severity(conn: &Connection) -> Result<()> {
+    match conn.execute(
+        "ALTER TABLE event ADD COLUMN severity TEXT NOT NULL DEFAULT 'warn'",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("migrate: add severity column");
+        }
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {
+            tracing::debug!("migrate: severity column 已存在, 跳过");
+        }
+        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
@@ -238,10 +264,24 @@ mod tests {
     #[test]
     fn test_record_and_query_event() {
         let s = open_mem();
-        s.record_event("fusion-rag", "ServiceDown", "conn refused", 5000, "native")
-            .unwrap();
-        s.record_event("fusion-rag", "ServiceBack", "recovered", 5300, "native")
-            .unwrap();
+        s.record_event(
+            "fusion-rag",
+            "ServiceDown",
+            "conn refused",
+            5000,
+            "native",
+            "warn",
+        )
+        .unwrap();
+        s.record_event(
+            "fusion-rag",
+            "ServiceBack",
+            "recovered",
+            5300,
+            "native",
+            "info",
+        )
+        .unwrap();
         let rows = s.recent_events("fusion-rag", 10).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, "ServiceDown");
@@ -263,6 +303,25 @@ mod tests {
         let rows = s.recent_health("fusion-mlx", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].latency_ms, 2);
+    }
+
+    // issue #37: 过期 event 行也被 sweep 清除, 近期行保留 (health+event 两表都裁)
+    #[test]
+    fn test_cleanup_old_prunes_events_too() {
+        let s = open_mem();
+        let now = 1_000_000u64;
+        let old = now - (8 * 24 * 3600);
+        s.record_event("fusion-rag", "ServiceDown", "old", old, "native", "warn")
+            .unwrap();
+        s.record_event("fusion-rag", "ServiceDown", "new", now, "native", "warn")
+            .unwrap();
+        s.record_health("fusion-rag", "healthy", 1, old, "native")
+            .unwrap();
+        let deleted = s.cleanup_old(now, 7).unwrap();
+        assert_eq!(deleted, 2, "旧 health 行 + 旧 event 行");
+        let ev = s.recent_events("fusion-rag", 10).unwrap();
+        assert_eq!(ev.len(), 1, "近期 event 行保留");
+        assert_eq!(ev[0].detail, "new");
     }
 
     #[test]
@@ -297,10 +356,24 @@ mod tests {
         assert_eq!(native_rows.len(), 1);
         assert_eq!(native_rows[0].plane, "native");
         // event 跨 plane
-        s.record_event("redis", "ContainerCrashLoop", "exited", 300, "compose")
-            .unwrap();
-        s.record_event("fusion-mlx", "ServiceDown", "refused", 310, "native")
-            .unwrap();
+        s.record_event(
+            "redis",
+            "ContainerCrashLoop",
+            "exited",
+            300,
+            "compose",
+            "error",
+        )
+        .unwrap();
+        s.record_event(
+            "fusion-mlx",
+            "ServiceDown",
+            "refused",
+            310,
+            "native",
+            "warn",
+        )
+        .unwrap();
         let ev_compose = s.recent_events("redis", 10).unwrap();
         assert_eq!(ev_compose[0].plane, "compose");
         let ev_native = s.recent_events("fusion-mlx", 10).unwrap();
@@ -344,6 +417,7 @@ mod tests {
         let ev = s.recent_events("fusion-rag", 10).unwrap();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].plane, "native", "旧 event 行 plane 默认 native");
+        assert_eq!(ev[0].severity, "warn", "旧 event 行 severity 默认 warn");
         // 迁移后再写新行, plane 显式 compose
         s.record_health("redis", "healthy", 1, 2000, "compose")
             .unwrap();

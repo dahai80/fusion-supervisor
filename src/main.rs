@@ -129,6 +129,8 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             c.tick_all(now).await;
             // issue #10: 备份调度检查 (到期触发 run_backup, fail-closed 已告警)
             c.check_backup_schedule(now).await;
+            // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
+            c.check_retention(now);
         }
     });
     // issue #22/#26/#25: HTTP 面 (metrics + 只读 status/history/events + web

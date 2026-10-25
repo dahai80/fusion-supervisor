@@ -27,7 +27,9 @@ pub struct StatusEntry {
 
 pub struct SupervisorCore {
     pub runners: Vec<runner::ServiceRunner>,
-    pub store: HistoryStore,
+    // issue #37: Arc 化 — Alerter 的事件落库 sink 需要持有 store 的克隆
+    // (告警 chokepoint 统一写 event 表, native + compose 共用)。
+    pub store: Arc<HistoryStore>,
     pub alerter: Alerter,
     pub cfg: Config,
     // 注入的 start 函数 (生产=bash start.sh, 测试=fake)。签名: (repo_dir, cmd) -> Result
@@ -39,13 +41,18 @@ pub struct SupervisorCore {
     compose_tracker: crate::compose_tracker::ComposeTracker,
     // issue #10: 上次备份时间戳 (调度判定用)。0=从未备份 → 首次 tick 即到期。
     last_backup_ts: u64,
+    // issue #37: 上次 retention sweep 时间戳 (调度判定用, 语义同 last_backup_ts)。
+    last_prune_ts: u64,
+    // issue #37: 累计清除的 history.db 行数 (/metrics fusion_sv_events_pruned_total)
+    pub events_pruned_total: u64,
 }
 
 impl SupervisorCore {
     // 生产构造: 真 bash start.sh + 真 probe。probe_map 填 spec + restart_cmd。
     pub fn new(defs: Vec<ServiceDef>, cfg: Config) -> Result<Self> {
-        let store = HistoryStore::open(&cfg.db_path)?;
-        let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
+        let store = Arc::new(HistoryStore::open(&cfg.db_path)?);
+        let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
+            .with_event_sink(make_event_sink(store.clone()));
         let env_file = cfg.compose.env_file.clone();
         let runners: Vec<_> = defs
             .into_iter()
@@ -97,6 +104,8 @@ impl SupervisorCore {
             compose,
             compose_tracker,
             last_backup_ts: 0,
+            last_prune_ts: 0,
+            events_pruned_total: 0,
         })
     }
 
@@ -123,8 +132,10 @@ impl SupervisorCore {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let db_path =
             std::env::temp_dir().join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
-        let store = HistoryStore::open(&db_path).unwrap();
-        let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone());
+        let store = Arc::new(HistoryStore::open(&db_path).unwrap());
+        // issue #37: 测试构造同样注入事件 sink — native 告警落库行为与生产一致 (可测)
+        let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
+            .with_event_sink(make_event_sink(store.clone()));
         let start_fn = Arc::new(start_fn);
         let probe_fn = Arc::new(probe_fn);
         let runners: Vec<_> = defs
@@ -159,6 +170,8 @@ impl SupervisorCore {
             compose,
             compose_tracker,
             last_backup_ts: 0,
+            last_prune_ts: 0,
+            events_pruned_total: 0,
         }
     }
 
@@ -523,13 +536,7 @@ impl SupervisorCore {
                     ),
                 };
                 tracing::info!(svc = %c.service, kind = kind.label(), "compose tick 告警决策");
-                // 持久化事件行 plane=compose (issue #7)
-                if let Err(e) = self
-                    .store
-                    .record_event(&c.service, event_kind, &detail, now_ts, "compose")
-                {
-                    tracing::warn!(svc = %c.service, err = %e, "compose event write fail (非致命)");
-                }
+                let _ = event_kind; // 落库统一走 Alerter 事件 sink (issue #37), 此处仅告警
                 let _ = self
                     .alerter
                     .alert(crate::alert::Alert {
@@ -779,6 +786,51 @@ impl SupervisorCore {
             }
         }
     }
+    // issue #37: history.db retention sweep 调度 (语义同 backup 调度)。
+    // 到期执行 cleanup_old (health_check + event 两表按 history_retention_days 裁剪)。
+    // 失败也更新时间戳 — 避免每 tick 重试风暴, 下轮 sweep 再试。
+    // daemon tick 循环内调用。返回是否执行了 sweep。
+    pub fn check_retention(&mut self, now_ts: u64) -> bool {
+        if !crate::backup::backup_due(now_ts, self.last_prune_ts, self.cfg.prune_schedule_sec) {
+            return false;
+        }
+        tracing::info!(
+            now_ts,
+            retention_days = self.cfg.history_retention_days,
+            "retention sweep 到期, 执行"
+        );
+        match self
+            .store
+            .cleanup_old(now_ts, self.cfg.history_retention_days)
+        {
+            Ok(n) => {
+                tracing::info!(pruned = n, "retention sweep 完成");
+                self.events_pruned_total += n as u64;
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "retention sweep 失败 (下轮再试)");
+            }
+        }
+        self.last_prune_ts = now_ts;
+        true
+    }
+}
+
+// issue #37: Alerter 事件落库 sink — 每次真实发出的告警 (去抖通过) 写 event 表。
+// compose 告警 service 带 "compose:" 前缀 → 落库剥离前缀 + plane=compose
+// (语义同旧 tick_compose 显式写入, issue #7)。
+fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
+    Arc::new(
+        move |service: &str, kind: &str, detail: &str, ts: u64, _plane: &str, severity: &str| {
+            let (svc, plane) = match service.strip_prefix("compose:") {
+                Some(s) => (s, "compose"),
+                None => (service, "native"),
+            };
+            if let Err(e) = store.record_event(svc, kind, detail, ts, plane, severity) {
+                tracing::warn!(svc = svc, err = %e, "alert event write fail (非致命)");
+            }
+        },
+    )
 }
 
 // 据配置构建 compose 后端。enabled=false → None (仅 native)。
@@ -1631,6 +1683,65 @@ mod tests {
     }
 
     // ---- compose 容器持久化进 history.db (issue #7) ----
+
+    // issue #37: native 告警经 Alerter 事件 sink 落库 — kind/plane/severity 正确,
+    // 去抖窗内被抑制的告警不重复落库, alerts_emitted 计数只记真实发出。
+    #[tokio::test]
+    async fn test_native_alert_persists_event() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        let ev = core.store.recent_events("fusion-mlx", 10).unwrap();
+        assert_eq!(ev.len(), 1, "首次宕机 ServiceDown 应落库");
+        assert_eq!(ev[0].kind, "ServiceDown");
+        assert_eq!(ev[0].plane, "native");
+        assert_eq!(ev[0].severity, "warn");
+        assert_eq!(core.alerter.alerts_emitted(), 1);
+        // 去抖窗内第二次 ServiceDown: 不落库不计数 (tick 只排期重启, 不发新告警)
+        core.tick_all(1001).await;
+        let ev2 = core.store.recent_events("fusion-mlx", 10).unwrap();
+        assert_eq!(ev2.len(), 1, "无新告警不应新增 event 行");
+        assert_eq!(core.alerter.alerts_emitted(), 1);
+    }
+
+    // issue #37: retention sweep 调度 — 到期裁剪过期行并计数, 未到期不执行。
+    #[tokio::test]
+    async fn test_check_retention_prunes_and_counts() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        let now = 1_000_000u64;
+        let old = now - (8 * 24 * 3600);
+        core.store
+            .record_health("fusion-mlx", "healthy", 1, old, "native")
+            .unwrap();
+        core.store
+            .record_event("fusion-mlx", "ServiceDown", "old", old, "native", "warn")
+            .unwrap();
+        core.store
+            .record_health("fusion-mlx", "healthy", 2, now, "native")
+            .unwrap();
+        assert!(core.check_retention(now), "last_prune_ts=0 → 首次即到期");
+        assert_eq!(core.events_pruned_total, 2, "旧 health 行 + 旧 event 行");
+        assert_eq!(
+            core.store.recent_health("fusion-mlx", 10).unwrap().len(),
+            1,
+            "近期行保留"
+        );
+        // 调度间隔内未到期 → 不重复执行
+        assert!(!core.check_retention(now + 60));
+        assert_eq!(core.events_pruned_total, 2);
+    }
 
     // 容器 exited → tick_compose 应写 event 行 plane=compose, kind=ServiceDown
     #[tokio::test]

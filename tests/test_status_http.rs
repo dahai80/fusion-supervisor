@@ -145,7 +145,7 @@ async fn test_history_and_events_read_store() {
             .record_health("fusion-mlx", "Unhealthy", 0, 2000, "native")
             .unwrap();
         c.store
-            .record_event("fusion-mlx", "Crashed", "exit 1", 1500, "native")
+            .record_event("fusion-mlx", "Crashed", "exit 1", 1500, "native", "warn")
             .unwrap();
     }
     let (addr, handle) = start_server(core_arc.clone(), None, None).await;
