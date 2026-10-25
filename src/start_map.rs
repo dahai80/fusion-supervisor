@@ -53,13 +53,48 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
                 "8765".into(),
             ],
         }),
+        // issue #33: fusion-store 仓库根无 start.sh; deploy/start.sh 有上游 bug
+        // (BINARY 指向不存在的 target/release/fusion-store, 实际产物是 fs-serve,
+        //  上游 issue dahai80/fusion-store#5) — 直接 daemonize fs-serve 二进制
+        // (自带默认口/环回监听, 探活见 probe_map)
+        "fusion-store" => Some(StartSpec::Daemon {
+            bin: "fusion-store/target/release/fs-serve".into(),
+            args: vec![],
+        }),
+        // issue #33: fusion-smallbusiness 无 start.sh, CLI 入口直接跑 uvicorn
+        // (口由 FSB env 决定, 探活见 probe_map)
+        "fusion-smallbusiness" => Some(StartSpec::Daemon {
+            bin: "fusion-smallbusiness".into(),
+            args: vec![],
+        }),
+        // issue #33: fusion-simulation 无 start.sh, `fusion-sim service start`
+        // 前台阻塞进程 (gRPC :11447 + metrics :11456, --gui 起 Web GUI :11455);
+        // registry 的 -gui/-metrics 条目由该进程内嵌服务, 已 supervise:false
+        "fusion-simulation" => Some(StartSpec::Daemon {
+            bin: "fusion-sim".into(),
+            args: vec![
+                "service".into(),
+                "start".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--gui".into(),
+            ],
+        }),
         _ => None,
     }
 }
 
 // 共享 venv 内的 CLI 入口优先 (daemon 通常不在 venv shell 里跑);
 // 不存在则退回裸名交给 PATH。
+// 含路径分隔符的 bin (如 fusion-store/target/release/fs-serve) 相对 FUSION_ROOT 解析。
 pub fn resolve_bin(bin: &str) -> String {
+    if bin.contains('/') {
+        let candidate = fusion_root().join(bin);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+        return bin.to_string();
+    }
     let candidate = fusion_root().join(".venv/bin").join(bin);
     if candidate.exists() {
         candidate.to_string_lossy().into_owned()
@@ -201,6 +236,62 @@ mod tests {
             cmd.contains("--transport sse --port 8765"),
             "应带 MCP server 参数: {cmd}"
         );
+    }
+
+    // issue #33: fusion-store 直接 daemonize fs-serve 二进制 (deploy/start.sh 上游
+    // BINARY 名不匹配, 走不了); 含路径的 bin 相对 FUSION_ROOT 解析
+    #[test]
+    fn test_fusion_store_daemon_spec() {
+        let spec = start_spec_for("fusion-store").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-store/target/release/fs-serve");
+                assert!(args.is_empty(), "零参启动, 口走 fs-serve 内置默认");
+            }
+            _ => panic!("fusion-store 应为 Daemon spec"),
+        }
+        let cmd = daemon_start_cmd(&spec, "fusion-store").unwrap();
+        assert!(cmd.contains("fs-serve"), "应启动 fs-serve 二进制: {cmd}");
+    }
+
+    // 含路径分隔符的 bin 相对 FUSION_ROOT 解析; 纯名走 .venv/bin
+    #[test]
+    fn test_resolve_bin_path_form() {
+        // 存在与否都不得拼进 .venv/bin (路径带 / 拼接语义错误)
+        let r = resolve_bin("fusion-store/target/release/fs-serve");
+        assert!(!r.contains(".venv"), "路径形式 bin 不得走 .venv 解析: {r}");
+        assert!(r.contains("fs-serve"));
+    }
+
+    // issue #33: fusion-smallbusiness CLI 直接跑 uvicorn (:11490)
+    #[test]
+    fn test_fusion_smallbusiness_daemon_spec() {
+        let spec = start_spec_for("fusion-smallbusiness").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-smallbusiness");
+                assert!(args.is_empty(), "零参启动, 口走 FSB env 默认值");
+            }
+            _ => panic!("fusion-smallbusiness 应为 Daemon spec"),
+        }
+    }
+
+    // issue #33: fusion-sim service start 前台阻塞, daemonize + --gui
+    // (gui :11455 / metrics :11456 由同一进程内嵌, registry 已 supervise:false)
+    #[test]
+    fn test_fusion_simulation_daemon_spec() {
+        let spec = start_spec_for("fusion-simulation").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-sim");
+                assert!(args.contains(&"service".to_string()));
+                assert!(args.contains(&"start".to_string()));
+                assert!(args.contains(&"--gui".to_string()));
+            }
+            _ => panic!("fusion-simulation 应为 Daemon spec"),
+        }
+        let cmd = daemon_start_cmd(&spec, "fusion-simulation").unwrap();
+        assert!(cmd.contains("service start"), "应带 service start: {cmd}");
     }
 
     #[test]
