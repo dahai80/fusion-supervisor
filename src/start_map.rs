@@ -80,6 +80,33 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
                 "--gui".into(),
             ],
         }),
+        // issue #34: fusion-cowork-ws = `fusion-cowork remote serve` 前台 WebSocket
+        // 服务 (registry :11439), cowork start.sh 只管主 desk RPC 不含它
+        "fusion-cowork-ws" => Some(StartSpec::Daemon {
+            bin: "fusion-cowork".into(),
+            args: vec!["remote".into(), "serve".into()],
+        }),
+        // issue #34: fusion-bench start.sh 引用已删除的 fusion_bench.api.server
+        // 模块 (上游已迁 api.app, 上游 issue dahai80/fusion-bench#27) —
+        // 直接 daemonize `fusion-bench serve` (前台 uvicorn, 默认口 11467)
+        "fusion-bench" => Some(StartSpec::Daemon {
+            bin: "fusion-bench".into(),
+            args: vec!["serve".into()],
+        }),
+        // issue #34: fusion-k12-teacher start.sh 不收 start 子命令 (bare/-d/stop,
+        // 上游 issue dahai80/fusion-k12-teacher#31) — 直接 daemonize
+        // `fusion-k12 serve` (前台, 默认口 11448)
+        "fusion-k12-teacher" => Some(StartSpec::Daemon {
+            bin: "fusion-k12".into(),
+            args: vec!["serve".into()],
+        }),
+        // issue #34: fusion-code-modenization start.sh 用 `python -m ...server.runner`
+        // — runner 无 __main__ 入口, 导入即退出 0 (入口已迁 server/__main__.py,
+        // 上游 issue dahai80/fusion-code-modelization#21) — 直接 daemonize 正确入口
+        "fusion-code-modenization" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec!["-m".into(), "fusion_code_modelization.server".into()],
+        }),
         _ => None,
     }
 }
@@ -156,6 +183,59 @@ mod tests {
     fn test_trainer_bridge_uses_script() {
         let spec = start_spec_for("fusion-trainer-bridge").unwrap();
         assert!(matches!(spec, StartSpec::Script(_)));
+    }
+
+    // issue #34: cowork-ws 用 remote serve 前台进程 daemonize
+    #[test]
+    fn test_cowork_ws_daemon_spec() {
+        let spec = start_spec_for("fusion-cowork-ws").unwrap();
+        match spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-cowork");
+                assert_eq!(args, vec!["remote".to_string(), "serve".to_string()]);
+            }
+            _ => panic!("cowork-ws 应为 Daemon spec"),
+        }
+    }
+
+    // issue #34: bench/k12/modenization start.sh 上游破损, Daemon spec 直跑正确入口
+    #[test]
+    fn test_issue34_broken_start_sh_daemon_specs() {
+        let spec = start_spec_for("fusion-bench").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-bench");
+                assert_eq!(args, &vec!["serve".to_string()]);
+            }
+            _ => panic!("fusion-bench 应为 Daemon spec"),
+        }
+
+        let spec = start_spec_for("fusion-k12-teacher").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, "fusion-k12");
+                assert_eq!(args, &vec!["serve".to_string()]);
+            }
+            _ => panic!("fusion-k12-teacher 应为 Daemon spec"),
+        }
+
+        let spec = start_spec_for("fusion-code-modenization").unwrap();
+        match &spec {
+            StartSpec::Daemon { bin, args } => {
+                assert_eq!(bin, ".venv/bin/python");
+                assert_eq!(
+                    args,
+                    &vec![
+                        "-m".to_string(),
+                        "fusion_code_modelization.server".to_string()
+                    ]
+                );
+            }
+            _ => panic!("fusion-code-modenization 应为 Daemon spec"),
+        }
+        // resolve_bin 路径形式: .venv/bin/python 必须解析到 FUSION_ROOT 下
+        let r = resolve_bin(".venv/bin/python");
+        assert!(r.contains(".venv/bin/python"), "解析结果异常: {r}");
     }
 
     #[test]

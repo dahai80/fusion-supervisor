@@ -12,18 +12,46 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-gateway", ProbeSpec::http(11432, "/healthz"));
     // platform
     m.insert("fusion-rag", ProbeSpec::http(11436, "/health"));
-    m.insert("fusion-model-hub", ProbeSpec::http(11444, "/health"));
-    m.insert("fusion-memory", ProbeSpec::uds("/tmp/fusion-memory.sock"));
+    // issue #34: 实际公开健康口是 /api/v1/system/health (auth.py PUBLIC_PATHS), 根 /health 401
+    m.insert(
+        "fusion-model-hub",
+        ProbeSpec::http(11444, "/api/v1/system/health"),
+    );
+    // issue #34: fm-server HTTP 面 /healthz (socket 已迁 ~/.fusion-memory/, HTTP 探活更稳)
+    m.insert("fusion-memory", ProbeSpec::http(11435, "/healthz"));
     // app
-    m.insert("fusion-code", ProbeSpec::http(11441, "/health"));
+    // issue #34: projectApiServer 全端点鉴权 (per-instance token), HTTP 探活恒 401 → TCP
+    m.insert("fusion-code", ProbeSpec::tcp(11441));
     m.insert("fusion-doc", ProbeSpec::http(11449, "/health"));
     m.insert("fusion-cowork", ProbeSpec::http(11438, "/health"));
+    // issue #34: cowork-ws = `fusion-cowork remote serve` WebSocket, 无 /health → TCP
+    m.insert("fusion-cowork-ws", ProbeSpec::tcp(11439));
+    // issue #34: fusion-projects 为 UDS 服务 (sock /tmp/fusion-project-svc.sock),
+    // registry 11440 为死值, TCP 探活恒不可达 → UDS 探活
+    m.insert(
+        "fusion-projects",
+        ProbeSpec::uds("/tmp/fusion-project-svc.sock"),
+    );
     // domain
-    m.insert("fusion-health", ProbeSpec::http(11469, "/health"));
-    m.insert("fusion-finance", ProbeSpec::http(11466, "/health"));
-    m.insert("fusion-k12-teacher", ProbeSpec::http(11448, "/health"));
-    // speech = UDS daemon
-    m.insert("fusion-speech", ProbeSpec::uds("/tmp/fusion-speech.sock"));
+    // issue #34: 路由挂 /api/v1 前缀 (api/app.py include_router), 根 /health 404
+    m.insert("fusion-health", ProbeSpec::http(11469, "/api/v1/health"));
+    // issue #34: APIKeyMiddleware 豁免口为 /api/v1/ready (503=依赖未就绪, 真实状态)
+    m.insert("fusion-finance", ProbeSpec::http(11466, "/api/v1/ready"));
+    // issue #34: k12 健康口 /api/health (backend=ok 才算全通)
+    m.insert("fusion-k12-teacher", ProbeSpec::http(11448, "/api/health"));
+    // issue #34: bench 公开健康口 /api/v1/system/health (auth 豁免表)
+    m.insert(
+        "fusion-bench",
+        ProbeSpec::http(11467, "/api/v1/system/health"),
+    );
+    // issue #34: modelization REST /health (start.sh 同口)
+    m.insert(
+        "fusion-code-modenization",
+        ProbeSpec::http(11459, "/health"),
+    );
+    // issue #34: speech daemon socket 已迁 ~/.fusion-speech/run/ (上游 config.py),
+    // HTTP /health 面一直存在, 改 HTTP 探活
+    m.insert("fusion-speech", ProbeSpec::http(11465, "/health"));
     // issue #29: shell-ecosystem 模块服务 (实探 /health 均已验证)
     m.insert("fusion-cowork-web", ProbeSpec::http(11461, "/health"));
     m.insert("fusion-trainer-bridge", ProbeSpec::http(8790, "/health"));
@@ -88,7 +116,8 @@ mod tests {
 
     #[test]
     fn test_probe_spec_known_uds() {
-        let s = probe_spec_for("fusion-memory", 11435);
+        // issue #34: memory 改 HTTP 后, UDS 探活以 fusion-projects 为代表
+        let s = probe_spec_for("fusion-projects", 11440);
         assert!(matches!(s.kind, ProbeKind::Uds));
     }
 
@@ -144,6 +173,46 @@ mod tests {
         for name in ["fusion-store", "fusion-smallbusiness", "fusion-simulation"] {
             assert_eq!(restart_cmd_for(name), "stop+start", "{name}");
         }
+    }
+
+    // issue #34: 探活路径对齐上游实况 — model-hub/health/finance 换真实路径,
+    // speech/memory 改 HTTP, projects 改 UDS, code 恒 401 退 TCP
+    #[test]
+    fn test_issue34_probe_path_fixes() {
+        let s = probe_spec_for("fusion-model-hub", 11444);
+        assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
+
+        let s = probe_spec_for("fusion-health", 11469);
+        assert_eq!(s.path.as_deref(), Some("/api/v1/health"));
+
+        let s = probe_spec_for("fusion-finance", 11466);
+        assert_eq!(s.path.as_deref(), Some("/api/v1/ready"));
+
+        for name in ["fusion-speech", "fusion-memory"] {
+            let s = probe_spec_for(name, 1);
+            assert!(matches!(s.kind, ProbeKind::Http), "{name} 应 HTTP 探活");
+        }
+        let s = probe_spec_for("fusion-speech", 11465);
+        assert_eq!(s.path.as_deref(), Some("/health"));
+        let s = probe_spec_for("fusion-memory", 11435);
+        assert_eq!(s.path.as_deref(), Some("/healthz"));
+
+        let s = probe_spec_for("fusion-projects", 11440);
+        assert!(matches!(s.kind, ProbeKind::Uds), "projects 应 UDS 探活");
+
+        let s = probe_spec_for("fusion-code", 11441);
+        assert!(matches!(s.kind, ProbeKind::Tcp), "code 恒 401 应 TCP 探活");
+
+        let s = probe_spec_for("fusion-cowork-ws", 11439);
+        assert!(matches!(s.kind, ProbeKind::Tcp));
+
+        // issue #34 补充: bench/k12/modenization 换真实路径
+        let s = probe_spec_for("fusion-bench", 11467);
+        assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
+        let s = probe_spec_for("fusion-k12-teacher", 11448);
+        assert_eq!(s.path.as_deref(), Some("/api/health"));
+        let s = probe_spec_for("fusion-code-modenization", 11459);
+        assert_eq!(s.path.as_deref(), Some("/health"));
     }
 
     #[test]
