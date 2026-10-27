@@ -50,7 +50,30 @@ The daemon logs a one-line warning at boot when `FUSION_ROOT` is unset and the c
 cd ~/fusion && source .venv/bin/activate && set -a && source .env && set +a && FUSION_ROOT=~/fusion fusion-sv daemon
 ```
 
-**Env stripping for settings-owned services (issues #39/#40).** Inheritance cuts both ways: `fusion-mlx`'s `start.sh` gives `FUSION_MLX_API_KEY` env precedence over `~/.fusion-mlx/settings.json` `auth.api_key`, so a daemon carrying a stale key from the monorepo `.env` would pin that snapshot into every supervisor-triggered relaunch — all settings.json clients (gateway backend, scrapers) 401 while the service still probes Healthy. The supervisor now strips `FUSION_MLX_API_KEY` from the `fusion-mlx` child env (`env_map::strip_env_for`), so each launch resolves the key fresh from settings.json — single source of truth. Applies to all spawn paths: `up_all`, `up_one`, and crash-recovery restarts. The compose `check_env` guard still requires the daemon itself to hold the var (it gates compose containers, which genuinely need it).
+**Env stripping for settings-owned services (issues #39/#40/#45).** Inheritance cuts both ways: `fusion-mlx`'s `start.sh` gives `FUSION_MLX_API_KEY` env precedence over `~/.fusion-mlx/settings.json` `auth.api_key`, so a daemon carrying a stale key from the monorepo `.env` would pin that snapshot into every supervisor-triggered relaunch — all settings.json clients (gateway backend, scrapers) 401 while the service still probes Healthy. The supervisor now strips `FUSION_MLX_API_KEY` from the `fusion-mlx` child env (`env_map::strip_env_for`), so each launch resolves the key fresh from settings.json — single source of truth. Issue #45 extends the same strip to `fusion-health` (its `config.py` also prefers the env var over settings.json — a stale daemon snapshot made backend probes 401 and `/api/v1/health` report 503 degraded). Applies to all spawn paths: `up_all`, `up_one`, and crash-recovery restarts. The compose `check_env` guard still requires the daemon itself to hold the var (it gates compose containers, which genuinely need it).
+
+## Business-plane takeover (issue #45)
+
+Four business services are registered in `architecture/port-registry.yaml` WITHOUT the `fusion-` prefix, with repos under `business/<name>/` in the monorepo:
+
+| Service | Port | Start command (start_map Daemon spec) | Probe |
+|---|---|---|---|
+| ai-family | 11483 | `bash business/ai-family/start.sh start` (default path; proper start/stop/status case statement) | TCP (every router is `verify_service_key`-gated — HTTP would 401 forever) |
+| fit-ai | 11510 | daemonized `uvicorn server.main:app --app-dir server --port 11510`, cwd `business/fit-ai` | HTTP `/api/v1/system/health` (auth-exempt) |
+| ai-speech-exam | 11560 | daemonized `uvicorn app.main:app --app-dir backend --port 11560`, cwd `business/ai-speech-exam`, env `FUSION_AI_SPEECH_EXAM_CONFIG=config/config.yaml` | HTTP `/health` (unauthenticated) |
+| ai-apparelmockup | 11520 | daemonized `python -m http.server 11520 --directory web/dist`, cwd `business/ai-apparelmockup` | TCP (static server, no `/health` — HTTP would 404 = BadPath forever) |
+
+Three hazards drove the design:
+
+1. **Repo-dir mapping**: `manifest::name_to_dir` maps the registry keys to `business/<name>` (default `~/fusion/<name>` does not exist — every start path failed closed).
+2. **Arg-less start.sh**: `fit-ai`/`ai-speech-exam`/`ai-apparelmockup` start.sh scripts `exec` a foreground process and IGNORE subcommand args — `bash start.sh stop` would START the service. They are taken over via `StartSpec::Daemon` (issue #34 pattern), which now supports `cwd` (resolved against `FUSION_ROOT`) and app-internal `env`. Daemon pid discipline: `mkdir`/`cd ... || exit 1`/`export` joined with `;` (never `&&` — `A && B &` backgrounds the whole list and the pidfile would hold the subshell pid, orphaning the service on stop).
+3. **FUSION_CLIENT_KEY injection**: the three uvicorn/http.server apps fail-closed at boot without `FUSION_CLIENT_KEY` (`: "${FUSION_CLIENT_KEY:?}"`). `env_map::shell_env_for` injects it on every spawn path (up_all/up_one/crash-restart): process env → `.env` → read-only fallback to `fusion-gateway/config.yaml` `auth.api_keys` (prefers the `name=admin` entry). All three sources missing → the supervisor refuses to start the service (fail-closed) rather than spawn a guaranteed crash-loop. `ai-family` is deliberately excluded — it runs its own `verify_service_key` auth and never consumes the key.
+
+Restart semantics: `ai-family`'s start.sh has no `restart` subcommand, and Daemon-spec services have no restart semantics at all — `restart` falls back to stop+start (`probe_map::restart_cmd_for`).
+
+Deploy note: `ai-speech-exam` reads `config/config.yaml` (git-ignored; only `config.example.yaml` is committed, containing no secrets). Copying the example is an accepted deploy step.
+
+**Web console vendored SDK re-sync (issue #43).** `web/vendor/@fusion/web-sdk` is re-vendored from `fusion-web-shell` tag **v0.1.2**: picks up the host-bridge `isHttpErrorResult()` type-predicate fix (bare-string bridge results no longer throw `TypeError: Cannot use 'in' operator`, upstream #75) and the cached-sync `theme.get()` seeded by a background host pull (upstream #77). The local `?embedded=1`-without-parent-frame patch (top-level deep links) is re-applied on top — upstream never carried it.
 
 When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
@@ -134,7 +157,7 @@ Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSIO
 ## Test
 
 ```bash
-cargo test --all-targets          # 174 test fns (unit + 13 integration files)
+cargo test --all-targets          # 183 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

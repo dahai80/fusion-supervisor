@@ -1,4 +1,5 @@
 import { HttpError, withRetry } from './retry';
+import { createThemeState } from './theme';
 import type {
     BridgeMessage,
     DeviceInfo,
@@ -12,6 +13,7 @@ import type {
 } from './types';
 
 export { withRetry, withTimeout, isRetryableError, TimeoutError, HttpError } from './retry';
+export { createThemeState } from './theme';
 export { createPoller, type PollerOptions } from './poll';
 export { createHostBridge, type HostBridgeHandle, type HostBridgeOptions } from './host';
 export * from './types';
@@ -59,11 +61,7 @@ async function directRequest<T>(path: string, init?: HttpRequestInit): Promise<H
         });
     } catch (err) {
         if (init?.timeoutMs && controller.signal.aborted) {
-            throw new HttpError(
-                0,
-                'timeout',
-                `request timed out after ${init.timeoutMs}ms`
-            );
+            throw new HttpError(0, 'timeout', `request timed out after ${init.timeoutMs}ms`);
         }
         throw err;
     } finally {
@@ -81,10 +79,7 @@ interface BridgeDeps {
     log(level: 'log' | 'warn' | 'error', ...args: unknown[]): void;
 }
 
-function createBridge(
-    deps: BridgeDeps,
-    opts: Required<Omit<ShellSdkOptions, 'embedded'>>
-) {
+function createBridge(deps: BridgeDeps, opts: Required<Omit<ShellSdkOptions, 'embedded'>>) {
     const pending = new Map<
         string,
         {
@@ -160,8 +155,26 @@ function standaloneSdk(log: BridgeDeps['log']): FusionShellSdk {
     mql?.addEventListener('change', (e) =>
         themeListeners.forEach((fn) => fn(e.matches ? 'dark' : 'light'))
     );
-    const request = async <T>(path: string, init?: HttpRequestInit): Promise<HttpResult<T>> =>
-        directRequest<T>(path, init);
+    const request = async <T>(path: string, init?: HttpRequestInit): Promise<HttpResult<T>> => {
+        // #20: JSON bodies without an explicit content-type make FastAPI (and
+        // friends) reject the request with 422. Default to application/json;
+        // a caller-provided header always wins.
+        const hasContentType = Object.keys(init?.headers ?? {}).some(
+            (k) => k.toLowerCase() === 'content-type'
+        );
+        const headers =
+            init?.body !== undefined && !hasContentType
+                ? { 'content-type': 'application/json', ...init?.headers }
+                : init?.headers;
+        const res = await fetch(path, {
+            method: init?.method ?? 'GET',
+            headers,
+            body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+        });
+        const data = (await res.json().catch(() => null)) as T;
+        if (!res.ok) throw new HttpError(res.status, 'http_error', `request failed: ${res.status}`);
+        return { status: res.status, ok: true, data };
+    };
     return {
         http: {
             request,
@@ -260,7 +273,9 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
         );
     }
 
-    const themeListeners = new Set<(mode: ThemeMode) => void>();
+    const themeState = createThemeState(
+        document.documentElement.classList.contains('light') ? 'light' : 'dark'
+    );
     const visListeners = new Set<(visible: boolean) => void>();
 
     const bridge = createBridge(
@@ -279,8 +294,19 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
 
     bridge.eventListeners.set(
         'theme',
-        new Set([(payload) => themeListeners.forEach((fn) => fn(payload as ThemeMode))])
+        new Set([(payload) => themeState.set(payload as ThemeMode)])
     );
+    // Seed from the host (issue #77): the mount-time theme push can be lost
+    // to about:blank before the module's listener exists, so pull once in the
+    // background; themeState.set dedupes against a push that did land.
+    // #1298: no parent frame = no host to answer, skip the pull (the
+    // document seed above is all there is).
+    if (hasHostFrame) {
+        void bridge
+            .call<ThemeMode>('theme', null, 5000)
+            .then((mode) => themeState.set(mode))
+            .catch(() => undefined);
+    }
     bridge.eventListeners.set(
         'visibility',
         new Set([(payload) => visListeners.forEach((fn) => fn(payload as boolean))])
@@ -317,10 +343,15 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
                 lang = next;
                 langListeners.forEach((fn) => fn(lang));
             });
-            langObs.observe(document.documentElement, {
-                attributes: true,
-                attributeFilter: ['lang'],
-            });
+            try {
+                langObs.observe(document.documentElement, {
+                    attributes: true,
+                    attributeFilter: ['lang'],
+                });
+            } catch {
+                // Non-DOM document (test fake): a DOM impl whose observe()
+                // rejects just means no lang updates — degrade silently.
+            }
         }
     }
     window.addEventListener('message', (ev: MessageEvent) => {
@@ -343,6 +374,7 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
     const http = {
         async request<T = unknown>(path: string, init?: HttpRequestInit): Promise<HttpResult<T>> {
             if (!hasHostFrame) {
+                // #1298: top-level deep link — no host relay, go direct.
                 return directRequest<T>(path, init);
             }
             const res = await bridge.call<HttpResult<T>>(
@@ -369,6 +401,7 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
         toast: {
             show(input: ToastInput) {
                 if (!hasHostFrame) {
+                    // #1298: no host to relay to — surface locally.
                     log(
                         input.level === 'error' ? 'error' : 'log',
                         `[toast:${input.level}]`,
@@ -386,14 +419,12 @@ export function createShellSdk(options?: ShellSdkOptions): FusionShellSdk {
             },
         },
         theme: {
-            get: () =>
-                typeof document !== 'undefined' &&
-                document.documentElement.classList.contains('light')
-                    ? 'light'
-                    : 'dark',
+            // Cached sync read (issue #77): seeded from the module document,
+            // corrected by the background host pull above, kept fresh by
+            // host push events.
+            get: () => themeState.get(),
             subscribe(listener) {
-                themeListeners.add(listener);
-                return () => themeListeners.delete(listener);
+                return themeState.subscribe(listener);
             },
         },
         devices: {

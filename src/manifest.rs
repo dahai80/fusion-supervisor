@@ -49,9 +49,15 @@ fn default_supervise() -> bool {
 // registry key → 本地 repo 目录。绝大多数 key==dir, 例外在此。
 // sub-service key (fusion-cowork-ws) → 父 repo (fusion-cowork)。
 pub fn name_to_dir(name: &str) -> &str {
-    // 已知拼写差异例外
-    static EXCEPTIONS: &[(&str, &str)] =
-        &[("fusion-code-modelization", "fusion-code-modenization")];
+    // 已知拼写差异例外 + business 平台目录前缀 (issue #45: registry key 无 fusion-
+    // 前缀, 实际 repo 在 monorepo 根 business/ 子目录下, 默认映射 ~/fusion/<name> 不存在)
+    static EXCEPTIONS: &[(&str, &str)] = &[
+        ("fusion-code-modelization", "fusion-code-modenization"),
+        ("ai-family", "business/ai-family"),
+        ("fit-ai", "business/fit-ai"),
+        ("ai-speech-exam", "business/ai-speech-exam"),
+        ("ai-apparelmockup", "business/ai-apparelmockup"),
+    ];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
             return dir;
@@ -227,6 +233,15 @@ external_tools: []
         );
         assert_eq!(name_to_dir("fusion-mlx"), "fusion-mlx");
         assert_eq!(name_to_dir("fusion-cowork-ws"), "fusion-cowork");
+    }
+
+    // issue #45: business 平台服务 → business/ 子目录
+    #[test]
+    fn test_name_to_dir_business_plane() {
+        assert_eq!(name_to_dir("ai-family"), "business/ai-family");
+        assert_eq!(name_to_dir("fit-ai"), "business/fit-ai");
+        assert_eq!(name_to_dir("ai-speech-exam"), "business/ai-speech-exam");
+        assert_eq!(name_to_dir("ai-apparelmockup"), "business/ai-apparelmockup");
     }
 
     // issue #29: shell-ecosystem 子服务 → 父 repo; 父名本身 → 自身

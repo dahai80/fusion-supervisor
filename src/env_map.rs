@@ -20,14 +20,16 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
 }
 
 // issue #29: shell-ecosystem 模块服务的注册 env。
-// 这些服务启动时向 fusion-gateway 注册 + 心跳 (缺 admin key 则静默不注册 —
-// 正是 10-24 事故里 sidebar 丢失的根因), 故注入不受 compose 开关控制。
+// issue #45: business 平台服务的 FUSION_CLIENT_KEY (gateway 客户端 key, 约定 1)
+// 也走此注入通道 — 三个 arg-less start.sh 均硬性要求该 key, 缺失 fail-fast。
+// 这些注入不受 compose 开关控制 (与 sidecar 连接 env 不同)。
 fn shell_vars(svc: &str) -> Option<&'static [&'static str]> {
     match svc {
         "fusion-cowork-web" | "fusion-plugins-ecosystem-console" => {
             Some(&["FUSION_SHELL_GATEWAY_URL", "FUSION_GATEWAY_ADMIN_KEY"])
         }
         "fusion-trainer-bridge" => Some(&["FUSION_TRAINER_BRIDGE_KEY"]),
+        "fit-ai" | "ai-speech-exam" | "ai-apparelmockup" => Some(&["FUSION_CLIENT_KEY"]),
         _ => None,
     }
 }
@@ -46,6 +48,10 @@ pub fn needs_shell_env(svc: &str) -> bool {
 pub fn strip_env_for(svc: &str) -> &'static [&'static str] {
     match svc {
         "fusion-mlx" => &["FUSION_MLX_API_KEY"],
+        // issue #45: fusion-health 的 config.py env 优先级高于 ~/.fusion-mlx/
+        // settings.json — daemon 快照里的旧 key 让 backend 探活 401 (503 degraded)。
+        // 剥离后其配置回退解析 settings.json, 与 mlx 实例的 key 单一真源一致。
+        "fusion-health" => &["FUSION_MLX_API_KEY"],
         _ => &[],
     }
 }
@@ -163,6 +169,22 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
                 })?;
                 out.insert(k.to_string(), v);
             }
+            // issue #45: business 平台 gateway 客户端 key — 解析顺序同 shell 注册:
+            // 进程 env → env_file → 兜底读 gateway config auth.api_keys (优先 name=admin
+            // 且 allowed_models 含 * 的全模型 key; 否则第一条)。三服务 start.sh 均
+            // `:?` 硬性要求, 全缺 → fail-closed Err (早失败早告警)。
+            "FUSION_CLIENT_KEY" => {
+                let v = match resolve(k, env_file) {
+                    Some(v) => v,
+                    None => read_gateway_client_key().with_context(|| {
+                        format!(
+                            "FUSION_CLIENT_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
+                             无法为 {svc} 启动 (fail-closed)"
+                        )
+                    })?,
+                };
+                out.insert(k.to_string(), v);
+            }
             other => bail!("env_map: 未知 shell 注册 key {other} for {svc}"),
         }
     }
@@ -189,6 +211,39 @@ fn read_gateway_admin_key() -> Result<String> {
         .and_then(|k| k.as_str())
         .filter(|k| !k.is_empty())
         .with_context(|| format!("gateway config 无 web_shell.admin_key: {}", path.display()))?;
+    Ok(key.to_string())
+}
+
+// issue #45: 只读 fusion-gateway config.yaml 的 auth.api_keys, 取 name=admin 的
+// key (全模型通配, 业务后端打 gateway 的 LLM 通道需要), 无 admin 则取第一条。
+// 路径: FUSION_GATEWAY_CONFIG 覆盖, 默认 ~/fusion/fusion-gateway/config.yaml。
+fn read_gateway_client_key() -> Result<String> {
+    let path = std::env::var("FUSION_GATEWAY_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join("fusion/fusion-gateway/config.yaml")
+        });
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("读 gateway config 失败: {}", path.display()))?;
+    let cfg: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("解析 gateway config 失败: {}", path.display()))?;
+    let keys = cfg
+        .get("auth")
+        .and_then(|a| a.get("api_keys"))
+        .and_then(|k| k.as_sequence())
+        .with_context(|| format!("gateway config 无 auth.api_keys: {}", path.display()))?;
+    let admin = keys
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("admin"));
+    let entry = admin
+        .or_else(|| keys.first())
+        .with_context(|| format!("gateway config auth.api_keys 为空: {}", path.display()))?;
+    let key = entry
+        .get("key")
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty())
+        .with_context(|| format!("gateway config api_keys 条目无 key: {}", path.display()))?;
     Ok(key.to_string())
 }
 
@@ -399,12 +454,75 @@ pub(crate) mod tests {
     }
 
     // issue #39/#40: fusion-mlx 子进程剥离 FUSION_MLX_API_KEY (防旧 key 钉死),
-    // 其它服务不剥离。
+    // 其它服务不剥离。issue #45: fusion-health 同剥离 (config.py env 优先于
+    // settings.json, 旧 key 让 backend 探活 401)。
     #[test]
     fn test_strip_env_for_mlx_only() {
         assert_eq!(strip_env_for("fusion-mlx"), &["FUSION_MLX_API_KEY"]);
+        assert_eq!(strip_env_for("fusion-health"), &["FUSION_MLX_API_KEY"]);
         assert!(strip_env_for("fusion-gateway").is_empty());
         assert!(strip_env_for("fusion-rag").is_empty());
+    }
+
+    // ---- issue #45: business 平台 FUSION_CLIENT_KEY 注入 ----
+
+    // 进程 env 直接给 key → 注入成功, 不读 gateway config
+    #[test]
+    fn test_client_key_from_process_env() {
+        let _g = env_lock().lock().unwrap();
+        let _c = EnvGuard::set("FUSION_CLIENT_KEY", "fromproc");
+        let f = env_file("");
+        let env = shell_env_for("fit-ai", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "fromproc");
+        assert!(needs_shell_env("fit-ai"));
+        assert!(needs_shell_env("ai-speech-exam"));
+        assert!(needs_shell_env("ai-apparelmockup"));
+        // ai-family 源码不消费该 key (自建鉴权), 不注入
+        assert!(!needs_shell_env("ai-family"));
+    }
+
+    // .env 给 key → 进程 env 缺失时从文件解析
+    #[test]
+    fn test_client_key_from_env_file() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
+        let f = env_file("FUSION_CLIENT_KEY=fromfile\n");
+        let env = shell_env_for("ai-speech-exam", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "fromfile");
+    }
+
+    // 全缺 + gateway config 不可读 → fail-closed Err, 点名缺失 key
+    #[test]
+    fn test_client_key_fail_closed_no_source() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
+        let _c = EnvGuard::set(
+            "FUSION_GATEWAY_CONFIG",
+            "/nonexistent/fusion-gateway-config-test.yaml",
+        );
+        let f = env_file("");
+        let r = shell_env_for("ai-apparelmockup", f.path());
+        assert!(r.is_err(), "client key 全缺应 fail-closed");
+        assert!(
+            r.unwrap_err().to_string().contains("FUSION_CLIENT_KEY"),
+            "err 应点名缺失 key"
+        );
+    }
+
+    // 兜底读 gateway config auth.api_keys — 优先 name=admin 条目
+    #[test]
+    fn test_client_key_gateway_fallback_prefers_admin() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
+        let f = env_file("");
+        std::fs::write(
+            f.path(),
+            "auth:\n  api_keys:\n  - name: demo\n    key: demokey123\n  - name: admin\n    key: adminkey456\n",
+        )
+        .unwrap();
+        let _c = EnvGuard::set("FUSION_GATEWAY_CONFIG", f.path().to_str().unwrap());
+        let env = shell_env_for("fit-ai", f.path()).unwrap();
+        assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "adminkey456");
     }
 
     // env guard (RAII 恢复进程 env), 与 config.rs EnvGuard 同构
