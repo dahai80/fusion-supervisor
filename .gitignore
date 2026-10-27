@@ -7,3 +7,4 @@
 # real env with secrets — keep .env.example only
 /.env
 /.env.test
+/logs/

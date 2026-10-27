@@ -867,6 +867,42 @@ fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> 
     }
 }
 
+// issue #47: 子进程 stderr → 同时写服务日志 + 保留末尾 20 行 (失败根因回传给告警)。
+// 返回 JoinHandle<String>, join 后拿到 tail 文本。
+const STDERR_TAIL_LINES: usize = 20;
+
+fn spawn_stderr_tail(
+    stderr: Option<std::process::ChildStderr>,
+    log_path: std::path::PathBuf,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        let mut tail = std::collections::VecDeque::<String>::new();
+        let Some(r) = stderr else {
+            return String::new();
+        };
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&log_path)
+            .ok();
+        if log.is_none() {
+            tracing::warn!(log = %log_path.display(), "open svc log fail, stderr 仅留 tail");
+        }
+        for line in BufReader::new(r).lines().map_while(Result::ok) {
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        tail.make_contiguous().join("\n")
+    })
+}
+
 // issue #29: 覆盖服务的启动分派。
 // Script: bash <script> <cmd> (trainer-bridge 自带 start/stop)。
 // Daemon: start → nohup 后台 + pidfile; stop → pidfile kill; restart 上游已退化为 stop+start。
@@ -898,13 +934,24 @@ fn exec_start_spec(
             for k in crate::env_map::strip_env_for(svc) {
                 command.env_remove(k);
             }
-            let status = command
+            // issue #47: stderr 管道捕获 — 写服务日志 + 末尾 20 行进失败信息 (根因回传)。
+            std::fs::create_dir_all(crate::start_map::log_path(svc).parent().unwrap()).ok();
+            let mut child = command
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .map_err(|e| anyhow::anyhow!("spawn daemon cmd: {e}"))?;
+            let tail_h = spawn_stderr_tail(child.stderr.take(), crate::start_map::log_path(svc));
+            let status = child
+                .wait()
+                .map_err(|e| anyhow::anyhow!("wait daemon cmd: {e}"))?;
+            let tail = tail_h.join().unwrap_or_default();
             if !status.success() {
-                anyhow::bail!("daemon cmd {cmd} exit {:?}", status.code());
+                // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
+                match status.code() {
+                    Some(c) => anyhow::bail!("daemon cmd {cmd} exit code={c}: {tail}"),
+                    None => anyhow::bail!("daemon cmd {cmd} killed by signal: {tail}"),
+                }
             }
             Ok(())
         }
@@ -924,13 +971,6 @@ fn exec_bash_script(
     std::fs::create_dir_all(crate::start_map::log_path(svc).parent().unwrap()).ok();
     let svc_log = crate::start_map::log_path(svc);
     tracing::info!(sh = %sh.display(), cmd, log = %svc_log.display(), env_n = env_overrides.len(), "exec start script");
-    let stderr: std::process::Stdio = match std::fs::File::create(&svc_log) {
-        Ok(f) => f.into(),
-        Err(e) => {
-            tracing::warn!(err = %e, log = %svc_log.display(), "open svc log fail, stderr → null");
-            std::process::Stdio::null()
-        }
-    };
     let mut command = std::process::Command::new("bash");
     command.arg(sh).arg(cmd);
     // 注入 env (覆盖/新增), 继承父进程其余 env
@@ -942,13 +982,23 @@ fn exec_bash_script(
     for k in crate::env_map::strip_env_for(svc) {
         command.env_remove(k);
     }
-    let status = command
+    // issue #47: stderr 管道捕获 — 写服务日志 + 末尾 20 行进失败信息 (根因回传)。
+    let mut child = command
         .stdout(std::process::Stdio::null())
-        .stderr(stderr)
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("spawn start script: {e}"))?;
+    let tail_h = spawn_stderr_tail(child.stderr.take(), svc_log);
+    let status = child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("wait start script: {e}"))?;
+    let tail = tail_h.join().unwrap_or_default();
     if !status.success() {
-        anyhow::bail!("script {cmd} exit {:?}", status.code());
+        // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
+        match status.code() {
+            Some(c) => anyhow::bail!("script {cmd} exit code={c}: {tail}"),
+            None => anyhow::bail!("script {cmd} killed by signal: {tail}"),
+        }
     }
     Ok(())
 }
@@ -1023,6 +1073,31 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("FUSION_MLX_API_KEY", v) },
             None => unsafe { std::env::remove_var("FUSION_MLX_API_KEY") },
         }
+    }
+
+    // issue #47: exec_bash_script 失败信息携带退出码 + stderr tail (根因回传给告警/event)
+    #[test]
+    fn test_exec_bash_script_captures_exit_code_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = dir.path().join("fail.sh");
+        std::fs::write(
+            &sh,
+            "#!/bin/bash\necho 'yaml: unmarshal errors: bad config' >&2\nexit 78\n",
+        )
+        .unwrap();
+        let err = exec_bash_script("ut-tail-capture", &sh, "start", &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exit code=78"), "应携带约定格式退出码: {msg}");
+        assert!(
+            msg.contains("yaml: unmarshal errors: bad config"),
+            "应携带 stderr tail: {msg}"
+        );
+        // 日志文件也应收到同一 stderr (tail 线程写盘)
+        let log = crate::start_map::log_path("ut-tail-capture");
+        let log_content = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_content.contains("yaml: unmarshal errors: bad config"));
+        // 清理测试过程文件
+        let _ = std::fs::remove_file(&log);
     }
 
     // issue #31: up_one/down_one — service 级操作只动目标服务
