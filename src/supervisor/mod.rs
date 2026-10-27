@@ -893,6 +893,11 @@ fn exec_start_spec(
             for (k, v) in env_overrides {
                 command.env(k, v);
             }
+            // issue #39/#40: 剥离钉死快照的 env (如 fusion-mlx 的 FUSION_MLX_API_KEY),
+            // 让服务自己的 start.sh/配置现场解析。
+            for k in crate::env_map::strip_env_for(svc) {
+                command.env_remove(k);
+            }
             let status = command
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -931,6 +936,11 @@ fn exec_bash_script(
     // 注入 env (覆盖/新增), 继承父进程其余 env
     for (k, v) in env_overrides {
         command.env(k, v);
+    }
+    // issue #39/#40: 剥离钉死快照的 env (如 fusion-mlx 的 FUSION_MLX_API_KEY),
+    // 让服务自己的 start.sh 现场从 settings.json 解析, 防 supervisor 重启后旧 key 401 风暴。
+    for k in crate::env_map::strip_env_for(svc) {
+        command.env_remove(k);
     }
     let status = command
         .stdout(std::process::Stdio::null())
@@ -979,6 +989,39 @@ mod tests {
             max_concurrent_start: 2,
             start_timeout_sec: 5,
             ..Config::default()
+        }
+    }
+
+    // issue #39/#40: exec_bash_script 剥离 strip_env_for 列出的 env —
+    // fusion-mlx 子进程不得继承 daemon 的 FUSION_MLX_API_KEY 快照 (防旧 key 401),
+    // 其它服务照常继承。
+    #[test]
+    fn test_exec_bash_script_strips_pinned_env() {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var("FUSION_MLX_API_KEY").ok();
+        unsafe { std::env::set_var("FUSION_MLX_API_KEY", "stale-snapshot-key") };
+        // 脚本: env 存在即 fail
+        let dir = tempfile::tempdir().unwrap();
+        let sh = dir.path().join("probe.sh");
+        std::fs::write(
+            &sh,
+            "#!/bin/bash\nif [ -n \"$FUSION_MLX_API_KEY\" ]; then exit 1; fi\nexit 0\n",
+        )
+        .unwrap();
+        // fusion-mlx: 剥离后脚本看不到 var → Ok
+        assert!(
+            exec_bash_script("fusion-mlx", &sh, "start", &[]).is_ok(),
+            "fusion-mlx 子进程应剥离 FUSION_MLX_API_KEY"
+        );
+        // 其它服务: 继承 var → 脚本 fail
+        assert!(
+            exec_bash_script("fusion-rag", &sh, "start", &[]).is_err(),
+            "其它服务照常继承 daemon env"
+        );
+        // 恢复进程 env
+        match prev {
+            Some(v) => unsafe { std::env::set_var("FUSION_MLX_API_KEY", v) },
+            None => unsafe { std::env::remove_var("FUSION_MLX_API_KEY") },
         }
     }
 

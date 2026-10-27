@@ -50,6 +50,8 @@ The daemon logs a one-line warning at boot when `FUSION_ROOT` is unset and the c
 cd ~/fusion && source .venv/bin/activate && set -a && source .env && set +a && FUSION_ROOT=~/fusion fusion-sv daemon
 ```
 
+**Env stripping for settings-owned services (issues #39/#40).** Inheritance cuts both ways: `fusion-mlx`'s `start.sh` gives `FUSION_MLX_API_KEY` env precedence over `~/.fusion-mlx/settings.json` `auth.api_key`, so a daemon carrying a stale key from the monorepo `.env` would pin that snapshot into every supervisor-triggered relaunch — all settings.json clients (gateway backend, scrapers) 401 while the service still probes Healthy. The supervisor now strips `FUSION_MLX_API_KEY` from the `fusion-mlx` child env (`env_map::strip_env_for`), so each launch resolves the key fresh from settings.json — single source of truth. Applies to all spawn paths: `up_all`, `up_one`, and crash-recovery restarts. The compose `check_env` guard still requires the daemon itself to hold the var (it gates compose containers, which genuinely need it).
+
 When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
 ## How it works
@@ -57,7 +59,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 nati
 - **Source of truth:** reads `architecture/port-registry.yaml` for the 53-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
 - **Dual-mode binary:** `daemon` = long-lived supervisor loop + UDS JSON-RPC server (`/tmp/fusion-sv.sock`, perms 0600); CLI subcommands = one-shot client over the same UDS.
 - **Health probing:** per-service `probe_map` normalizes liveness paths (HTTP `/health`/`/healthz`, UDS `ping`→`pong`, TCP fallback). 2s timeout.
-- **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Backoff is scheduled, not slept in-lock (issue #31): the tick records a `restart_after` deadline and returns, so `/metrics` and status RPCs stay responsive while failing services churn. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset). `up [svc]` / `down [svc]` are true single-service operations (issue #31 — previously the service argument was silently ignored and `down <svc>` stopped everything).
+- **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Backoff is scheduled, not slept in-lock (issue #31): the tick records a `restart_after` deadline and returns, so `/metrics` and status RPCs stay responsive while failing services churn. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset). `up [svc]` / `down [svc]` are true single-service operations end-to-end (issue #31 fixed the RPC side — `up_one`/`down_one`; issue #41 fixed the CLI side, which parsed the `[SERVICE]` argument but silently dropped it, so `down <svc>` stopped the whole fleet — the arg now routes through the tested `cli::up_down_target` helper).
 - **Anti-restart-storm:** a 404/405 (`BadPath`) = probe path wrong, NOT a crash signal → never restarts, only alerts. Only `ConnectionRefused`/`Timeout` trigger restart. The crash-window cap is the final backstop.
 - **History:** SQLite (`~/.fusion-sv/history.db`, WAL mode), `health_check` + `event` tables, 7-day retention. The retention sweep is wired (issue #37): the daemon tick checks `prune_schedule_sec` (default hourly) and prunes rows older than `history_retention_days` (default 7) from BOTH tables; pruned-row count is logged per sweep and accumulated in `fusion_sv_events_pruned_total`. Failed sweeps also advance the schedule timestamp (no per-tick retry storm — same semantics as the backup schedule).
 - **Alert persistence (issue #37):** every alert that survives dedup is persisted to the `event` table (kind, detail, ts, plane, severity) at the `Alerter::alert` chokepoint — native and compose alerts alike (compose services stored unprefixed with `plane="compose"`). The event table carries a `severity` column (`error` = container crash-loop, `info` = recovery/drain/backup, `warn` = the rest); old DBs are migrated idempotently (`ALTER TABLE ... DEFAULT 'warn'`). So the web console's Alerts page and `/api/v1/events` answer "what alerted last week". `fusion_sv_alerts_total` counts emitted alerts.
@@ -132,7 +134,7 @@ Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSIO
 ## Test
 
 ```bash
-cargo test --all-targets          # 171 test fns (unit + 13 integration files)
+cargo test --all-targets          # 174 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

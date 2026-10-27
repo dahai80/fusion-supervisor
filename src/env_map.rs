@@ -37,6 +37,19 @@ pub fn needs_shell_env(svc: &str) -> bool {
     shell_vars(svc).is_some()
 }
 
+// issue #39/#40: 启动子进程前须剥离的 env 变量名。
+// fusion-mlx 的 start.sh 中 FUSION_MLX_API_KEY env 优先级高于 settings.json,
+// daemon env 快照 (来自 monorepo .env) 会钉死旧 key → supervisor 每次重启
+// 都让新实例用旧 key 鉴权, 所有 settings.json 客户端 401。
+// 剥离后 start.sh 每次现场从 ~/.fusion-mlx/settings.json 解析, 单一真源。
+// compose check_env 仍要求 daemon 自身持有该 var (gate compose 容器, 不受影响)。
+pub fn strip_env_for(svc: &str) -> &'static [&'static str] {
+    match svc {
+        "fusion-mlx" => &["FUSION_MLX_API_KEY"],
+        _ => &[],
+    }
+}
+
 // 返回服务所需的全部连接变量名 (供调用方判断是否需注入)。
 pub fn needs_injection(svc: &str) -> bool {
     required_vars(svc).is_some()
@@ -383,6 +396,15 @@ pub(crate) mod tests {
         assert!(!needs_shell_env("fusion-mlx"));
         assert!(needs_shell_env("fusion-cowork-web"));
         assert!(needs_shell_env("fusion-trainer-bridge"));
+    }
+
+    // issue #39/#40: fusion-mlx 子进程剥离 FUSION_MLX_API_KEY (防旧 key 钉死),
+    // 其它服务不剥离。
+    #[test]
+    fn test_strip_env_for_mlx_only() {
+        assert_eq!(strip_env_for("fusion-mlx"), &["FUSION_MLX_API_KEY"]);
+        assert!(strip_env_for("fusion-gateway").is_empty());
+        assert!(strip_env_for("fusion-rag").is_empty());
     }
 
     // env guard (RAII 恢复进程 env), 与 config.rs EnvGuard 同构
