@@ -62,8 +62,16 @@ async fn main() -> anyhow::Result<()> {
         None | Some(Commands::Daemon) => run_daemon(cfg).await,
         Some(Commands::Status) => cli_status(cfg).await,
         Some(Commands::Top) => cli_top(cfg).await,
-        Some(Commands::Up { .. }) => cli_call(cfg, "up").await,
-        Some(Commands::Down { .. }) => cli_call(cfg, "down").await,
+        // issue #41: [SERVICE] 参数必须路由到单服务 RPC (up_one/down_one),
+        // 此前 `{ .. }` 丢弃参数致 `down <svc>` 全停。经 cli::up_down_target 路由 (可测)。
+        Some(Commands::Up { service }) => match cli::up_down_target(service) {
+            Some(s) => cli_call_param(cfg, "up", s).await,
+            None => cli_call(cfg, "up").await,
+        },
+        Some(Commands::Down { service }) => match cli::up_down_target(service) {
+            Some(s) => cli_call_param(cfg, "down", s).await,
+            None => cli_call(cfg, "down").await,
+        },
         Some(Commands::Restart { service }) => cli_call_param(cfg, "restart", service).await,
         Some(Commands::Logs { service }) => cli_logs(cfg, service).await,
         Some(Commands::Ping) => cli_ping(cfg).await,
