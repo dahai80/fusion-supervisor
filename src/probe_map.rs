@@ -68,6 +68,13 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-smallbusiness", ProbeSpec::http(11490, "/health"));
     // issue #33: 仿真 gRPC 服务无 HTTP 面, TCP 端口探活 (:11447)
     m.insert("fusion-simulation", ProbeSpec::tcp(11447));
+    // issue #45: business 平台探活 — fit-ai 公开健康口 (server/main.py 同款鉴权豁免),
+    // speech-exam /health 无鉴权; ai-family 全 router 挂 verify_service_key (恒 401)
+    // 与 apparelmockup (静态 http.server 无 /health, 恒 404=BadPath 不重启) 退 TCP
+    m.insert("fit-ai", ProbeSpec::http(11510, "/api/v1/system/health"));
+    m.insert("ai-speech-exam", ProbeSpec::http(11560, "/health"));
+    m.insert("ai-family", ProbeSpec::tcp(11483));
+    m.insert("ai-apparelmockup", ProbeSpec::tcp(11520));
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -88,7 +95,12 @@ pub fn probe_spec_for(name: &str, port: u16) -> ProbeSpec {
 // issue #29: start_map 覆盖服务 (trainer-bridge 脚本无 restart 子命令;
 // daemonize 进程无 restart 语义) 一律 stop+start。
 pub fn restart_cmd_for(name: &str) -> &'static str {
-    if name == "fusion-store" || crate::start_map::start_spec_for(name).is_some() {
+    // issue #45: ai-family start.sh 只有 start/stop/status/log/doctor,
+    // 无 restart 子命令 (bash start.sh restart → usage exit 1) → stop+start
+    if name == "fusion-store"
+        || name == "ai-family"
+        || crate::start_map::start_spec_for(name).is_some()
+    {
         "stop+start"
     } else {
         "restart"
@@ -213,6 +225,33 @@ mod tests {
         assert_eq!(s.path.as_deref(), Some("/api/health"));
         let s = probe_spec_for("fusion-code-modenization", 11459);
         assert_eq!(s.path.as_deref(), Some("/health"));
+    }
+
+    // issue #45: business 平台探活 — fit-ai/speech-exam HTTP, family/apparelmockup TCP
+    #[test]
+    fn test_issue42_business_probe_specs() {
+        let s = probe_spec_for("fit-ai", 11510);
+        assert!(matches!(s.kind, ProbeKind::Http));
+        assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
+
+        let s = probe_spec_for("ai-speech-exam", 11560);
+        assert!(matches!(s.kind, ProbeKind::Http));
+        assert_eq!(s.path.as_deref(), Some("/health"));
+
+        for (name, port) in [("ai-family", 11483), ("ai-apparelmockup", 11520)] {
+            let s = probe_spec_for(name, port);
+            assert!(matches!(s.kind, ProbeKind::Tcp), "{name} 应 TCP 探活");
+        }
+    }
+
+    // issue #45: ai-family 无 restart 子命令 → stop+start; start_map 覆盖的
+    // business 服务 (fit-ai 等) 同样 stop+start
+    #[test]
+    fn test_issue42_restart_cmd_business() {
+        assert_eq!(restart_cmd_for("ai-family"), "stop+start");
+        assert_eq!(restart_cmd_for("fit-ai"), "stop+start");
+        assert_eq!(restart_cmd_for("ai-speech-exam"), "stop+start");
+        assert_eq!(restart_cmd_for("ai-apparelmockup"), "stop+start");
     }
 
     #[test]
