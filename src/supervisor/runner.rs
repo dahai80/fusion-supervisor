@@ -8,6 +8,37 @@ use anyhow::Result;
 pub type ProbeFn = Box<dyn Fn() -> ProbeResult + Send + Sync>;
 pub type StartFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
+// issue #47: 配置致命退出码 (sysexits.h EX_CONFIG)。fusion-gateway 契约:
+// 78 = 配置坏且自愈失败 (重启无救, 需人工修配置), 其它退出码 = 普通 crash。
+pub(crate) const EXIT_CONFIG: i32 = 78;
+// issue #47: 快速失败窗口 (秒) — start 成功后窗口内又探活不可达 = fast-exit
+const FAST_FAIL_WINDOW_SEC: u64 = 10;
+// issue #47: 连续快速失败熔断阈值 (达阈值 → 告警 + 退避升级)
+const FAST_FAIL_STREAK: u32 = 3;
+// issue #47: config-fatal 封顶次数 (达限标 Failed, 人工 fusion-sv restart 复位)
+const CONFIG_FAIL_CAP: u32 = 5;
+
+// issue #47: 熔断退避序列 10s → 60s → 300s (封顶)。区别于普通 crash 的 1→2→4→…:
+// config-fatal / 快速失败时快速重试只会空烧进程启动, 拉长间隔等人工修复。
+fn escalated_delay(n: u32) -> u64 {
+    match n {
+        0 | 1 => 10,
+        2 => 60,
+        _ => 300,
+    }
+}
+
+// issue #47: 从 exec_* 失败信息提取退出码 (约定格式 "exit code=<n>",
+// 见 supervisor/mod.rs 的 bail! 格式 — 改一处必须同步另一处)。
+fn exit_code_of(err_msg: &str) -> Option<i32> {
+    let rest = err_msg.split("exit code=").nth(1)?;
+    let digits: &str = rest
+        .split(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .next()
+        .unwrap_or("");
+    digits.parse().ok()
+}
+
 // 状态机: Stopped→Starting→Healthy→(Unhealthy)→Restarting→Healthy|Failed
 //         Healthy→Draining→Stopped (drain 完成) | Healthy→Draining→Healthy (drain 取消)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,6 +66,14 @@ pub struct ServiceRunner {
     // 数十秒, 饿死 RPC/HTTP status。改为记截止时间本 tick 直接返回,
     // 后续 tick 到点再真正 invoke_start (poll_unhealthy_sec=2s, 误差 ≤2s)。
     pub restart_after: Option<u64>,
+    // issue #47: 上次 invoke_start 成功时刻 (unix sec)。None=从未成功 start。
+    last_start_ts: Option<u64>,
+    // issue #47: 连续快速失败计数 — start 成功后 FAST_FAIL_WINDOW_SEC 内又探活不可达。
+    fast_fail_streak: u32,
+    // issue #47: 快速失败熔断告警 latch (达阈值告警一次, 恢复 Healthy 复位, 不刷屏)
+    fast_fail_alerted: bool,
+    // issue #47: config-fatal (exit 78) 连续计数 — 达 CONFIG_FAIL_CAP 标 Failed。
+    config_fail_streak: u32,
     probe_fn: ProbeFn,
     start_fn: StartFn,
 }
@@ -54,6 +93,10 @@ impl ServiceRunner {
             restart_cmd: restart_cmd.to_string(),
             drain_grace_until: None,
             restart_after: None,
+            last_start_ts: None,
+            fast_fail_streak: 0,
+            fast_fail_alerted: false,
+            config_fail_streak: 0,
             probe_fn: Box::new(probe_fn),
             start_fn: Box::new(start_fn),
         }
@@ -104,6 +147,10 @@ impl ServiceRunner {
                         })
                         .await;
                     self.policy.reset();
+                    // issue #47: 恢复即复位熔断计数 (快速失败 / config-fatal)
+                    self.fast_fail_streak = 0;
+                    self.fast_fail_alerted = false;
+                    self.config_fail_streak = 0;
                 }
             }
             ProbeResult::Unhealthy { reason } => {
@@ -168,8 +215,15 @@ impl ServiceRunner {
                 // crash 记账语义与旧版一致: 每次实际重启尝试记 1 次。
                 match self.restart_after {
                     None => {
-                        // 首次进入退避: 排期, 本 tick 不重启
-                        let delay = self.policy.next_delay();
+                        // issue #47: 熔断生效时退避走 10→60→300 序列,
+                        // 不走普通 crash 的 1→2→4 快速序列 (空烧进程启动)。
+                        let delay = if self.config_fail_streak > 0 {
+                            escalated_delay(self.config_fail_streak)
+                        } else if self.fast_fail_streak >= FAST_FAIL_STREAK {
+                            escalated_delay(self.fast_fail_streak)
+                        } else {
+                            self.policy.next_delay()
+                        };
                         self.restart_after = Some(now_ts + delay);
                         tracing::info!(svc = %self.def.name, delay, "退避后重启 (scheduled)");
                     }
@@ -192,18 +246,78 @@ impl ServiceRunner {
                                 .await;
                             return;
                         }
-                        if let Err(e) = self.invoke_start() {
-                            tracing::warn!(svc = %self.def.name, err = %e, "start.sh fail");
-                            let _ = alerter
-                                .alert(Alert {
-                                    service: self.def.name.clone(),
-                                    kind: AlertKind::RestartFailed,
-                                    detail: e.to_string(),
-                                    ts: now_ts,
-                                })
-                                .await;
-                        } else {
-                            self.state = State::Restarting;
+                        // issue #47: 快速失败断路 — 上次 start 成功后窗口内又探活不可达。
+                        // 连续达阈值 → 熔断告警 (latch, 恢复复位), 后续退避升级 10→60→300。
+                        if let Some(t0) = self.last_start_ts
+                            && now_ts.saturating_sub(t0) < FAST_FAIL_WINDOW_SEC
+                        {
+                            self.fast_fail_streak += 1;
+                            if self.fast_fail_streak == FAST_FAIL_STREAK && !self.fast_fail_alerted
+                            {
+                                self.fast_fail_alerted = true;
+                                tracing::error!(
+                                    svc = %self.def.name,
+                                    streak = self.fast_fail_streak,
+                                    window_sec = FAST_FAIL_WINDOW_SEC,
+                                    "快速失败熔断 (start 后秒级又宕), 退避升级"
+                                );
+                                let _ = alerter
+                                    .alert(Alert {
+                                        service: self.def.name.clone(),
+                                        kind: AlertKind::FastFailLoop,
+                                        detail: format!(
+                                            "{} consecutive fast-exits (<{}s) after start",
+                                            self.fast_fail_streak, FAST_FAIL_WINDOW_SEC
+                                        ),
+                                        ts: now_ts,
+                                    })
+                                    .await;
+                            }
+                        }
+                        match self.invoke_start() {
+                            Err(e) => {
+                                let detail = e.to_string();
+                                // issue #47: exit 78 (EX_CONFIG) = 配置致命, 重启无救 —
+                                // 不烧快速重试, 退避走 10→60→300; 连续达 cap 标 Failed。
+                                if exit_code_of(&detail) == Some(EXIT_CONFIG) {
+                                    self.config_fail_streak += 1;
+                                    self.last_start_ts = None;
+                                    tracing::error!(
+                                        svc = %self.def.name,
+                                        streak = self.config_fail_streak,
+                                        "config-fatal (exit 78), 重启无救需修配置"
+                                    );
+                                    let _ = alerter
+                                        .alert(Alert {
+                                            service: self.def.name.clone(),
+                                            kind: AlertKind::ServiceConfigFatal,
+                                            detail,
+                                            ts: now_ts,
+                                        })
+                                        .await;
+                                    if self.config_fail_streak >= CONFIG_FAIL_CAP {
+                                        self.state = State::Failed;
+                                        tracing::error!(svc = %self.def.name, "config-fatal 封顶, 标 Failed 停重启");
+                                        return;
+                                    }
+                                    self.restart_after =
+                                        Some(now_ts + escalated_delay(self.config_fail_streak));
+                                } else {
+                                    tracing::warn!(svc = %self.def.name, err = %detail, "start.sh fail");
+                                    let _ = alerter
+                                        .alert(Alert {
+                                            service: self.def.name.clone(),
+                                            kind: AlertKind::RestartFailed,
+                                            detail,
+                                            ts: now_ts,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Ok(()) => {
+                                self.last_start_ts = Some(now_ts);
+                                self.state = State::Restarting;
+                            }
                         }
                     }
                 }
@@ -510,5 +624,139 @@ mod tests {
         assert!(matches!(r.state, State::Healthy));
         assert!(r.drain_grace_until.is_none());
         let _ = (calls, probe_cell);
+    }
+
+    // issue #47: exec 失败信息退出码解析 (约定格式 "exit code=<n>")
+    #[test]
+    fn test_exit_code_of() {
+        assert_eq!(
+            exit_code_of("script restart exit code=78: yaml: bad config"),
+            Some(78)
+        );
+        assert_eq!(exit_code_of("daemon cmd start exit code=1: boom"), Some(1));
+        assert_eq!(exit_code_of("script restart killed by signal: x"), None);
+        assert_eq!(exit_code_of("spawn fail: no such file"), None);
+        assert_eq!(exit_code_of("exit code=78"), Some(78));
+        assert_eq!(exit_code_of("exit code=-1: segv"), Some(-1));
+    }
+
+    // issue #47: config-fatal (exit 78) 退避升级 10→60→300, 不走 1→2→4 快速序列
+    #[tokio::test]
+    async fn test_config_fatal_exit_78_escalates_backoff() {
+        let (_, _, pf, _) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused,
+        });
+        let sf = |_cmd: &str| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "script restart exit code=78: yaml: bad config"
+            ))
+        };
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Unhealthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        // 排期 tick (streak=0 → 走普通退避 1s)
+        r.tick(1000, &s, &mut al).await.unwrap();
+        assert_eq!(r.restart_after, Some(1001));
+        // 到点: start 失败 exit 78 → streak=1, 退避 10s
+        r.tick(1001, &s, &mut al).await.unwrap();
+        assert_eq!(r.config_fail_streak, 1);
+        assert_eq!(r.restart_after, Some(1011));
+        // 到点: streak=2, 退避 60s
+        r.tick(1011, &s, &mut al).await.unwrap();
+        assert_eq!(r.config_fail_streak, 2);
+        assert_eq!(r.restart_after, Some(1071));
+        // 到点: streak=3, 退避 300s (封顶)
+        r.tick(1071, &s, &mut al).await.unwrap();
+        assert_eq!(r.config_fail_streak, 3);
+        assert_eq!(r.restart_after, Some(1371));
+        // 状态仍 Unhealthy (未封顶不标 Failed)
+        assert!(matches!(r.state, State::Unhealthy));
+    }
+
+    // issue #47: 连续 5 次 exit 78 → 标 Failed 停重启
+    #[tokio::test]
+    async fn test_config_fatal_cap_marks_failed() {
+        let (_, _, pf, _) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused,
+        });
+        let sf = |_cmd: &str| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "script restart exit code=78: yaml: bad config"
+            ))
+        };
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Unhealthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        let mut now = 1000u64;
+        // 排期 tick, 之后循环 "到点 → 失败 streak+1 → 排期 escalated" 直到 Failed
+        r.tick(now, &s, &mut al).await.unwrap(); // 排期 1s
+        now += 1;
+        loop {
+            r.tick(now, &s, &mut al).await.unwrap(); // 失败 → streak+1
+            if matches!(r.state, State::Failed) {
+                break;
+            }
+            now = r.restart_after.unwrap(); // 跳到退避截止
+        }
+        assert_eq!(r.config_fail_streak, 5);
+        assert!(
+            matches!(r.state, State::Failed),
+            "连续 5 次 exit 78 应标 Failed"
+        );
+    }
+
+    // issue #47: 快速失败断路 — start 成功后窗口内又宕, 连续 3 次熔断 + 退避升级
+    #[tokio::test]
+    async fn test_fast_fail_circuit_breaker() {
+        let (_, _, pf, _) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused,
+        });
+        let sf = |_cmd: &str| -> Result<()> { Ok(()) };
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Unhealthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        // 排期 1s → 到点 start 成功 (last_start_ts=1001)
+        r.tick(1000, &s, &mut al).await.unwrap();
+        r.tick(1001, &s, &mut al).await.unwrap();
+        assert_eq!(r.last_start_ts, Some(1001));
+        assert_eq!(r.fast_fail_streak, 0);
+        // 轮 1: 排期 (退避 2s) → 到点 1004, 距上次 start 3s < 10s → streak=1
+        r.tick(1002, &s, &mut al).await.unwrap();
+        r.tick(1004, &s, &mut al).await.unwrap();
+        assert_eq!(r.fast_fail_streak, 1);
+        // 轮 2: 退避 4s → 到点 1009, 距上次 start 5s → streak=2
+        r.tick(1005, &s, &mut al).await.unwrap();
+        r.tick(1009, &s, &mut al).await.unwrap();
+        assert_eq!(r.fast_fail_streak, 2);
+        // 轮 3: 退避 8s → 到点 1018, 距上次 start 9s → streak=3 熔断 latch
+        r.tick(1010, &s, &mut al).await.unwrap();
+        r.tick(1018, &s, &mut al).await.unwrap();
+        assert_eq!(r.fast_fail_streak, 3);
+        assert!(r.fast_fail_alerted, "达阈值应置熔断 latch");
+        // 下一轮排期退避升级: escalated_delay(3)=300s
+        r.tick(1019, &s, &mut al).await.unwrap();
+        assert_eq!(r.restart_after, Some(1319), "熔断后退避应走 300s 封顶");
+    }
+
+    // issue #47: 恢复 Healthy 复位熔断计数
+    #[tokio::test]
+    async fn test_recovery_resets_circuit_breakers() {
+        let (_, probe_cell, pf, sf) = harness(ProbeResult::Healthy { latency_ms: 5 });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Unhealthy;
+        r.fast_fail_streak = 3;
+        r.fast_fail_alerted = true;
+        r.config_fail_streak = 2;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Healthy));
+        assert_eq!(r.fast_fail_streak, 0);
+        assert!(!r.fast_fail_alerted);
+        assert_eq!(r.config_fail_streak, 0);
+        let _ = probe_cell;
     }
 }

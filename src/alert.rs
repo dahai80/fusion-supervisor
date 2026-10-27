@@ -23,6 +23,10 @@ pub enum AlertKind {
     RolloutPrewarmFailed,
     // issue #10: 备份失败 (目标未设/不可写/docker exec 失败)
     BackupFailed,
+    // issue #47: 配置致命退出 (exit 78, EX_CONFIG) — 重启无救, 需人工修配置
+    ServiceConfigFatal,
+    // issue #47: 快速失败熔断 (start 成功后秒级又宕, 连续达阈值)
+    FastFailLoop,
 }
 
 impl AlertKind {
@@ -37,6 +41,8 @@ impl AlertKind {
             AlertKind::ServiceDrained => "ServiceDrained",
             AlertKind::RolloutPrewarmFailed => "RolloutPrewarmFailed",
             AlertKind::BackupFailed => "BackupFailed",
+            AlertKind::ServiceConfigFatal => "ServiceConfigFatal",
+            AlertKind::FastFailLoop => "FastFailLoop",
         }
     }
 }
@@ -84,6 +90,8 @@ impl Alerter {
     fn severity_of(kind: &AlertKind) -> &'static str {
         match kind {
             AlertKind::ContainerCrashLoop => "error",
+            // issue #47: 配置致命/快速失败熔断均为升级事件
+            AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop => "error",
             AlertKind::ServiceBack | AlertKind::ServiceDrained => "info",
             _ => "warn",
         }
@@ -112,8 +120,11 @@ impl Alerter {
             tracing::debug!(svc = %alert.service, kind = alert.kind.label(), "alert dedup skip");
             return Ok(());
         }
-        // CrashLoop 升级用 ERROR, 其余 WARN (便于运维筛 crash-loop)
-        let is_escalation = matches!(alert.kind, AlertKind::ContainerCrashLoop);
+        // CrashLoop / config-fatal / 快速失败熔断升级用 ERROR, 其余 WARN (便于运维筛升级事件)
+        let is_escalation = matches!(
+            alert.kind,
+            AlertKind::ContainerCrashLoop | AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop
+        );
         if is_escalation {
             tracing::error!(
                 svc = %alert.service,
@@ -227,5 +238,8 @@ mod tests {
             "ContainerStateChange"
         );
         assert_eq!(AlertKind::ContainerCrashLoop.label(), "ContainerCrashLoop");
+        // issue #47: 新增升级告警 kind
+        assert_eq!(AlertKind::ServiceConfigFatal.label(), "ServiceConfigFatal");
+        assert_eq!(AlertKind::FastFailLoop.label(), "FastFailLoop");
     }
 }
