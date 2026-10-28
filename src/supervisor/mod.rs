@@ -10,6 +10,8 @@ use crate::probe::{ProbeResult, ProbeSpec, probe};
 use crate::probe_map;
 use crate::store::HistoryStore;
 use anyhow::Result;
+// issue #60: CommandExt::process_group — 服务子进程独立进程组, 隔离 daemon 重载的组信号
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -930,6 +932,9 @@ fn exec_start_spec(
             for k in crate::env_map::strip_env_for(svc) {
                 command.env_remove(k);
             }
+            // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
+            // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
+            command.process_group(0);
             // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join,
             // 后台化孙进程持有 fd 不再阻塞 exec — 见 open_svc_stderr 注释)。
             let log_path = crate::start_map::log_path(svc);
@@ -979,6 +984,9 @@ fn exec_bash_script(
     for k in crate::env_map::strip_env_for(svc) {
         command.env_remove(k);
     }
+    // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
+    // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
+    command.process_group(0);
     // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join —
     // 后台化孙进程持有 pipe 写端曾把 exec 永久挂死, 见 open_svc_stderr 注释)。
     let mut child = command
@@ -1113,6 +1121,44 @@ mod tests {
         );
         // 清理测试过程文件 (孙进程 sleep 已被 tempdir 之外清理策略兜底: 60s 后自然退出)
         let _ = std::fs::remove_file(crate::start_map::log_path("ut-linger"));
+    }
+
+    // issue #60 回归: exec 启动的子进程必须落在独立进程组 — launchd bootout 按
+    // daemon 进程组广播 SIGTERM, 继承同组会把整个托管 fleet 连带杀掉。
+    // 断言: exec_bash_script 起的 bash pgid ≠ 测试进程 pgid; 普通继承 spawn 则 ==。
+    #[test]
+    fn test_exec_child_gets_own_process_group() {
+        let our_pgid = {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg("ps -o pgid= -p $$ | tr -d ' '")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let pgid_file = dir.path().join("child-pgid");
+        let sh = dir.path().join("pgid.sh");
+        std::fs::write(
+            &sh,
+            format!(
+                "#!/bin/bash\nps -o pgid= -p $$ | tr -d ' ' > {}\n",
+                pgid_file.display()
+            ),
+        )
+        .unwrap();
+        exec_bash_script("ut-pgid", &sh, "start", &[]).unwrap();
+        let child_pgid = std::fs::read_to_string(&pgid_file)
+            .expect("子进程应写出自身 pgid")
+            .trim()
+            .to_string();
+        assert!(!child_pgid.is_empty(), "pgid 输出不得为空");
+        assert_ne!(
+            child_pgid, our_pgid,
+            "exec 子进程应独立进程组 (issue #60), 实际与 daemon 同组"
+        );
+        // 清理测试过程文件
+        let _ = std::fs::remove_file(crate::start_map::log_path("ut-pgid"));
     }
 
     // issue #31: up_one/down_one — service 级操作只动目标服务
