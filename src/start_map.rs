@@ -16,11 +16,15 @@ pub enum StartSpec {
     // (stop 用 pidfile kill; restart 由 restart_cmd_for 退化为 stop+start)
     // issue #45: cwd 相对 FUSION_ROOT (None=继承 daemon cwd);
     // env 为 app 内部固定 env (如 config 路径), 非 secret — secret 走 env_map 注入。
+    // issue #49: env_file 相对 FUSION_ROOT 的 dotenv 文件, start 前 set -a source
+    // 注入 (服务自身 .env 是唯一真源, 覆盖 daemon 进程 env 快照里的旧值);
+    // 文件缺失 fail-closed 拒启 (bash exit 1)。
     Daemon {
         bin: String,
         args: Vec<String>,
         cwd: Option<String>,
         env: Vec<(String, String)>,
+        env_file: Option<String>,
     },
 }
 
@@ -31,6 +35,7 @@ fn daemon(bin: &str, args: &[&str]) -> StartSpec {
         args: args.iter().map(|s| s.to_string()).collect(),
         cwd: None,
         env: Vec::new(),
+        env_file: None,
     }
 }
 
@@ -81,10 +86,19 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         // 模块 (上游已迁 api.app, 上游 issue dahai80/fusion-bench#27) —
         // 直接 daemonize `fusion-bench serve` (前台 uvicorn, 默认口 11467)
         "fusion-bench" => Some(daemon("fusion-bench", &["serve"])),
-        // issue #34: fusion-k12-teacher start.sh 不收 start 子命令 (bare/-d/stop,
-        // 上游 issue dahai80/fusion-k12-teacher#31) — 直接 daemonize
-        // `fusion-k12 serve` (前台, 默认口 11448)
-        "fusion-k12-teacher" => Some(daemon("fusion-k12", &["serve"])),
+        // issue #34/#49: fusion-k12-teacher start.sh `start` 子命令前台 exec (上游
+        // dahai80/fusion-k12-teacher#31 已修但脚本路径仍前台阻塞) — daemonize
+        // `fusion-k12 serve` (默认口 11448)。issue #49: bare serve 不加载项目自身
+        // .env (FUSION_MLX_API_KEY 等), 继承 daemon env 快照里的旧 key → gateway
+        // 401 → /api/health 503 backend down → 探活重启循环。env_file 指向项目
+        // .env (唯一真源), start 前 set -a source 注入, 覆盖旧值。
+        "fusion-k12-teacher" => Some(StartSpec::Daemon {
+            bin: "fusion-k12".into(),
+            args: vec!["serve".into()],
+            cwd: None,
+            env: Vec::new(),
+            env_file: Some("fusion-k12-teacher/.env".into()),
+        }),
         // issue #34: fusion-code-modenization start.sh 用 `python -m ...server.runner`
         // — runner 无 __main__ 入口, 导入即退出 0 (入口已迁 server/__main__.py,
         // 上游 issue dahai80/fusion-code-modelization#21) — 直接 daemonize 正确入口
@@ -111,6 +125,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             ],
             cwd: Some("business/fit-ai".into()),
             env: Vec::new(),
+            env_file: None,
         }),
         "ai-speech-exam" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
@@ -131,6 +146,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
                 "FUSION_AI_SPEECH_EXAM_CONFIG".into(),
                 "config/config.yaml".into(),
             )],
+            env_file: None,
         }),
         // 静态前端分发 (python http.server), 无 /health 端点 → TCP 探活
         "ai-apparelmockup" => Some(StartSpec::Daemon {
@@ -146,6 +162,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             ],
             cwd: Some("business/ai-apparelmockup".into()),
             env: Vec::new(),
+            env_file: None,
         }),
         _ => None,
     }
@@ -191,12 +208,15 @@ pub fn log_path(svc: &str) -> PathBuf {
 // 子 shell, $! 拿到的是子 shell pid 而非真实进程 pid — stop 时 kill 掉的是壳,
 // 服务进程变孤儿继续占口。`;` 分隔后 nohup 单独后台, $! 即 nohup exec 后的真实 pid。
 // issue #45: cd 用 `|| exit 1` 守护 (cwd 不存在时拒启, 不在错误目录裸跑)。
+// issue #49: env_file 在 cd 之后 set -a source (dotenv 覆盖 daemon env 快照旧值),
+// 文件缺失 `|| exit 1` fail-closed 拒启。
 pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     let StartSpec::Daemon {
         bin,
         args,
         cwd,
         env,
+        env_file,
     } = spec
     else {
         return None;
@@ -208,6 +228,13 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     if let Some(cwd) = cwd {
         let dir = fusion_root().join(cwd);
         pre.push_str(&format!("cd '{}' || exit 1; ", dir.display()));
+    }
+    if let Some(env_file) = env_file {
+        let path = fusion_root().join(env_file);
+        pre.push_str(&format!(
+            "set -a; [ -f '{path}' ] || exit 1; source '{path}'; set +a; ",
+            path = path.display(),
+        ));
     }
     for (k, v) in env {
         pre.push_str(&format!("export {k}='{v}'; "));
@@ -438,6 +465,7 @@ mod tests {
                 args,
                 cwd,
                 env,
+                ..
             } => {
                 assert_eq!(bin, ".venv/bin/python");
                 assert!(args.contains(&"server.main:app".to_string()));
@@ -501,5 +529,41 @@ mod tests {
             "stop 应读 pidfile: {cmd}"
         );
         assert!(cmd.contains("rm -f"), "stop 应清 pidfile: {cmd}");
+    }
+
+    // issue #49: k12 daemonize 前必须 source 项目自身 .env (唯一真源, 覆盖 daemon
+    // env 快照旧 key); 文件缺失 fail-closed 拒启; 其他 Daemon 服务不带该段
+    #[test]
+    fn test_issue49_k12_env_file_source_segment() {
+        let spec = start_spec_for("fusion-k12-teacher").unwrap();
+        let StartSpec::Daemon {
+            env_file: Some(env_file),
+            ..
+        } = &spec
+        else {
+            panic!("fusion-k12-teacher 应为带 env_file 的 Daemon spec");
+        };
+        assert_eq!(env_file, "fusion-k12-teacher/.env");
+
+        let cmd = daemon_start_cmd(&spec, "fusion-k12-teacher").unwrap();
+        let seg = format!(
+            "set -a; [ -f '{p}' ] || exit 1; source '{p}'; set +a; ",
+            p = fusion_root().join(env_file).display(),
+        );
+        assert!(cmd.contains(&seg), "应带 fail-closed source 段: {cmd}");
+        // source 段须在 nohup 之前 (env 注入先于进程启动)
+        assert!(
+            cmd.find(&seg).unwrap() < cmd.find("nohup").unwrap(),
+            "source 段应在 nohup 前: {cmd}"
+        );
+        assert!(!cmd.contains("&& nohup"), "不得破坏 pid 纪律: {cmd}");
+
+        // 无 env_file 的 Daemon 服务命令不含 source 段
+        let plain =
+            daemon_start_cmd(&start_spec_for("fusion-bench").unwrap(), "fusion-bench").unwrap();
+        assert!(
+            !plain.contains("set -a;"),
+            "无 env_file 服务不应 source: {plain}"
+        );
     }
 }

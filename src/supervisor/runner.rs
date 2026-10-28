@@ -183,15 +183,21 @@ impl ServiceRunner {
                 reason = ?reason,
                 "探活不可达但非宕机信号, 不重启 (查 probe_map 路径)"
             );
+            // issue #49: 同一根因每 tick (2s) 重复告警刷爆日志 — 只在状态转移进
+            // Unhealthy 的首次告警, 持续 Unhealthy 期间静默; 恢复 Healthy 后
+            // 再失败会重新告警 (状态机复位即解除静默)。
+            let first_transition = !matches!(self.state, State::Unhealthy);
             self.state = State::Unhealthy;
-            let _ = alerter
-                .alert(Alert {
-                    service: self.def.name.clone(),
-                    kind: AlertKind::RestartFailed,
-                    detail: format!("probe path suspect: {:?}", reason),
-                    ts: now_ts,
-                })
-                .await;
+            if first_transition {
+                let _ = alerter
+                    .alert(Alert {
+                        service: self.def.name.clone(),
+                        kind: AlertKind::RestartFailed,
+                        detail: format!("probe path suspect: {:?}", reason),
+                        ts: now_ts,
+                    })
+                    .await;
+            }
             return;
         }
         // 真宕机信号 (ConnectionRefused/Timeout)
@@ -519,6 +525,24 @@ mod tests {
         r.tick(1001, &s, &mut al).await.unwrap();
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(r.policy.crash_count(), 0);
+    }
+
+    // issue #49: 非重启型探活失败 (BadPath/BadStatus) 的 RestartFailed 告警只在
+    // 转移进 Unhealthy 的首次发 — 持续 Unhealthy 期间每 tick (2s) 不得刷屏
+    #[tokio::test]
+    async fn test_badpath_alert_only_on_transition() {
+        let (_, _, pf, sf) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::BadStatus(500),
+        });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Healthy;
+        let s = store();
+        let mut al = Alerter::new(0, String::new());
+        r.tick(1000, &s, &mut al).await.unwrap(); // 转移进 Unhealthy → 告警 1 次
+        assert_eq!(al.alerts_emitted(), 1);
+        r.tick(1002, &s, &mut al).await.unwrap(); // 持续 Unhealthy → 静默
+        r.tick(1004, &s, &mut al).await.unwrap();
+        assert_eq!(al.alerts_emitted(), 1, "持续 Unhealthy 不得重复告警");
     }
 
     #[tokio::test]
