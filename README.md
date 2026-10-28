@@ -96,6 +96,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 nati
 ## How it works
 
 - **Source of truth:** reads `architecture/port-registry.yaml` for the 53-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
+- **Registry-key → repo-dir mapping (issue #57):** `name_to_dir` maps registry keys to local repo directories. Most keys equal their directory; known exceptions live in an explicit table (`fusion-code-modelization` → `fusion-code-modenization` spelling, business-plane keys → `business/<name>`, and `fusion-multi-node` → `fusion-multi-nodes` — the registry key is singular but the repo directory on disk is plural; before #57 the default mapping pointed at a nonexistent directory and the Cluster master failed closed on every boot). Sub-service keys (`fusion-cowork-ws`, `fusion-multi-node-agent`, …) resolve to their parent repo via a `(prefix, dir)` table, so plural-directory parents resolve correctly too.
 - **Dual-mode binary:** `daemon` = long-lived supervisor loop + UDS JSON-RPC server (`/tmp/fusion-sv.sock`, perms 0600); CLI subcommands = one-shot client over the same UDS.
 - **Health probing:** per-service `probe_map` normalizes liveness paths (HTTP `/health`/`/healthz`, UDS `ping`→`pong`, TCP fallback). 2s timeout.
 - **Crash recovery:** ports fusion-mlx `--watchdog` — 300s sliding window, 5-crash cap, exponential backoff 1→2→4→8→16→30s. Backoff is scheduled, not slept in-lock (issue #31): the tick records a `restart_after` deadline and returns, so `/metrics` and status RPCs stay responsive while failing services churn. Cap hit → `Failed` state, stops restart, alerts (manual `fusion-sv restart <svc>` to reset). `up [svc]` / `down [svc]` are true single-service operations end-to-end (issue #31 fixed the RPC side — `up_one`/`down_one`; issue #41 fixed the CLI side, which parsed the `[SERVICE]` argument but silently dropped it, so `down <svc>` stopped the whole fleet — the arg now routes through the tested `cli::up_down_target` helper).
@@ -177,7 +178,7 @@ Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSIO
 ## Test
 
 ```bash
-cargo test --all-targets          # 193 test fns (unit + 13 integration files)
+cargo test --all-targets          # 194 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -204,7 +205,7 @@ Cross-node Prometheus aggregation (v2), cross-node cluster orchestration, rewrit
 
 Containerized multi-node commercial-deployment topology — extends
 `architecture/fusion-deploy-container-multinode-0901.md`. Layered Docker
-Compose: base cluster plane (`fusion-multi-node/docker-compose.yml`, network
+Compose: base cluster plane (`fusion-multi-nodes/docker-compose.yml`, network
 pin #58 landed) + business-plane overlay (`docker-compose.business.yml` here).
 Merge: `docker compose -f docker-compose.yml -f ../fusion-supervisor/docker-compose.business.yml up -d`.
 
@@ -219,7 +220,7 @@ container boundary).
 1. MLX running bare-metal: `~/claude-home/fusion-mlx/start.sh start`
 2. Cluster token + MLX API key exported inline (the base compose is fail-closed
    `${FUSION_CLUSTER_TOKEN:?}` / `${FUSION_MLX_API_KEY:?}` — no `.env` is
-   created in `fusion-multi-node`):
+   created in `fusion-multi-nodes`):
    ```bash
    export FUSION_CLUSTER_TOKEN=$(openssl rand -hex 16)
    export FUSION_MLX_API_KEY=fg-admin-key   # matches fusion-mlx api_key
@@ -228,7 +229,7 @@ container boundary).
    (download via `HF_MIRROR=https://hf-mirror.com` if missing), available in MLX.
 4. Docker Desktop running (v29.4+).
 5. Stop any bare-metal `fusion-multi-node` master first (it holds port 11452):
-   `cd fusion-multi-node && bash start.sh stop`.
+   `cd fusion-multi-nodes `cd fusion-multi-node && bash start.sh stop``cd fusion-multi-node && bash start.sh stop` bash start.sh stop`.
 
 ### Build the smoke images
 
@@ -249,7 +250,7 @@ lock — see upstream issue dahai80/fusion-models-hub#52).
 ### Run smoke validation
 
 The multi-node smoke harness (`scripts/smoke-container-multinode.sh`) was
-**removed** in PR #24 — it depended on `fusion-multi-node/docker-compose.yml`,
+**removed** in PR #24 — it depended on `fusion-multi-nodes/docker-compose.yml`,
 which is no longer tested on the local single-machine deployment. The
 sidecar-plane smoke (`bash scripts/smoke-sidecar.sh` + unit-only
 `bash scripts/smoke-sidecar.test.sh`) remains the validated path.
@@ -269,7 +270,7 @@ Smoke harness auto-teardowns via `trap` — no persistent test data is kept,
 only the `/tmp/fusion-smoke.*/smoke.log` run log remains (per CLAUDE.md:
 keep only final output + logs). The `fusion-cluster` Docker network may
 persist (harmless, reused across runs). For manual teardown + cert cleanup
-(mTLS path): `docker compose ... down` + `rm -rf fusion-multi-node/tls/`.
+(mTLS path): `docker compose ... down` + `rm -rf fusion-multi-nodes/tls/`.
 
 ## Production Sidecar (Traefik + Redis + Postgres + Qdrant)
 
