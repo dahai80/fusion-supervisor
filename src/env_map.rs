@@ -25,11 +25,27 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
 // 这些注入不受 compose 开关控制 (与 sidecar 连接 env 不同)。
 fn shell_vars(svc: &str) -> Option<&'static [&'static str]> {
     match svc {
-        "fusion-cowork-web" | "fusion-plugins-ecosystem-console" => {
-            Some(&["FUSION_SHELL_GATEWAY_URL", "FUSION_GATEWAY_ADMIN_KEY"])
+        // issue #54: 上游已迁 conventions §6 新名 — cowork shell_registry.py 读
+        // FUSION_SHELL_GATEWAY_URL + FUSION_ADMIN_KEY (URL 尚未迁 BASE_URL,
+        // 迁移期保留旧名); plugins console v0.4.7 (fusion-plugins-ecosystem#39)
+        // 读 FUSION_GATEWAY_BASE_URL + FUSION_ADMIN_KEY, 不再认旧名。
+        "fusion-cowork-web" => Some(&["FUSION_SHELL_GATEWAY_URL", "FUSION_ADMIN_KEY"]),
+        "fusion-plugins-ecosystem-console" => {
+            Some(&["FUSION_GATEWAY_BASE_URL", "FUSION_ADMIN_KEY"])
         }
         "fusion-trainer-bridge" => Some(&["FUSION_TRAINER_BRIDGE_KEY"]),
-        "fit-ai" | "ai-speech-exam" | "ai-apparelmockup" => Some(&["FUSION_CLIENT_KEY"]),
+        // issue #55: 2026-10-27/28 批量登记的 FastAPI business 服务同样消费
+        // gateway 客户端 key (约定 1); 纯静态托管 (customer-insight ×2,
+        // apparelmockup-web) 不打 gateway, 不注入。
+        "ai-fit"
+        | "ai-speech-exam"
+        | "ai-apparelmockup"
+        | "ai-ads-videobuilder"
+        | "ai-doc-automation"
+        | "ai-information-search"
+        | "ai-OperaBase"
+        | "ai-charactervoice"
+        | "ai-charactervoice-session" => Some(&["FUSION_CLIENT_KEY"]),
         _ => None,
     }
 }
@@ -131,8 +147,9 @@ pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<S
 // issue #29: 解析某服务的 shell 注册 env。
 // 解析顺序 (与 trainer-bridge.sh 自读 gateway config 的模式一致):
 //   进程 env → env_file → 兜底
-// - FUSION_SHELL_GATEWAY_URL: 兜底 http://127.0.0.1:11432 (本地网关固定端口)
-// - FUSION_GATEWAY_ADMIN_KEY: 兜底读 fusion-gateway config.yaml web_shell.admin_key
+// - FUSION_SHELL_GATEWAY_URL / FUSION_GATEWAY_BASE_URL: 兜底 http://127.0.0.1:11432
+//   (本地网关固定端口; issue #54 起按消费方分用新旧 URL 名)
+// - FUSION_ADMIN_KEY: 兜底读 fusion-gateway config.yaml web_shell.admin_key
 //   (只读, 不改写上游), 路径由 FUSION_GATEWAY_CONFIG 覆盖
 // - FUSION_TRAINER_BRIDGE_KEY: 无兜底, env/env_file 均无 → fail-closed Err
 //   (bridge 自身要求此 key, 缺了起不来, 早失败早告警)
@@ -148,17 +165,23 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
                 let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
                 out.insert(k.to_string(), v);
             }
-            "FUSION_GATEWAY_ADMIN_KEY" => {
+            // issue #54: admin key 发布到新名 FUSION_ADMIN_KEY (conventions §1),
+            // 兜底仍只读 gateway config web_shell.admin_key, 不改上游。
+            "FUSION_ADMIN_KEY" => {
                 let v = match resolve(k, env_file) {
                     Some(v) => v,
-                    None => read_gateway_admin_key()
-                        .with_context(|| {
-                            format!(
-                                "FUSION_GATEWAY_ADMIN_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
+                    None => read_gateway_admin_key().with_context(|| {
+                        format!(
+                            "FUSION_ADMIN_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
                                  无法为 {svc} 注册 shell (fail-closed)"
-                            )
-                        })?,
+                        )
+                    })?,
                 };
+                out.insert(k.to_string(), v);
+            }
+            // issue #54: plugins console v0.4.7 读的新 URL 变量, 兜底同本地网关。
+            "FUSION_GATEWAY_BASE_URL" => {
+                let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
                 out.insert(k.to_string(), v);
             }
             "FUSION_TRAINER_BRIDGE_KEY" => {
@@ -369,14 +392,15 @@ pub(crate) mod tests {
 
     // ---- issue #29: shell 注册 env ----
 
-    // 进程 env 直接给 admin key → 注入成功, 不读 gateway config
+    // 进程 env 直接给 admin key → 注入成功, 不读 gateway config。
+    // issue #54: 注入名迁 FUSION_ADMIN_KEY; cowork 仍读旧 URL 名。
     #[test]
     fn test_shell_env_from_process_env() {
         let _g = env_lock().lock().unwrap();
-        let _c = EnvGuard::set("FUSION_GATEWAY_ADMIN_KEY", "fromproc");
+        let _c = EnvGuard::set("FUSION_ADMIN_KEY", "fromproc");
         let f = env_file("");
         let env = shell_env_for("fusion-cowork-web", f.path()).unwrap();
-        assert_eq!(env.get("FUSION_GATEWAY_ADMIN_KEY").unwrap(), "fromproc");
+        assert_eq!(env.get("FUSION_ADMIN_KEY").unwrap(), "fromproc");
         assert_eq!(
             env.get("FUSION_SHELL_GATEWAY_URL").unwrap(),
             "http://127.0.0.1:11432",
@@ -384,21 +408,28 @@ pub(crate) mod tests {
         );
     }
 
-    // .env 给 admin key → 进程 env 缺失时从文件解析
+    // .env 给 admin key → 进程 env 缺失时从文件解析;
+    // plugins console 读新 URL 名 FUSION_GATEWAY_BASE_URL (issue #54)
     #[test]
     fn test_shell_env_from_env_file() {
         let _g = env_lock().lock().unwrap();
-        unsafe { std::env::remove_var("FUSION_GATEWAY_ADMIN_KEY") };
-        let f = env_file("FUSION_GATEWAY_ADMIN_KEY=fromfile\n");
+        unsafe { std::env::remove_var("FUSION_ADMIN_KEY") };
+        unsafe { std::env::remove_var("FUSION_GATEWAY_BASE_URL") };
+        let f = env_file("FUSION_ADMIN_KEY=fromfile\n");
         let env = shell_env_for("fusion-plugins-ecosystem-console", f.path()).unwrap();
-        assert_eq!(env.get("FUSION_GATEWAY_ADMIN_KEY").unwrap(), "fromfile");
+        assert_eq!(env.get("FUSION_ADMIN_KEY").unwrap(), "fromfile");
+        assert_eq!(
+            env.get("FUSION_GATEWAY_BASE_URL").unwrap(),
+            "http://127.0.0.1:11432",
+            "console URL 未配置应兜底本地网关"
+        );
     }
 
     // admin key 全缺 + gateway config 不可读 (指到不存在路径) → fail-closed Err
     #[test]
     fn test_shell_env_fail_closed_no_admin_key() {
         let _g = env_lock().lock().unwrap();
-        unsafe { std::env::remove_var("FUSION_GATEWAY_ADMIN_KEY") };
+        unsafe { std::env::remove_var("FUSION_ADMIN_KEY") };
         let _c = EnvGuard::set(
             "FUSION_GATEWAY_CONFIG",
             "/nonexistent/fusion-gateway-config-test.yaml",
@@ -408,7 +439,7 @@ pub(crate) mod tests {
         assert!(r.is_err(), "admin key 全缺应 fail-closed");
         let msg = r.unwrap_err().to_string();
         assert!(
-            msg.contains("FUSION_GATEWAY_ADMIN_KEY"),
+            msg.contains("FUSION_ADMIN_KEY"),
             "err 应点名缺失 key: {msg}"
         );
     }
@@ -472,11 +503,16 @@ pub(crate) mod tests {
         let _g = env_lock().lock().unwrap();
         let _c = EnvGuard::set("FUSION_CLIENT_KEY", "fromproc");
         let f = env_file("");
-        let env = shell_env_for("fit-ai", f.path()).unwrap();
+        let env = shell_env_for("ai-fit", f.path()).unwrap();
         assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "fromproc");
-        assert!(needs_shell_env("fit-ai"));
+        assert!(needs_shell_env("ai-fit"));
         assert!(needs_shell_env("ai-speech-exam"));
         assert!(needs_shell_env("ai-apparelmockup"));
+        // issue #55: 批量登记的 FastAPI 条目同注入; 纯静态托管不注入
+        assert!(needs_shell_env("ai-ads-videobuilder"));
+        assert!(needs_shell_env("ai-charactervoice"));
+        assert!(!needs_shell_env("customer-insight"));
+        assert!(!needs_shell_env("ai-apparelmockup-web"));
         // ai-family 源码不消费该 key (自建鉴权), 不注入
         assert!(!needs_shell_env("ai-family"));
     }
@@ -521,7 +557,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let _c = EnvGuard::set("FUSION_GATEWAY_CONFIG", f.path().to_str().unwrap());
-        let env = shell_env_for("fit-ai", f.path()).unwrap();
+        let env = shell_env_for("ai-fit", f.path()).unwrap();
         assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "adminkey456");
     }
 

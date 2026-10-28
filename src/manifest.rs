@@ -54,9 +54,24 @@ pub fn name_to_dir(name: &str) -> &str {
     static EXCEPTIONS: &[(&str, &str)] = &[
         ("fusion-code-modelization", "fusion-code-modenization"),
         ("ai-family", "business/ai-family"),
-        ("fit-ai", "business/fit-ai"),
+        // ai-fit: registry key + actual dir are both ai-fit (issue: boot
+        // auto-start failed because the old 'fit-ai' exception pointed to a
+        // business/fit-ai directory that never existed)
+        ("ai-fit", "business/ai-fit"),
         ("ai-speech-exam", "business/ai-speech-exam"),
         ("ai-apparelmockup", "business/ai-apparelmockup"),
+        // issue #55: 2026-10-27/28 端口治理批量登记的 business 条目 — 默认映射
+        // ~/fusion/<key> 不存在, 全部落在 business/ 子目录 (charactervoice 双条目
+        // 与 customer-insight 双条目各自共享同一 repo; ai-OperaBase 目录大小写特殊)。
+        ("ai-ads-videobuilder", "business/ai-ads-videobuilder"),
+        ("ai-doc-automation", "business/ai-doc-automation"),
+        ("ai-information-search", "business/ai-information-search"),
+        ("ai-OperaBase", "business/ai-OperaBase"),
+        ("ai-charactervoice", "business/ai-charactervoice"),
+        ("ai-charactervoice-session", "business/ai-charactervoice"),
+        ("customer-insight", "business/ai-customer-insight"),
+        ("customer-insight-api", "business/ai-customer-insight"),
+        ("ai-apparelmockup-web", "business/ai-apparelmockup"),
     ];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
@@ -239,9 +254,29 @@ external_tools: []
     #[test]
     fn test_name_to_dir_business_plane() {
         assert_eq!(name_to_dir("ai-family"), "business/ai-family");
-        assert_eq!(name_to_dir("fit-ai"), "business/fit-ai");
+        assert_eq!(name_to_dir("ai-fit"), "business/ai-fit");
         assert_eq!(name_to_dir("ai-speech-exam"), "business/ai-speech-exam");
         assert_eq!(name_to_dir("ai-apparelmockup"), "business/ai-apparelmockup");
+        // issue #55: 2026-10-27/28 批量登记条目 (含大小写特殊与共享 repo 双条目)
+        assert_eq!(
+            name_to_dir("ai-OperaBase"),
+            "business/ai-OperaBase",
+            "目录大小写特殊"
+        );
+        assert_eq!(
+            name_to_dir("ai-charactervoice-session"),
+            "business/ai-charactervoice",
+            "session 与 api 共享 repo"
+        );
+        assert_eq!(
+            name_to_dir("customer-insight-api"),
+            "business/ai-customer-insight",
+            "api 与 web 共享 repo"
+        );
+        assert_eq!(
+            name_to_dir("ai-ads-videobuilder"),
+            "business/ai-ads-videobuilder"
+        );
     }
 
     // issue #29: shell-ecosystem 子服务 → 父 repo; 父名本身 → 自身

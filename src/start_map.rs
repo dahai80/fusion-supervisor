@@ -110,20 +110,21 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         // start/stop 参数) — `bash start.sh stop` 会反向启动服务, 走不了脚本路径,
         // 与 bench/k12/modenization 同款 daemonize。FUSION_CLIENT_KEY (secret) 不在
         // 此表 — 走 env_map 注入 (进程 env → .env → gateway config 兜底)。
-        "fit-ai" => Some(StartSpec::Daemon {
+        // issue #55: registry key + dir 均已改名 ai-fit; start.sh 前台 exec
+        // uvicorn server.main:app (cwd=repo 根, 无 --app-dir — 旧 fit-ai spec 的
+        // --app-dir server 是错的, 此前靠端口上残留进程探活掩盖)。
+        "ai-fit" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
                 "-m".into(),
                 "uvicorn".into(),
                 "server.main:app".into(),
-                "--app-dir".into(),
-                "server".into(),
                 "--host".into(),
                 "127.0.0.1".into(),
                 "--port".into(),
                 "11510".into(),
             ],
-            cwd: Some("business/fit-ai".into()),
+            cwd: Some("business/ai-fit".into()),
             env: Vec::new(),
             env_file: None,
         }),
@@ -148,13 +149,143 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             )],
             env_file: None,
         }),
-        // 静态前端分发 (python http.server), 无 /health 端点 → TCP 探活
+        // issue #55: 上游 start.sh 已从静态 http.server 改为 FastAPI 后端
+        // (uvicorn server.app:app, 11520); web 静态分发拆到 ai-apparelmockup-web。
         "ai-apparelmockup" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
                 "-m".into(),
-                "http.server".into(),
+                "uvicorn".into(),
+                "server.app:app".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
                 "11520".into(),
+            ],
+            cwd: Some("business/ai-apparelmockup".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        // ---- issue #55: 2026-10-27/28 端口治理批量登记的 business 条目 ----
+        // 约定 1 标准 start.sh 全部前台 exec → 同款 daemonize; 端口逐一钉死
+        // (上游 config 默认值多为迁移前旧口, TASK-PORT-PROC-2026-10-27 未落地)。
+        // FUSION_CLIENT_KEY 一律走 env_map 注入, 不在此表。
+        "ai-ads-videobuilder" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "ads_vb.cli".into(),
+                "serve".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11531".into(),
+            ],
+            cwd: Some("business/ai-ads-videobuilder".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        "ai-doc-automation" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "backend.cli".into(),
+                "serve".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11550".into(),
+            ],
+            cwd: Some("business/ai-doc-automation".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        // backend.app 无 CLI 参数, 端口读 FUSION_AI_INFORMATION_SEARCH_PORT
+        "ai-information-search" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec!["-m".into(), "backend.app".into()],
+            cwd: Some("business/ai-information-search".into()),
+            env: vec![("FUSION_AI_INFORMATION_SEARCH_PORT".into(), "11595".into())],
+            env_file: None,
+        }),
+        // fusion_ai_operabase.main 端口读 FUSION_AI_OPERABASE_PORT
+        "ai-OperaBase" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec!["-m".into(), "fusion_ai_operabase.main".into()],
+            cwd: Some("business/ai-OperaBase".into()),
+            env: vec![("FUSION_AI_OPERABASE_PORT".into(), "11504".into())],
+            env_file: None,
+        }),
+        // charactervoice 无 start.sh; config 默认口仍是迁移前 11480/11481 → 显式钉口
+        "ai-charactervoice" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "uvicorn".into(),
+                "svc_api.app:app".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11505".into(),
+            ],
+            cwd: Some("business/ai-charactervoice".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        "ai-charactervoice-session" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "uvicorn".into(),
+                "svc_session.app:app".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11506".into(),
+            ],
+            cwd: Some("business/ai-charactervoice".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        // customer-insight 双条目共享同一 repo: web 静态分发 (11594) +
+        // API 预留口 (11501, API 未实现前先托管静态, API 落地后换入口)
+        "customer-insight" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "http.server".into(),
+                "11594".into(),
+                "--bind".into(),
+                "127.0.0.1".into(),
+                "--directory".into(),
+                "web/dist".into(),
+            ],
+            cwd: Some("business/ai-customer-insight".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        "customer-insight-api" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "http.server".into(),
+                "11501".into(),
+                "--bind".into(),
+                "127.0.0.1".into(),
+                "--directory".into(),
+                "web/dist".into(),
+            ],
+            cwd: Some("business/ai-customer-insight".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        // apparelmockup 拆出的 web 静态分发 (无 /health → TCP 探活)
+        "ai-apparelmockup-web" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "http.server".into(),
+                "11593".into(),
                 "--bind".into(),
                 "127.0.0.1".into(),
                 "--directory".into(),
@@ -458,7 +589,7 @@ mod tests {
     // issue #45: business 平台三个 arg-less start.sh → daemonize + cwd + env
     #[test]
     fn test_issue42_business_daemon_specs() {
-        let spec = start_spec_for("fit-ai").unwrap();
+        let spec = start_spec_for("ai-fit").unwrap();
         match &spec {
             StartSpec::Daemon {
                 bin,
@@ -469,10 +600,14 @@ mod tests {
             } => {
                 assert_eq!(bin, ".venv/bin/python");
                 assert!(args.contains(&"server.main:app".to_string()));
-                assert_eq!(cwd.as_deref(), Some("business/fit-ai"));
-                assert!(env.is_empty(), "fit-ai 无固定 env (key 走 env_map)");
+                assert!(
+                    !args.contains(&"--app-dir".to_string()),
+                    "uvicorn 应从 repo 根导入"
+                );
+                assert_eq!(cwd.as_deref(), Some("business/ai-fit"));
+                assert!(env.is_empty(), "ai-fit 无固定 env (key 走 env_map)");
             }
-            _ => panic!("fit-ai 应为 Daemon spec"),
+            _ => panic!("ai-fit 应为 Daemon spec"),
         }
 
         let spec = start_spec_for("ai-speech-exam").unwrap();
@@ -490,14 +625,91 @@ mod tests {
             _ => panic!("ai-speech-exam 应为 Daemon spec"),
         }
 
+        // issue #55: apparelmockup 上游改 FastAPI — 不再是 http.server
         let spec = start_spec_for("ai-apparelmockup").unwrap();
         match &spec {
             StartSpec::Daemon { args, cwd, .. } => {
-                assert!(args.contains(&"http.server".to_string()));
+                assert!(args.contains(&"server.app:app".to_string()));
                 assert!(args.contains(&"11520".to_string()));
+                assert!(!args.contains(&"http.server".to_string()));
                 assert_eq!(cwd.as_deref(), Some("business/ai-apparelmockup"));
             }
             _ => panic!("ai-apparelmockup 应为 Daemon spec"),
+        }
+    }
+
+    // issue #55: 批量登记条目 — 端口钉死 (上游 config 默认口未迁移),
+    // 无 CLI 端口参数的走 env, 共享 repo 双条目 cwd 一致
+    #[test]
+    fn test_issue55_business_batch_specs() {
+        for (name, module, port) in [
+            ("ai-charactervoice", "svc_api.app:app", "11505"),
+            ("ai-charactervoice-session", "svc_session.app:app", "11506"),
+        ] {
+            let spec = start_spec_for(name).unwrap();
+            match &spec {
+                StartSpec::Daemon { args, cwd, .. } => {
+                    assert!(args.contains(&module.to_string()), "{name}: {args:?}");
+                    assert!(
+                        args.contains(&"--port".to_string()) && args.contains(&port.to_string()),
+                        "{name} 端口须钉死 {port}: {args:?}"
+                    );
+                    assert_eq!(cwd.as_deref(), Some("business/ai-charactervoice"));
+                }
+                _ => panic!("{name} 应为 Daemon spec"),
+            }
+        }
+
+        let spec = start_spec_for("ai-information-search").unwrap();
+        match &spec {
+            StartSpec::Daemon { env, cwd, .. } => {
+                assert!(
+                    env.iter()
+                        .any(|(k, v)| k == "FUSION_AI_INFORMATION_SEARCH_PORT" && v == "11595")
+                );
+                assert_eq!(cwd.as_deref(), Some("business/ai-information-search"));
+            }
+            _ => panic!("ai-information-search 应为 Daemon spec"),
+        }
+
+        let spec = start_spec_for("ai-OperaBase").unwrap();
+        match &spec {
+            StartSpec::Daemon { env, cwd, .. } => {
+                assert!(
+                    env.iter()
+                        .any(|(k, v)| k == "FUSION_AI_OPERABASE_PORT" && v == "11504")
+                );
+                assert_eq!(cwd.as_deref(), Some("business/ai-OperaBase"));
+            }
+            _ => panic!("ai-operabase 应为 Daemon spec"),
+        }
+
+        for (name, port) in [
+            ("customer-insight", "11594"),
+            ("customer-insight-api", "11501"),
+            ("ai-apparelmockup-web", "11593"),
+        ] {
+            let spec = start_spec_for(name).unwrap();
+            match &spec {
+                StartSpec::Daemon { args, cwd, .. } => {
+                    assert!(args.contains(&"http.server".to_string()));
+                    assert!(args.contains(&port.to_string()), "{name}: {args:?}");
+                    assert!(args.contains(&"web/dist".to_string()));
+                    assert!(cwd.is_some());
+                }
+                _ => panic!("{name} 应为 Daemon spec"),
+            }
+        }
+
+        for name in ["ai-ads-videobuilder", "ai-doc-automation"] {
+            let spec = start_spec_for(name).unwrap();
+            match &spec {
+                StartSpec::Daemon { args, .. } => {
+                    assert!(args.contains(&"serve".to_string()), "{name}: {args:?}");
+                    assert!(args.contains(&"--port".to_string()));
+                }
+                _ => panic!("{name} 应为 Daemon spec"),
+            }
         }
     }
 

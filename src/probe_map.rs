@@ -68,13 +68,28 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-smallbusiness", ProbeSpec::http(11490, "/health"));
     // issue #33: 仿真 gRPC 服务无 HTTP 面, TCP 端口探活 (:11447)
     m.insert("fusion-simulation", ProbeSpec::tcp(11447));
-    // issue #45: business 平台探活 — fit-ai 公开健康口 (server/main.py 同款鉴权豁免),
+    // issue #45: business 平台探活 — ai-fit 公开健康口 (server/main.py 同款鉴权豁免),
     // speech-exam /health 无鉴权; ai-family 全 router 挂 verify_service_key (恒 401)
     // 与 apparelmockup (静态 http.server 无 /health, 恒 404=BadPath 不重启) 退 TCP
-    m.insert("fit-ai", ProbeSpec::http(11510, "/api/v1/system/health"));
+    m.insert("ai-fit", ProbeSpec::http(11510, "/api/v1/system/health"));
     m.insert("ai-speech-exam", ProbeSpec::http(11560, "/health"));
     m.insert("ai-family", ProbeSpec::tcp(11483));
+    // issue #55: apparelmockup 上游已改 FastAPI 但未见公开健康口 → 保守 TCP
     m.insert("ai-apparelmockup", ProbeSpec::tcp(11520));
+    // issue #55: 批量登记条目 — 有鉴权豁免 /health 的走 HTTP, 其余 (ads_vb /
+    // operabase 未见公开健康口, 静态 http.server 恒 404) 退 TCP
+    m.insert("ai-doc-automation", ProbeSpec::http(11550, "/health"));
+    m.insert("ai-information-search", ProbeSpec::http(11595, "/health"));
+    m.insert("ai-charactervoice", ProbeSpec::http(11505, "/health"));
+    m.insert(
+        "ai-charactervoice-session",
+        ProbeSpec::http(11506, "/health"),
+    );
+    m.insert("ai-ads-videobuilder", ProbeSpec::tcp(11531));
+    m.insert("ai-OperaBase", ProbeSpec::tcp(11504));
+    m.insert("customer-insight", ProbeSpec::tcp(11594));
+    m.insert("customer-insight-api", ProbeSpec::tcp(11501));
+    m.insert("ai-apparelmockup-web", ProbeSpec::tcp(11593));
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -230,7 +245,7 @@ mod tests {
     // issue #45: business 平台探活 — fit-ai/speech-exam HTTP, family/apparelmockup TCP
     #[test]
     fn test_issue42_business_probe_specs() {
-        let s = probe_spec_for("fit-ai", 11510);
+        let s = probe_spec_for("ai-fit", 11510);
         assert!(matches!(s.kind, ProbeKind::Http));
         assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
 
@@ -249,9 +264,12 @@ mod tests {
     #[test]
     fn test_issue42_restart_cmd_business() {
         assert_eq!(restart_cmd_for("ai-family"), "stop+start");
-        assert_eq!(restart_cmd_for("fit-ai"), "stop+start");
+        assert_eq!(restart_cmd_for("ai-fit"), "stop+start");
         assert_eq!(restart_cmd_for("ai-speech-exam"), "stop+start");
         assert_eq!(restart_cmd_for("ai-apparelmockup"), "stop+start");
+        // issue #55: 新批量条目同为 start_map 覆盖 → stop+start
+        assert_eq!(restart_cmd_for("ai-charactervoice"), "stop+start");
+        assert_eq!(restart_cmd_for("customer-insight"), "stop+start");
     }
 
     #[test]
