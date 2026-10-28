@@ -59,15 +59,31 @@ Four business services are registered in `architecture/port-registry.yaml` WITHO
 | Service | Port | Start command (start_map Daemon spec) | Probe |
 |---|---|---|---|
 | ai-family | 11483 | `bash business/ai-family/start.sh start` (default path; proper start/stop/status case statement) | TCP (every router is `verify_service_key`-gated — HTTP would 401 forever) |
-| fit-ai | 11510 | daemonized `uvicorn server.main:app --app-dir server --port 11510`, cwd `business/fit-ai` | HTTP `/api/v1/system/health` (auth-exempt) |
+| ai-fit | 11510 | daemonized `uvicorn server.main:app --port 11510`, cwd `business/ai-fit` (issue #55: registry key and dir both renamed `fit-ai`→`ai-fit`; dropped the broken `--app-dir server` — uvicorn imports from repo root) | HTTP `/api/v1/system/health` (auth-exempt) |
 | ai-speech-exam | 11560 | daemonized `uvicorn app.main:app --app-dir backend --port 11560`, cwd `business/ai-speech-exam`, env `FUSION_AI_SPEECH_EXAM_CONFIG=config/config.yaml` | HTTP `/health` (unauthenticated) |
-| ai-apparelmockup | 11520 | daemonized `python -m http.server 11520 --directory web/dist`, cwd `business/ai-apparelmockup` | TCP (static server, no `/health` — HTTP would 404 = BadPath forever) |
+| ai-apparelmockup | 11520 | daemonized `uvicorn server.app:app --port 11520`, cwd `business/ai-apparelmockup` (issue #55: upstream switched from static http.server to FastAPI) | TCP (no public health route observed — HTTP could 404 = BadPath forever) |
+
+Issue #55 extends the business plane to the 2026-10-27/28 port-governance batch (all `StartSpec::Daemon`, pinned to registry ports where upstream defaults still disagree):
+
+| Service | Port | Start command | Probe |
+|---|---|---|---|
+| ai-ads-videobuilder | 11531 | `python -m ads_vb.cli serve --port 11531`, cwd `business/ai-ads-videobuilder` | TCP (no public health route) |
+| ai-doc-automation | 11550 | `python -m backend.cli serve --port 11550`, cwd `business/ai-doc-automation` | HTTP `/health` |
+| ai-information-search | 11595 | `python -m backend.app`, env `FUSION_AI_INFORMATION_SEARCH_PORT=11595`, cwd `business/ai-information-search` | HTTP `/health` (auth-exempt) |
+| ai-OperaBase | 11504 | `python -m fusion_ai_operabase.main`, env `FUSION_AI_OPERABASE_PORT=11504`, cwd `business/ai-OperaBase` (dir casing ≠ registry key) | TCP (no public health route) |
+| ai-charactervoice | 11505 | `uvicorn svc_api.app:app --port 11505`, cwd `business/ai-charactervoice` (config default 11480 — port pinned until upstream migration lands) | HTTP `/health` |
+| ai-charactervoice-session | 11506 | `uvicorn svc_session.app:app --port 11506`, same repo as above (default 11481) | HTTP `/health` |
+| customer-insight | 11594 | `python -m http.server 11594 --directory web/dist`, cwd `business/ai-customer-insight` | TCP (static server) |
+| customer-insight-api | 11501 | `python -m http.server 11501 --directory web/dist`, same repo (serves static until the real API lands upstream) | TCP (static server) |
+| ai-apparelmockup-web | 11593 | `python -m http.server 11593 --directory web/dist`, cwd `business/ai-apparelmockup` | TCP (static server) |
+
+Three registry entries are explicitly exempted (`supervise: false`) until their upstream blockers clear: `ai-ads-videobuilder-web-dev` (dev-only vite server), `envipermit` (containerized design; its deploy compose maps API 11510 which now collides with ai-fit), `ai-surlsch00l-bookingagent` (`surl-agent serve` hardcodes 11570 ≠ registry 11507; migration TASK pending upstream, no git remote to file an issue).
 
 Three hazards drove the design:
 
 1. **Repo-dir mapping**: `manifest::name_to_dir` maps the registry keys to `business/<name>` (default `~/fusion/<name>` does not exist — every start path failed closed).
-2. **Arg-less start.sh**: `fit-ai`/`ai-speech-exam`/`ai-apparelmockup` start.sh scripts `exec` a foreground process and IGNORE subcommand args — `bash start.sh stop` would START the service. They are taken over via `StartSpec::Daemon` (issue #34 pattern), which now supports `cwd` (resolved against `FUSION_ROOT`) and app-internal `env`. Daemon pid discipline: `mkdir`/`cd ... || exit 1`/`export` joined with `;` (never `&&` — `A && B &` backgrounds the whole list and the pidfile would hold the subshell pid, orphaning the service on stop).
-3. **FUSION_CLIENT_KEY injection**: the three uvicorn/http.server apps fail-closed at boot without `FUSION_CLIENT_KEY` (`: "${FUSION_CLIENT_KEY:?}"`). `env_map::shell_env_for` injects it on every spawn path (up_all/up_one/crash-restart): process env → `.env` → read-only fallback to `fusion-gateway/config.yaml` `auth.api_keys` (prefers the `name=admin` entry). All three sources missing → the supervisor refuses to start the service (fail-closed) rather than spawn a guaranteed crash-loop. `ai-family` is deliberately excluded — it runs its own `verify_service_key` auth and never consumes the key.
+2. **Arg-less start.sh**: `ai-speech-exam` (and formerly `fit-ai`/`ai-apparelmockup`) start.sh scripts `exec` a foreground process and IGNORE subcommand args — `bash start.sh stop` would START the service. They are taken over via `StartSpec::Daemon` (issue #34 pattern), which now supports `cwd` (resolved against `FUSION_ROOT`) and app-internal `env`. Daemon pid discipline: `mkdir`/`cd ... || exit 1`/`export` joined with `;` (never `&&` — `A && B &` backgrounds the whole list and the pidfile would hold the subshell pid, orphaning the service on stop).
+3. **FUSION_CLIENT_KEY injection**: the FastAPI business apps (issue #55: `ai-fit`, `ai-speech-exam`, `ai-apparelmockup`, `ai-ads-videobuilder`, `ai-doc-automation`, `ai-information-search`, `ai-OperaBase`, `ai-charactervoice` ×2) fail-closed at boot without `FUSION_CLIENT_KEY` (gateway client key, 约定 1 — they call the gateway LLM channel). `env_map::shell_env_for` injects it on every spawn path (up_all/up_one/crash-restart): process env → `.env` → read-only fallback to `fusion-gateway/config.yaml` `auth.api_keys` (prefers the `name=admin` entry). All three sources missing → the supervisor refuses to start the service (fail-closed) rather than spawn a guaranteed crash-loop. `ai-family` (own `verify_service_key` auth) and the pure static hosts (`customer-insight` ×2, `ai-apparelmockup-web` — no gateway calls) are deliberately excluded.
 
 Restart semantics: `ai-family`'s start.sh has no `restart` subcommand, and Daemon-spec services have no restart semantics at all — `restart` falls back to stop+start (`probe_map::restart_cmd_for`).
 
@@ -145,12 +161,12 @@ Four shell module services are supervised with custom start commands + registrat
 
 | Service | Port | Start command | Required env (injected, fail-closed) |
 |---|---|---|---|
-| fusion-cowork-web | 11461 | `fusion-cowork web serve --port 11461` (daemonized w/ pidfile) | `FUSION_SHELL_GATEWAY_URL`, `FUSION_GATEWAY_ADMIN_KEY` |
+| fusion-cowork-web | 11461 | `fusion-cowork web serve --port 11461` (daemonized w/ pidfile) | `FUSION_SHELL_GATEWAY_URL`, `FUSION_ADMIN_KEY` |
 | fusion-trainer-bridge | 8790 | `fusion-trainer/scripts/trainer-bridge.sh start` | `FUSION_TRAINER_BRIDGE_KEY` |
-| fusion-plugins-ecosystem-console | 8795 | `fusion-plugin-console --port 8795` (daemonized w/ pidfile) | `FUSION_SHELL_GATEWAY_URL`, `FUSION_GATEWAY_ADMIN_KEY` |
+| fusion-plugins-ecosystem-console | 8795 | `fusion-plugin-console --port 8795` (daemonized w/ pidfile) | `FUSION_GATEWAY_BASE_URL`, `FUSION_ADMIN_KEY` |
 | fusion-agent-studio | 11442 | `start.sh start` (default path) | — |
 
-Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSION_GATEWAY_ADMIN_KEY` falls back to read-only `web_shell.admin_key` from `fusion-gateway/config.yaml` (same pattern as trainer-bridge.sh); `FUSION_TRAINER_BRIDGE_KEY` has no fallback — put it in `.env` (git-ignored). Gateway is Core layer, modules are App layer, so `up_all` brings up the gateway before the modules register against it.
+Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSION_ADMIN_KEY` (issue #54: renamed from `FUSION_GATEWAY_ADMIN_KEY` per env conventions Phase 2.2) falls back to read-only `web_shell.admin_key` from `fusion-gateway/config.yaml` (same pattern as trainer-bridge.sh); `FUSION_GATEWAY_BASE_URL` (issue #54: renamed from `FUSION_SHELL_GATEWAY_URL`) falls back to `http://127.0.0.1:11432`. `fusion-cowork`'s shell registry still reads the old URL name during the upstream transition window, so `fusion-cowork-web` keeps `FUSION_SHELL_GATEWAY_URL` + `FUSION_ADMIN_KEY`; the plugins console (v0.4.7) reads the new names only. `FUSION_TRAINER_BRIDGE_KEY` has no fallback — put it in `.env` (git-ignored). Gateway is Core layer, modules are App layer, so `up_all` brings up the gateway before the modules register against it.
 
 ## Boundary with existing supervisors
 
@@ -161,7 +177,7 @@ Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSIO
 ## Test
 
 ```bash
-cargo test --all-targets          # 192 test fns (unit + 13 integration files)
+cargo test --all-targets          # 193 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
