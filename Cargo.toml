@@ -1,6 +1,6 @@
 [package]
 name = "fusion-supervisor"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 license = "Apache-2.0"
 description = "Local-first fusion service supervisor and monitor"
