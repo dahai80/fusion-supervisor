@@ -867,40 +867,36 @@ fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> 
     }
 }
 
-// issue #47: 子进程 stderr → 同时写服务日志 + 保留末尾 20 行 (失败根因回传给告警)。
-// 返回 JoinHandle<String>, join 后拿到 tail 文本。
+// issue #51: 子进程 stderr 直接落服务日志文件 — 不再走 pipe + tail 线程。
+// 旧方案 (issue #47) 的 join 依赖 pipe EOF, 但 start.sh 后台化的服务进程 /
+// uvicorn worker 会继承 pipe 写端不关闭, child.wait() 返回后 join 永久阻塞,
+// up_all 持有核心 Mutex 饿死全部 RPC/HTTP (生产事故 2026-10-27, 见 issue #51)。
+// 失败 tail 改为 wait 后从日志文件回读末尾 N 行, 格式契约 "exit code=<n>" 不变。
 const STDERR_TAIL_LINES: usize = 20;
 
-fn spawn_stderr_tail(
-    stderr: Option<std::process::ChildStderr>,
-    log_path: std::path::PathBuf,
-) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-        let mut tail = std::collections::VecDeque::<String>::new();
-        let Some(r) = stderr else {
-            return String::new();
-        };
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&log_path)
-            .ok();
-        if log.is_none() {
-            tracing::warn!(log = %log_path.display(), "open svc log fail, stderr 仅留 tail");
+// 子进程 stderr 重定向目标: 服务日志文件 (truncate 打开; 打不开退化为丢弃)。
+fn open_svc_stderr(svc: &str, log_path: &std::path::Path) -> std::process::Stdio {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(log_path)
+    {
+        Ok(f) => f.into(),
+        Err(e) => {
+            tracing::warn!(svc, err = %e, log = %log_path.display(), "open svc log fail, stderr 丢弃");
+            std::process::Stdio::null()
         }
-        for line in BufReader::new(r).lines().map_while(Result::ok) {
-            if let Some(f) = log.as_mut() {
-                let _ = writeln!(f, "{line}");
-            }
-            if tail.len() == STDERR_TAIL_LINES {
-                tail.pop_front();
-            }
-            tail.push_back(line);
-        }
-        tail.make_contiguous().join("\n")
-    })
+    }
+}
+
+// 从服务日志文件回读末尾 N 行 (失败根因 tail; 文件缺失/读失败返回空串)。
+fn read_log_tail(log_path: &std::path::Path) -> String {
+    let bytes = std::fs::read(log_path).unwrap_or_default();
+    let content = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    lines[start..].join("\n")
 }
 
 // issue #29: 覆盖服务的启动分派。
@@ -934,19 +930,20 @@ fn exec_start_spec(
             for k in crate::env_map::strip_env_for(svc) {
                 command.env_remove(k);
             }
-            // issue #47: stderr 管道捕获 — 写服务日志 + 末尾 20 行进失败信息 (根因回传)。
-            std::fs::create_dir_all(crate::start_map::log_path(svc).parent().unwrap()).ok();
+            // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join,
+            // 后台化孙进程持有 fd 不再阻塞 exec — 见 open_svc_stderr 注释)。
+            let log_path = crate::start_map::log_path(svc);
+            std::fs::create_dir_all(log_path.parent().unwrap()).ok();
             let mut child = command
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
+                .stderr(open_svc_stderr(svc, &log_path))
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("spawn daemon cmd: {e}"))?;
-            let tail_h = spawn_stderr_tail(child.stderr.take(), crate::start_map::log_path(svc));
             let status = child
                 .wait()
                 .map_err(|e| anyhow::anyhow!("wait daemon cmd: {e}"))?;
-            let tail = tail_h.join().unwrap_or_default();
             if !status.success() {
+                let tail = read_log_tail(&log_path);
                 // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
                 match status.code() {
                     Some(c) => anyhow::bail!("daemon cmd {cmd} exit code={c}: {tail}"),
@@ -982,18 +979,18 @@ fn exec_bash_script(
     for k in crate::env_map::strip_env_for(svc) {
         command.env_remove(k);
     }
-    // issue #47: stderr 管道捕获 — 写服务日志 + 末尾 20 行进失败信息 (根因回传)。
+    // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join —
+    // 后台化孙进程持有 pipe 写端曾把 exec 永久挂死, 见 open_svc_stderr 注释)。
     let mut child = command
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(open_svc_stderr(svc, &svc_log))
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn start script: {e}"))?;
-    let tail_h = spawn_stderr_tail(child.stderr.take(), svc_log);
     let status = child
         .wait()
         .map_err(|e| anyhow::anyhow!("wait start script: {e}"))?;
-    let tail = tail_h.join().unwrap_or_default();
     if !status.success() {
+        let tail = read_log_tail(&svc_log);
         // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
         match status.code() {
             Some(c) => anyhow::bail!("script {cmd} exit code={c}: {tail}"),
@@ -1098,6 +1095,24 @@ mod tests {
         assert!(log_content.contains("yaml: unmarshal errors: bad config"));
         // 清理测试过程文件
         let _ = std::fs::remove_file(&log);
+    }
+
+    // issue #51 回归: start.sh 后台化的孙进程继承 stderr 不关闭 — exec 不得等它。
+    // 旧 pipe+join 实现会阻塞到 sleep 退出 (60s), 这里断言 <10s 内返回。
+    #[test]
+    fn test_exec_returns_despite_lingering_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = dir.path().join("linger.sh");
+        std::fs::write(&sh, "#!/bin/bash\nsleep 60 &\nexit 0\n").unwrap();
+        let start = std::time::Instant::now();
+        exec_bash_script("ut-linger", &sh, "start", &[])
+            .expect("exec 应在孙进程仍持有 stderr 时返回");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "不得等待 pipe EOF (旧实现在此挂死, issue #51)"
+        );
+        // 清理测试过程文件 (孙进程 sleep 已被 tempdir 之外清理策略兜底: 60s 后自然退出)
+        let _ = std::fs::remove_file(crate::start_map::log_path("ut-linger"));
     }
 
     // issue #31: up_one/down_one — service 级操作只动目标服务
