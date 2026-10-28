@@ -53,6 +53,10 @@ pub fn name_to_dir(name: &str) -> &str {
     // 前缀, 实际 repo 在 monorepo 根 business/ 子目录下, 默认映射 ~/fusion/<name> 不存在)
     static EXCEPTIONS: &[(&str, &str)] = &[
         ("fusion-code-modelization", "fusion-code-modenization"),
+        // issue #57: registry key 单数, 磁盘实际 repo 目录复数 fusion-multi-nodes
+        // (active v0.20.2, start.sh master 127.0.0.1:11452); 默认映射目录不存在
+        // → start 路径 fail-closed 长期 Failed
+        ("fusion-multi-node", "fusion-multi-nodes"),
         ("ai-family", "business/ai-family"),
         // ai-fit: registry key + actual dir are both ai-fit (issue: boot
         // auto-start failed because the old 'fit-ai' exception pointed to a
@@ -78,21 +82,25 @@ pub fn name_to_dir(name: &str) -> &str {
             return dir;
         }
     }
-    // 子服务 key: fusion-cowork-ws / fusion-security-svc / fusion-multi-node-agent 等 → 父 repo
-    for parent in &[
-        "fusion-cowork",
-        "fusion-security",
-        "fusion-multi-node",
-        "fusion-agent-studio",
-        "fusion-simulation",
-        "fusion-bench",
+    // 子服务 key: fusion-cowork-ws / fusion-security-svc / fusion-multi-node-agent 等 → 父 repo。
+    // (prefix, dir) 二元组: prefix 匹配子服务 key, dir 是父 repo 实际目录 —
+    // issue #57: fusion-multi-node-agent 等 supervise:false 条目若被 logs/start_sh_path
+    // 解析, 也要落进真实存在的 fusion-multi-nodes 目录而非不存在的单数目录
+    for (parent, dir) in &[
+        ("fusion-cowork", "fusion-cowork"),
+        ("fusion-security", "fusion-security"),
+        // issue #57: 父 repo 目录复数, prefix 仍按 registry key 单数匹配
+        ("fusion-multi-node", "fusion-multi-nodes"),
+        ("fusion-agent-studio", "fusion-agent-studio"),
+        ("fusion-simulation", "fusion-simulation"),
+        ("fusion-bench", "fusion-bench"),
         // issue #29: fusion-trainer-bridge → fusion-trainer;
         // fusion-plugins-ecosystem-console → fusion-plugins-ecosystem
-        "fusion-trainer",
-        "fusion-plugins-ecosystem",
+        ("fusion-trainer", "fusion-trainer"),
+        ("fusion-plugins-ecosystem", "fusion-plugins-ecosystem"),
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
-            return parent;
+            return dir;
         }
     }
     name
@@ -292,6 +300,16 @@ external_tools: []
             name_to_dir("fusion-plugins-ecosystem"),
             "fusion-plugins-ecosystem"
         );
+    }
+
+    // issue #57: registry key fusion-multi-node 单数, 磁盘 repo 目录复数
+    // fusion-multi-nodes — 裸 key 走 EXCEPTIONS, 子服务 key 走 prefix 循环, 两者都必须
+    // 落进真实存在的复数目录 (否则 start 路径 fail-closed 长期 Failed)
+    #[test]
+    fn test_name_to_dir_multi_node_plural_dir() {
+        assert_eq!(name_to_dir("fusion-multi-node"), "fusion-multi-nodes");
+        assert_eq!(name_to_dir("fusion-multi-node-agent"), "fusion-multi-nodes");
+        assert_eq!(name_to_dir("fusion-multi-node-mcp"), "fusion-multi-nodes");
     }
 
     // issue #29: 四个 shell 模块服务应落 App 层 (gateway 在 Core 层先起,
