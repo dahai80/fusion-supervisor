@@ -64,6 +64,8 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-plugins-ecosystem", ProbeSpec::tcp(8765));
     // issue #33: fs-serve /health (deploy/start.sh, :11463)
     m.insert("fusion-store", ProbeSpec::http(11463, "/health"));
+    // osagent issue#6: Prometheus 抓取口, /metrics 无鉴权恒 200 (:11571)
+    m.insert("fusion-osagent-metrics", ProbeSpec::http(11571, "/metrics"));
     // issue #33: fsb uvicorn /health (:11490)
     m.insert("fusion-smallbusiness", ProbeSpec::http(11490, "/health"));
     // issue #33: 仿真 gRPC 服务无 HTTP 面, TCP 端口探活 (:11447)

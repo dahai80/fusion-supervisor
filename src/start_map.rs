@@ -72,6 +72,13 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         // issue #33: fusion-smallbusiness 无 start.sh, CLI 入口直接跑 uvicorn
         // (口由 FSB env 决定, 探活见 probe_map)
         "fusion-smallbusiness" => Some(daemon("fusion-smallbusiness", &[])),
+        // osagent issue#6: serve-metrics 迁 9100→11571 后由 supervisor 接管 —
+        // fusion-osagent 无 start.sh, serve-metrics 是前台 CLI 进程 (proctitle
+        // `fusion-osagent serve-metrics :11571`), daemonize 接管
+        "fusion-osagent-metrics" => Some(daemon(
+            "fusion-osagent",
+            &["serve-metrics", "--port", "11571"],
+        )),
         // issue #33: fusion-simulation 无 start.sh, `fusion-sim service start`
         // 前台阻塞进程 (gRPC :11447 + metrics :11456, --gui 起 Web GUI :11455);
         // registry 的 -gui/-metrics 条目由该进程内嵌服务, 已 supervise:false
@@ -719,6 +726,23 @@ mod tests {
                 }
                 _ => panic!("{name} 应为 Daemon spec"),
             }
+        }
+
+        // osagent issue#6: serve-metrics Daemon spec (9100→11571 迁移后接管)
+        let spec = start_spec_for("fusion-osagent-metrics").unwrap();
+        match &spec {
+            StartSpec::Daemon {
+                bin,
+                args,
+                cwd,
+                env,
+                env_file,
+            } => {
+                assert_eq!(bin, "fusion-osagent");
+                assert_eq!(args, &["serve-metrics", "--port", "11571"]);
+                assert!(cwd.is_none() && env.is_empty() && env_file.is_none());
+            }
+            _ => panic!("fusion-osagent-metrics 应为 Daemon spec"),
         }
     }
 
