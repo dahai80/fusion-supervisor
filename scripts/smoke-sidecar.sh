@@ -23,14 +23,15 @@ OVERLAY="$ROOT/docker-compose.business.yml"
 ENV_FILE="${FUSION_ENV_FILE:-$ROOT/.env}"
 
 # fail-closed env: sidecar compose requires FUSION_PG_PASSWORD; business requires
-# FUSION_MLX_API_KEY. Bootstrap a temp .env if none so the harness is self-contained.
+# FUSION_CLIENT_KEY (canonical 名, config Phase 3). Bootstrap a temp .env if none
+# so the harness is self-contained.
 ensure_env() {
     if [ ! -f "$ENV_FILE" ]; then
         log "  no .env found, bootstrapping temp env"
         ENV_FILE="$LOG_DIR/.env"
         {
             echo "FUSION_PG_PASSWORD=smoke-pass-$$"
-            echo "FUSION_MLX_API_KEY=smoke-mlx-key"
+            echo "FUSION_CLIENT_KEY=smoke-client-key"
         } > "$ENV_FILE"
     fi
 }

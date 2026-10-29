@@ -22,7 +22,7 @@ trap cleanup EXIT
 cp docker-compose.sidecar.yml "$WORK/sidecar.yml"
 cp docker-compose.business.yml "$WORK/business.yml"
 echo "FUSION_PG_PASSWORD=test-pass" > "$WORK/.env"
-echo "FUSION_MLX_API_KEY=test-key" >> "$WORK/.env"
+echo "FUSION_CLIENT_KEY=test-key" >> "$WORK/.env"
 
 export SMOKE_LOG_DIR="$WORK/logs"; mkdir -p "$SMOKE_LOG_DIR"
 export FUSION_ENV_FILE="$WORK/.env"

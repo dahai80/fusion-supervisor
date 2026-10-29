@@ -27,7 +27,7 @@ services:
     ports: ["11444:11444"]
     environment:
       FUSION_MLX_URL: "http://host.docker.internal:11434"
-      FUSION_MLX_API_KEY: "${FUSION_MLX_API_KEY:?必须设置 FUSION_MLX_API_KEY — fusion-mlx 启用的 api_key}"
+      FUSION_CLIENT_KEY: "${FUSION_CLIENT_KEY:?必须设置 FUSION_CLIENT_KEY — 网关客户端 key (canonical 名, alias 链在 fusion-core)}"
       # sidecar 中间件连接 (issue #1): 共享 PG/Redis 实例, 各 app 按库名连
       DATABASE_URL: "postgresql://${FUSION_PG_USER:-fusion}:${FUSION_PG_PASSWORD}@postgres:5432/${FUSION_MODELHUB_DB:-modelhub}"
       REDIS_URL: "redis://redis:6379/0"
@@ -60,7 +60,7 @@ services:
     ports: ["11438:11438"]
     environment:
       FUSION_MLX_URL: "http://host.docker.internal:11434"
-      FUSION_MLX_API_KEY: "${FUSION_MLX_API_KEY:?必须设置 FUSION_MLX_API_KEY}"
+      FUSION_CLIENT_KEY: "${FUSION_CLIENT_KEY:?必须设置 FUSION_CLIENT_KEY}"
       DATABASE_URL: "postgresql://${FUSION_PG_USER:-fusion}:${FUSION_PG_PASSWORD}@postgres:5432/${FUSION_COWORK_DB:-cowork}"
       REDIS_URL: "redis://redis:6379/1"
     extra_hosts: ["host.docker.internal:host-gateway"]
