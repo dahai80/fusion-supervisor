@@ -378,11 +378,20 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     ))
 }
 
-// daemonize stop 命令: pidfile kill + 清理
+// daemonize stop 命令: pidfile kill + 宽限等待 + 升级 SIGKILL + 清理。
+// 部分前台化服务 (如 fusion-k12-teacher) 忽略 SIGTERM (优雅关闭卡死), 只 TERM
+// 会出现 down 返回 ok / pidfile 已删 / 进程仍存活的假停止 — 必须 -9 兜底。
+// 宽限 5s (25×0.2s), 正常进程 <1s 退出即提前跳出; 死循环等价 5s 阻塞, 逐服务串行可接受。
 pub fn daemon_stop_cmd(svc: &str) -> String {
     let pid = pid_path(svc);
     format!(
-        "kill \"$(cat '{pid}')\" 2>/dev/null; rm -f '{pid}'",
+        "p=$(cat '{pid}' 2>/dev/null || true); \
+         if [ -n \"$p\" ]; then \
+           kill \"$p\" 2>/dev/null || true; \
+           i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
+           kill -0 \"$p\" 2>/dev/null && kill -9 \"$p\" 2>/dev/null || true; \
+         fi; \
+         rm -f '{pid}'",
         pid = pid.display()
     )
 }
@@ -740,7 +749,17 @@ mod tests {
             cmd.contains("fusion-cowork-web.pid"),
             "stop 应读 pidfile: {cmd}"
         );
+        assert!(cmd.contains("kill -9"), "stop 应升级 SIGKILL: {cmd}");
         assert!(cmd.contains("rm -f"), "stop 应清 pidfile: {cmd}");
+    }
+
+    // 忽略 SIGTERM 的服务必须被升级击杀 (生产 bug: k12 down 后进程仍存活)
+    #[test]
+    fn test_daemon_stop_cmd_sigterm_escalation() {
+        let cmd = daemon_stop_cmd("fusion-k12-teacher");
+        assert!(cmd.contains("kill -0 \"$p\""), "应轮询进程存活: {cmd}");
+        assert!(cmd.contains("kill -9 \"$p\""), "TERM 后仍存活应 -9: {cmd}");
+        assert!(cmd.contains("rm -f"), "击杀后清 pidfile: {cmd}");
     }
 
     // issue #49: k12 daemonize 前必须 source 项目自身 .env (唯一真源, 覆盖 daemon

@@ -186,6 +186,11 @@ impl ServiceRunner {
             // issue #49: 同一根因每 tick (2s) 重复告警刷爆日志 — 只在状态转移进
             // Unhealthy 的首次告警, 持续 Unhealthy 期间静默; 恢复 Healthy 后
             // 再失败会重新告警 (状态机复位即解除静默)。
+            // Stopped/Failed/Draining 探活失败不改状态 — 手动停止的服务
+            // (down_one) 不能被下一 tick 翻回 Unhealthy 变红。
+            if matches!(self.state, State::Stopped | State::Failed | State::Draining) {
+                return;
+            }
             let first_transition = !matches!(self.state, State::Unhealthy);
             self.state = State::Unhealthy;
             if first_transition {
@@ -464,6 +469,21 @@ mod tests {
         assert!(matches!(r.state, State::Unhealthy));
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(r.policy.crash_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stopped_stays_stopped_on_probe_fail() {
+        // 手动 down 的服务 (Stopped) 探活失败不得翻回 Unhealthy (否则 tray 变红)
+        let (_, _, pf, sf) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::UdsConnectFailed,
+        });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Stopped;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        r.tick(1000, &s, &mut al).await.unwrap();
+        r.tick(1002, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Stopped));
     }
 
     #[tokio::test]
