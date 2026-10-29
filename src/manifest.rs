@@ -134,6 +134,9 @@ pub fn name_to_dir(name: &str) -> &str {
         // fusion-plugins-ecosystem-console → fusion-plugins-ecosystem
         ("fusion-trainer", "fusion-trainer"),
         ("fusion-plugins-ecosystem", "fusion-plugins-ecosystem"),
+        // osagent issue#6: registry 只有 fusion-osagent-metrics 子服务 key,
+        // 磁盘 repo 是 fusion-osagent (无 start.sh, 启动见 start_map Daemon spec)
+        ("fusion-osagent", "fusion-osagent"),
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
             return dir;
@@ -347,6 +350,13 @@ external_tools: []
         assert_eq!(name_to_dir("fusion-multi-node"), "fusion-multi-nodes");
         assert_eq!(name_to_dir("fusion-multi-node-agent"), "fusion-multi-nodes");
         assert_eq!(name_to_dir("fusion-multi-node-mcp"), "fusion-multi-nodes");
+    }
+
+    // osagent issue#6: fusion-osagent-metrics 子服务 key 落真实 repo 目录
+    // fusion-osagent (start 路径不再指向不存在的 fusion-osagent-metrics/)
+    #[test]
+    fn test_name_to_dir_osagent_metrics_parent() {
+        assert_eq!(name_to_dir("fusion-osagent-metrics"), "fusion-osagent");
     }
 
     // issue #29: 四个 shell 模块服务应落 App 层 (gateway 在 Core 层先起,
