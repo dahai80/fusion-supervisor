@@ -28,6 +28,30 @@ pub struct EventRow {
     pub severity: String,
 }
 
+// PRD app-tiering: 个人启动覆盖。pin 覆盖 > 注册表 boot: 字段; 存本机 SQLite, 重启不丢。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinMode {
+    Auto,
+    Manual,
+}
+
+impl PinMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinMode::Auto => "auto",
+            PinMode::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PinMode> {
+        match s {
+            "auto" => Some(PinMode::Auto),
+            "manual" => Some(PinMode::Manual),
+            _ => None,
+        }
+    }
+}
+
 impl HistoryStore {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent()
@@ -54,6 +78,10 @@ impl HistoryStore {
                  detail TEXT NOT NULL,
                  plane TEXT NOT NULL DEFAULT 'native',
                  severity TEXT NOT NULL DEFAULT 'warn'
+             );
+             CREATE TABLE IF NOT EXISTS boot_pin (
+                 service TEXT PRIMARY KEY,
+                 mode TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_health_svc ON health_check(service, ts);
              CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
@@ -156,6 +184,46 @@ impl HistoryStore {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    // PRD app-tiering: 写/清个人启动覆盖。None = 清除 (回到注册表 boot: 字段语义)。
+    pub fn set_boot_pin(&self, service: &str, mode: Option<PinMode>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match mode {
+            Some(m) => {
+                conn.execute(
+                    "INSERT INTO boot_pin(service, mode) VALUES (?, ?)
+                     ON CONFLICT(service) DO UPDATE SET mode = excluded.mode",
+                    params![service, m.as_str()],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM boot_pin WHERE service = ?", params![service])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_boot_pin(&self, service: &str) -> Result<Option<PinMode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT mode FROM boot_pin WHERE service = ?")?;
+        let mut rows = stmt.query_map(params![service], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(Ok(mode)) => Ok(PinMode::parse(&mode)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn all_boot_pins(&self) -> Result<Vec<(String, PinMode)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT service, mode FROM boot_pin")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(svc, mode)| PinMode::parse(&mode).map(|m| (svc, m)))
+            .collect())
     }
 
     // issue #25: 全局事件流 (web 告警列表数据源) — 跨服务最近事件, 时间升序返回。
@@ -423,5 +491,47 @@ mod tests {
             .unwrap();
         let new_rows = s.recent_health("redis", 10).unwrap();
         assert_eq!(new_rows[0].plane, "compose");
+    }
+
+    // PRD app-tiering: boot_pin 存取 — set/get/覆盖/清除/全量
+    #[test]
+    fn test_boot_pin_set_get_clear() {
+        let s = open_mem();
+        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), None, "无 pin 记录");
+        s.set_boot_pin("fusion-rag", Some(PinMode::Auto)).unwrap();
+        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), Some(PinMode::Auto));
+        // 覆盖写
+        s.set_boot_pin("fusion-rag", Some(PinMode::Manual)).unwrap();
+        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), Some(PinMode::Manual));
+        // 清除 = 回到注册表语义
+        s.set_boot_pin("fusion-rag", None).unwrap();
+        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), None);
+    }
+
+    #[test]
+    fn test_boot_pin_all_and_persistence() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let s = HistoryStore::open(tmp.path()).unwrap();
+            s.set_boot_pin("fusion-rag", Some(PinMode::Auto)).unwrap();
+            s.set_boot_pin("fusion-health", Some(PinMode::Manual))
+                .unwrap();
+        }
+        // 重开 (模拟 daemon 重启) — pin 不丢 (验收 §5.4)
+        let s = HistoryStore::open(tmp.path()).unwrap();
+        let mut pins = s.all_boot_pins().unwrap();
+        pins.sort();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0], ("fusion-health".into(), PinMode::Manual));
+        assert_eq!(pins[1], ("fusion-rag".into(), PinMode::Auto));
+    }
+
+    #[test]
+    fn test_pin_mode_parse() {
+        assert_eq!(PinMode::parse("auto"), Some(PinMode::Auto));
+        assert_eq!(PinMode::parse("manual"), Some(PinMode::Manual));
+        assert_eq!(PinMode::parse("bogus"), None);
+        assert_eq!(PinMode::Auto.as_str(), "auto");
+        assert_eq!(PinMode::Manual.as_str(), "manual");
     }
 }

@@ -6,6 +6,8 @@
 //   GET  /api/v1/history?service=&limit=   单服务健康历史 (issue #25)
 //   GET  /api/v1/events?limit=            全局事件流, 告警列表数据源 (issue #25)
 //   GET  /api/v1/logs?service=            日志 tail (复用 RPC dispatch)
+//   GET  /api/v1/boot                     boot 分级面 (issue #62, 只读无 token)
+//   POST /api/v1/boot/pin|boot/group      pin 覆盖 / 分组批量 (issue #62, token)
 //   POST /api/v1/{up,down,restart,drain,rollout,backup,shutdown}
 //                                编排操作 — 复用 UDS dispatch, 同一 token 语义
 //                                (issue #25; Authorization: Bearer / x-token)
@@ -151,6 +153,55 @@ async fn route(
             };
             http_text("200 OK", "application/json", &body)
         }
+        // PRD app-tiering (issue #62): boot 分级面 — GET 只读无 token (与 status 对齐),
+        // POST pin/group 走 dispatch_http 复用 token 校验。
+        ("GET", "/api/v1/boot") => {
+            let body = {
+                let c = core.lock().await;
+                serde_json::to_string(&c.boot_status()).unwrap_or_else(|_| "[]".into())
+            };
+            http_text("200 OK", "application/json", &body)
+        }
+        ("POST", "/api/v1/boot/pin") => {
+            let resp = crate::rpc::server::dispatch_http(
+                "boot.pin",
+                boot_post_params(&req.body, &req.token),
+                core,
+                token,
+                shutdown_tx,
+            )
+            .await;
+            let status = if resp.error.is_some() {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            http_text(
+                status,
+                "application/json",
+                &serde_json::to_string(&resp).unwrap_or_default(),
+            )
+        }
+        ("POST", "/api/v1/boot/group") => {
+            let resp = crate::rpc::server::dispatch_http(
+                "boot.group",
+                boot_post_params(&req.body, &req.token),
+                core,
+                token,
+                shutdown_tx,
+            )
+            .await;
+            let status = if resp.error.is_some() {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            http_text(
+                status,
+                "application/json",
+                &serde_json::to_string(&resp).unwrap_or_default(),
+            )
+        }
         ("GET", "/api/v1/history") => {
             let service = query_param(&req.query, "service").unwrap_or_default();
             if service.is_empty() {
@@ -277,6 +328,19 @@ fn http_text(status: &str, content_type: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+// boot POST 端点参数: JSON body + Bearer/x-token → params.token (与 catch-all 同语义)。
+fn boot_post_params(body: &str, token: &str) -> serde_json::Value {
+    let mut params: serde_json::Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(body).unwrap_or(json!({}))
+    };
+    if !token.is_empty() {
+        params["token"] = json!(token);
+    }
+    params
 }
 
 // 静态文件: "/" → index.html; 其余按路径取 (拒绝 ..); 未配置目录 → 404。

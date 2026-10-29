@@ -42,6 +42,10 @@ pub enum Method {
     Rollout,
     // issue #10: NAS 备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)
     Backup,
+    // PRD app-tiering (issue #62): boot 分级启动面
+    Boot,
+    BootPin,
+    BootGroup,
 }
 
 pub fn parse_method(s: &str) -> Option<Method> {
@@ -57,6 +61,9 @@ pub fn parse_method(s: &str) -> Option<Method> {
         "drain" => Some(Method::Drain),
         "rollout" => Some(Method::Rollout),
         "backup" => Some(Method::Backup),
+        "boot" => Some(Method::Boot),
+        "boot.pin" => Some(Method::BootPin),
+        "boot.group" => Some(Method::BootGroup),
         _ => None,
     }
 }
@@ -93,6 +100,13 @@ mod tests {
         assert!(matches!(parse_method("up"), Some(Method::Up)));
         assert!(matches!(parse_method("ping"), Some(Method::Ping)));
         assert!(matches!(parse_method("SHUTDOWN"), Some(Method::Shutdown)));
+        // PRD app-tiering: boot 三方法解析
+        assert!(matches!(parse_method("boot"), Some(Method::Boot)));
+        assert!(matches!(parse_method("boot.pin"), Some(Method::BootPin)));
+        assert!(matches!(
+            parse_method("BOOT.GROUP"),
+            Some(Method::BootGroup)
+        ));
     }
 
     #[test]

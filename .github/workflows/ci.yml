@@ -11,14 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --all-targets
+      - run: cargo check --workspace --all-targets
 
   test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-targets
+      - run: cargo test --workspace --all-targets
 
   fmt:
     runs-on: macos-latest
@@ -36,15 +36,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --workspace
       - uses: actions/upload-artifact@v4
         with:
           name: fusion-sv
           path: target/release/fusion-sv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion-tray
+          path: target/release/fusion-tray

@@ -267,6 +267,55 @@ async fn dispatch(
                 }
             }
         }
+        // PRD app-tiering (issue #62): boot 分级启动面
+        Some(Method::Boot) => {
+            let c = core.lock().await;
+            make_result(json!(c.boot_status()), req.id)
+        }
+        Some(Method::BootPin) => {
+            let svc = match req.params.get("service").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return make_error(-32602, "invalid params: service required", req.id),
+            };
+            let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
+                Some("auto") => Some(crate::store::PinMode::Auto),
+                Some("manual") => Some(crate::store::PinMode::Manual),
+                Some("clear") => None,
+                _ => {
+                    return make_error(
+                        -32602,
+                        "invalid params: mode must be auto|manual|clear",
+                        req.id,
+                    );
+                }
+            };
+            let mut c = core.lock().await;
+            match c.set_boot_pin(&svc, mode) {
+                Ok(()) => {
+                    tracing::info!(svc = %svc, "boot pin updated (rpc)");
+                    make_result(json!("ok"), req.id)
+                }
+                Err(e) => make_error(-32000, &e.to_string(), req.id),
+            }
+        }
+        Some(Method::BootGroup) => {
+            let group = match req.params.get("group").and_then(|v| v.as_str()) {
+                Some(g) => g.to_string(),
+                _ => return make_error(-32602, "invalid params: group required", req.id),
+            };
+            let action = match req.params.get("action").and_then(|v| v.as_str()) {
+                Some(a) => a.to_string(),
+                _ => return make_error(-32602, "invalid params: action required", req.id),
+            };
+            let mut c = core.lock().await;
+            match c.boot_group(&group, &action).await {
+                Ok(summary) => {
+                    tracing::info!(group = %group, action = %action, "boot group done (rpc)");
+                    make_result(summary, req.id)
+                }
+                Err(e) => make_error(-32000, &e.to_string(), req.id),
+            }
+        }
     }
 }
 

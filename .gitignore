@@ -8,3 +8,5 @@
 /.env
 /.env.test
 /logs/
+# 本地 crates.io 镜像加速 (rsproxy, CN 网络 workaround — 非项目配置)
+/.cargo/

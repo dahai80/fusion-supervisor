@@ -10,7 +10,7 @@ The fusion monorepo had no persistent supervisor. Existing tools are one-shot or
 
 ```bash
 cd fusion-supervisor
-cargo build --release   # binary: target/release/fusion-sv
+cargo build --release --workspace   # binaries: target/release/fusion-sv (daemon) + target/release/fusion-tray (desktop tray, issue #62)
 ```
 
 ## Usage
@@ -135,7 +135,7 @@ alert_dedup_sec = 300
 registry_path = "architecture/port-registry.yaml"
 metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22) + /api/v1/* face + web console (issue #25); "" = disable all
 web_dir = "~/fusion/fusion-supervisor/web/dist"  # optional: serve the built web console from the same listener; "" = off
-auto_up_on_start = true            # issue #29: daemon boot runs up_all once (probe-skips already-healthy); host-reboot self-healing when the daemon itself is launched at boot. Default false.
+auto_up_on_start = true            # issue #29/#62: daemon boot runs up_boot_set once — T0 (fixed core) + pin=auto services (probe-skips already-healthy); host-reboot self-healing when the daemon itself is launched at boot. Default false. BEHAVIOR CHANGE in #62: was up_all (everything).
 
 # Compose plane orchestration (disabled by default — native-only)
 [compose]
@@ -169,6 +169,43 @@ Four shell module services are supervised with custom start commands + registrat
 | fusion-agent-studio | 11442 | `start.sh start` (default path) | — |
 
 Env resolution: process env → `.env` (compose `env_file`) → fallback. `FUSION_ADMIN_KEY` (issue #54: renamed from `FUSION_GATEWAY_ADMIN_KEY` per env conventions Phase 2.2) falls back to read-only `web_shell.admin_key` from `fusion-gateway/config.yaml` (same pattern as trainer-bridge.sh); `FUSION_GATEWAY_BASE_URL` (issue #54: renamed from `FUSION_SHELL_GATEWAY_URL`) falls back to `http://127.0.0.1:11432`. `fusion-cowork`'s shell registry still reads the old URL name during the upstream transition window, so `fusion-cowork-web` keeps `FUSION_SHELL_GATEWAY_URL` + `FUSION_ADMIN_KEY`; the plugins console (v0.4.7) reads the new names only. `FUSION_TRAINER_BRIDGE_KEY` has no fallback — put it in `.env` (git-ignored). Gateway is Core layer, modules are App layer, so `up_all` brings up the gateway before the modules register against it.
+
+## Boot tiering + desktop tray (issue #62)
+
+Implements `architecture/fusion-supervisor-app-tiering-prd-1029.md`: services split into boot tiers so a host reboot brings up only what matters, plus an egui floating panel for fleet control.
+
+**Tiers** (annotated as `boot: {tier, pin}` per service in `architecture/port-registry.yaml` — 88 entries):
+
+- **T0 core** (10): mlx, gateway, memory, speech, identity, model-hub, rag, trainer, cowork, supervisor-adjacent core — always started at boot, cannot be skipped without a `manual` pin.
+- **T1 platform** (~20): everyday work services — started at boot only when pinned `auto` (per-user override, stored in `~/.fusion-sv/history.db` table `boot_pin`), otherwise on-demand.
+- **T2 app/domain** (rest): never started at boot; started on demand (tray / web console / CLI).
+
+The boot set = T0 ∪ {pinned=auto}. `auto_up_on_start = true` in `~/.fusion-sv/config.toml` now runs **`up_boot_set`** (T0 + pins) instead of `up_all` — **behavior change**: previously every one of the 53+ services was dragged up on daemon boot; now host-reboot recovery only restores the core + your pinned platform services, cutting boot memory footprint and start churn. `fusion-sv up` with no argument still means all services.
+
+HTTP face additions (same token rules as other mutations):
+
+- `GET /api/v1/boot` — one row per service: `{name, tier, pinned, state, port}` (single endpoint; the tray polls only this — it carries tier+pin+state, superset of `/api/v1/status`).
+- `POST /api/v1/boot/pin` `{"service": "...", "mode": "auto"|"manual"|"clear"}` — per-user boot override; survives daemon restart (SQLite).
+- `POST /api/v1/boot/group` `{"group": "T0"|"T1"|"T2", "action": "up"|"down"}` — tier-level bulk ops.
+
+### Desktop tray (`fusion-tray`)
+
+```bash
+cargo build --release --workspace   # binary: target/release/fusion-tray
+./target/release/fusion-tray        # no config needed; env overrides below
+```
+
+A 14px dot docked at the right screen edge (vertical center): green = all T0 healthy, yellow = T0 degraded, red = T0 down, gray = daemon unreachable. Click → fan menu (3 tier sectors with per-tier aggregate color) → click a sector → service list (running-first sort, realtime search, per-service start/stop/pin, right-click restart/drain/rollout; CORE stop needs confirm). Tier group buttons run `POST /api/v1/boot/group`. ESC walks back list → fan → dot. Destructive ops (restart/drain/rollout/group-down/all-stop) confirm first.
+
+When the daemon is unreachable the dot turns gray and the panel shows a "daemon 未运行" notice with one-click self-heal (`fusion-sv up`); no white screen. Env: `FUSION_SV_BASE` (default `http://127.0.0.1:9100`), `FUSION_SV_TOKEN`, `FUSION_TRAY_THEME` (`dark`/`light`, default follows system appearance). Poll cadence: 5s panel open / 30s dot / 60s unreachable.
+
+### LaunchAgent (log in → tray resident)
+
+```bash
+cp scripts/com.fusion.tray.plist.template ~/Library/LaunchAgents/com.fusion.tray.plist
+# edit: replace __FUSION_SUPERVISOR_DIR__ with the real path
+launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
+```
 
 ## Boundary with existing supervisors
 
