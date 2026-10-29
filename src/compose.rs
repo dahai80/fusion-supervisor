@@ -166,7 +166,9 @@ impl ComposeBackend for DockerCompose {
     fn check_env(&self) -> Result<()> {
         // fail-closed: 必需密码, 缺则拒绝并指 .env.example
         // docker --env-file 会注入文件内变量, 故查 env + env_file 两处
-        let need = ["FUSION_PG_PASSWORD", "FUSION_MLX_API_KEY"];
+        // config Phase 3 (issue #74): 客户端 key 用 canonical 名 FUSION_CLIENT_KEY,
+        // 旧名 FUSION_MLX_API_KEY 的兼容由 fusion-core alias 链负责, 本仓不再引用
+        let need = ["FUSION_PG_PASSWORD", "FUSION_CLIENT_KEY"];
         for k in need {
             if std::env::var(k).is_err() && !key_in_env_file(&self.env_file, k) {
                 anyhow::bail!(
