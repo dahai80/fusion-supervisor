@@ -1,5 +1,5 @@
 // PRD app-tiering (issue #62) P2+P3: 桌面悬浮点 tray。
-// L1 悬浮点 (屏幕右缘垂直居中, 健康点色 + 异常呼吸) → L2 半圆扇形 (3 扇区) → L3 分类列表 (搜索/开关/分组/pin)。
+// L1 悬浮点 (屏幕右缘垂直居中, 健康点色 + 异常呼吸) → L2 半圆扇形 (3 扇区, 朝屏幕内侧展开) → L3 分类列表 (搜索/开关/分组/pin)。
 // 数据面: 后台线程 ureq 轮询 GET /api/v1/boot (开面板 5s / dot 30s / 不可达 60s);
 // 写面: UI 线程入队 → worker 线程 ureq POST (120s 超时), 乐观更新 + 探活回填纠错。
 // 不可达: 点变灰 + 面板显示「daemon 未运行」+ 自愈 (spawn `fusion-sv up`)。
@@ -69,22 +69,94 @@ fn snap_dot_pos(p: Pos2, monitor: Vec2) -> Pos2 {
     out
 }
 
-// 各 UI 态窗口几何: dot 窗口中心 = dot 中心; fan 右缘贴 dot 向左展开 (竖放半圆);
-// list 在 dot 左侧垂直居中。
-fn window_geo(state: UiState, c: Pos2) -> (Vec2, Pos2) {
+// 展开方向: dot 贴哪条屏幕缘, 面板就朝屏幕内侧展开 (贴右缘向左, 贴左缘向右,
+// 贴上缘向下, 贴下缘向上)。半圆扇与列表都按此方向定位。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FanDir {
+    Left,
+    Right,
+    Down,
+    Up,
+}
+
+// 方向判定 (纯函数): 比较 dot 到横/纵最近屏幕缘的留白 — 纵向留白更小说明贴上下缘,
+// 按上下半区选 Down/Up; 否则按左右半区选 Right/Left。留白相同时走横向 (保持右缘
+// 默认位行为)。
+fn fan_dir(c: Pos2, monitor: Vec2) -> FanDir {
+    let margin_x = c.x.min(monitor.x - c.x);
+    let margin_y = c.y.min(monitor.y - c.y);
+    if margin_y < margin_x {
+        if c.y < monitor.y / 2.0 {
+            FanDir::Down
+        } else {
+            FanDir::Up
+        }
+    } else if c.x < monitor.x / 2.0 {
+        FanDir::Right
+    } else {
+        FanDir::Left
+    }
+}
+
+impl FanDir {
+    // 扇心 = 窗口上贴 dot 的那条边中点 (dot 本身)。y 上正下负的数学角制。
+    fn center_in(self, rect: egui::Rect) -> Pos2 {
+        match self {
+            FanDir::Left => Pos2::new(rect.right(), rect.center().y),
+            FanDir::Right => Pos2::new(rect.left(), rect.center().y),
+            FanDir::Down => Pos2::new(rect.center().x, rect.top()),
+            FanDir::Up => Pos2::new(rect.center().x, rect.bottom()),
+        }
+    }
+
+    // 展开方向角 (数学角制, 逆时针为正; 屏幕 y 轴向下故 Down 为 -90°)。
+    fn theta(self) -> f32 {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        match self {
+            FanDir::Left => PI,
+            FanDir::Right => 0.0,
+            FanDir::Down => -FRAC_PI_2,
+            FanDir::Up => FRAC_PI_2,
+        }
+    }
+}
+
+// 各 UI 态窗口几何: dot 窗口中心 = dot 中心; fan 窗口贴 dot 所在屏幕缘, 半圆朝内侧
+// 展开; list 在 dot 的屏幕内侧 (右半屏放左, 左半屏放右) 垂直居中并夹在屏内。
+fn window_geo(state: UiState, c: Pos2, monitor: Vec2) -> (Vec2, Pos2) {
     match state {
         UiState::Dot => (
             Vec2::new(DOT_WIN, DOT_WIN),
             Pos2::new(c.x - DOT_WIN / 2.0, c.y - DOT_WIN / 2.0),
         ),
-        UiState::Fan => (
-            Vec2::new(FAN_WIN, FAN_WIN),
-            Pos2::new(c.x - FAN_WIN, c.y - FAN_WIN / 2.0),
-        ),
-        UiState::List(_) => (
-            Vec2::new(LIST_W, LIST_H),
-            Pos2::new(c.x - LIST_W - 12.0, c.y - LIST_H / 2.0),
-        ),
+        UiState::Fan => {
+            let pos = match fan_dir(c, monitor) {
+                FanDir::Left => Pos2::new(c.x - FAN_WIN, c.y - FAN_WIN / 2.0),
+                FanDir::Right => Pos2::new(c.x, c.y - FAN_WIN / 2.0),
+                FanDir::Down => Pos2::new(c.x - FAN_WIN / 2.0, c.y),
+                FanDir::Up => Pos2::new(c.x - FAN_WIN / 2.0, c.y - FAN_WIN),
+            };
+            // 角落位 (dot 同时贴两条缘) 窗口会出屏: 夹进屏内 — 扇心由窗口矩形反推
+            // (ui_fan 用 rect), 故半圆仍与可见窗口自洽; 正常贴边位夹取是空操作。
+            let pos = Pos2::new(
+                pos.x.clamp(0.0, (monitor.x - FAN_WIN).max(0.0)),
+                pos.y.clamp(0.0, (monitor.y - FAN_WIN).max(0.0)),
+            );
+            (Vec2::new(FAN_WIN, FAN_WIN), pos)
+        }
+        UiState::List(_) => {
+            let x = if c.x < monitor.x / 2.0 {
+                c.x + 12.0
+            } else {
+                c.x - LIST_W - 12.0
+            };
+            let max_x = (monitor.x - LIST_W - 4.0).max(4.0);
+            let max_y = (monitor.y - LIST_H - 4.0).max(4.0);
+            (
+                Vec2::new(LIST_W, LIST_H),
+                Pos2::new(x.clamp(4.0, max_x), (c.y - LIST_H / 2.0).clamp(4.0, max_y)),
+            )
+        }
     }
 }
 
@@ -375,17 +447,27 @@ impl TrayApp {
         })
     }
 
-    // 窗口几何: dot 屏幕右缘垂直居中 (或记忆位置); fan 窗口右缘贴 dot 向左展开
-    // (竖放半圆); list 在 dot 左侧垂直居中。
+    // 窗口几何: dot 在屏幕右缘垂直居中 (或记忆位置); fan/list 按 dot 所处屏幕缘朝
+    // 屏幕内侧展开 (贴右向左 / 贴左向右 / 贴上下向下 / 向上)。
     fn apply_viewport(&mut self, ctx: &egui::Context) {
         if self.last_apply == Some(self.ui_state) {
             return;
         }
         let monitor = self.monitor_size(ctx);
         let center = self.dot_center(monitor);
-        let (size, pos) = window_geo(self.ui_state, center);
+        let (size, pos) = window_geo(self.ui_state, center, monitor);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        // 每次状态切换记一行几何 (方向由 dot 所处屏幕缘决定, 排障靠日志不靠截图)
+        tracing::info!(
+            state = ?self.ui_state,
+            dir = ?fan_dir(center, monitor),
+            dot_x = center.x,
+            dot_y = center.y,
+            win_x = pos.x,
+            win_y = pos.y,
+            "窗口几何已应用"
+        );
         self.last_apply = Some(self.ui_state);
     }
 
@@ -405,7 +487,8 @@ impl TrayApp {
         });
     }
 
-    // 扇区序 (竖放, 左半圆自顶向下): 顶=CORE, 中=PLATFORM, 底=APP。
+    // 扇区序 (自展开方向左侧起算): 首扇区=CORE, 中=PLATFORM, 末=APP。
+    // 向左展开时即「顶=CORE, 中=PLATFORM, 底=APP」(与既有习惯一致)。
     fn sector_tier(i: usize) -> Tier {
         match i {
             0 => Tier::Core,
@@ -582,7 +665,7 @@ impl TrayApp {
                         let monitor = self.monitor_size(ctx);
                         let center = clamp_dot_pos(self.dot_center(monitor) + (cur - prev), monitor);
                         self.dot_pos = Some(center);
-                        let (size, pos) = window_geo(UiState::Dot, center);
+                        let (size, pos) = window_geo(UiState::Dot, center, monitor);
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                     }
@@ -594,7 +677,7 @@ impl TrayApp {
                     let monitor = self.monitor_size(ctx);
                     let snapped = snap_dot_pos(self.dot_center(monitor), monitor);
                     self.dot_pos = Some(snapped);
-                    let (_, pos) = window_geo(UiState::Dot, snapped);
+                    let (_, pos) = window_geo(UiState::Dot, snapped, monitor);
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                     let path = default_pos_path();
                     save_dot_pos_to(&path, snapped);
@@ -610,6 +693,27 @@ impl TrayApp {
 }
 
 // ---------- L2 扇形 ----------
+
+// 命中判定 (纯函数): 鼠标相对扇心的位移落在展开半圆内 → 扇区序号。
+// 扇区按展开方向 ±90° 划分, 每 60° 一扇区; idx 从展开方向左侧起算 (与绘制同序)。
+fn fan_hover(rel: Vec2, dir: FanDir) -> Option<usize> {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    if rel.length() > FAN_R {
+        return None;
+    }
+    let ang = (-rel.y).atan2(rel.x);
+    let mut delta = ang - dir.theta();
+    while delta > PI {
+        delta -= 2.0 * PI;
+    }
+    while delta < -PI {
+        delta += 2.0 * PI;
+    }
+    if delta.abs() > FRAC_PI_2 {
+        return None;
+    }
+    Some((((delta + FRAC_PI_2) / (PI / 3.0)) as usize).min(2))
+}
 
 impl TrayApp {
     fn ui_fan(&mut self, ctx: &egui::Context) {
@@ -632,33 +736,22 @@ impl TrayApp {
                     .unwrap_or(Vec2::splat(FAN_WIN));
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 let painter = ui.painter_at(rect);
-                let center = Pos2::new(rect.right(), rect.center().y); // 扇心 = 右缘中点 = dot
+                // 扇心 = 贴 dot 的窗口边中点 (方向由 dot 所处屏幕缘决定), 半圆朝屏内展开。
+                let monitor = self.monitor_size(ctx);
+                let dir = fan_dir(self.dot_center(monitor), monitor);
+                let center = dir.center_in(rect);
+                let theta = dir.theta();
                 painter.circle_filled(center, DOT_R + 1.0, pal.text);
 
                 let mpos = ctx.input(|i| i.pointer.latest_pos());
-                let mut hover: Option<usize> = None;
-                if let Some(mp) = mpos {
-                    let rel = mp - center;
-                    let dist = rel.length();
-                    if dist <= FAN_R && rel.x < 0.0 {
-                        // 左半平面 (扇区向左展开): 顶=CORE, 中=PLATFORM, 底=APP, 每 60° 一扇区。
-                        let mut ang = (-rel.y).atan2(rel.x);
-                        if ang < 0.0 {
-                            ang += 2.0 * std::f32::consts::PI;
-                        }
-                        let idx = (((ang - std::f32::consts::FRAC_PI_2)
-                            / (std::f32::consts::PI / 3.0))
-                            as usize)
-                            .min(2);
-                        hover = Some(idx);
-                    }
-                }
+                let hover = mpos.and_then(|mp| fan_hover(mp - center, dir));
 
                 for i in 0..3usize {
                     let tier = Self::sector_tier(i);
-                    let a0 = std::f32::consts::FRAC_PI_2 + i as f32 * (std::f32::consts::PI / 3.0);
-                    let a1 =
-                        std::f32::consts::FRAC_PI_2 + (i + 1) as f32 * (std::f32::consts::PI / 3.0);
+                    let a0 = theta - std::f32::consts::FRAC_PI_2
+                        + i as f32 * (std::f32::consts::PI / 3.0);
+                    let a1 = theta - std::f32::consts::FRAC_PI_2
+                        + (i + 1) as f32 * (std::f32::consts::PI / 3.0);
                     let svcs = model.tier_svcs(tier);
                     let agg = state::sector(&svcs);
                     let alpha = if hover == Some(i) { 70u8 } else { 38u8 };
@@ -685,7 +778,7 @@ impl TrayApp {
                         FontId::proportional(10.0),
                         pal.text_dim,
                     );
-                    // 健康点阵: 径向向外堆行, 切向排列 (适配竖放左半圆)。
+                    // 健康点阵: 径向向外堆行, 切向排列 (随展开方向旋转)。
                     let cols = ((agg.dots.len() as f32).sqrt().ceil() as usize).max(1);
                     let (ux, uy) = (mid.cos(), -mid.sin());
                     let (px, py) = (-uy, ux);
@@ -1024,10 +1117,85 @@ mod pos_tests {
 
     #[test]
     fn test_window_geo_list_offset() {
-        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1000.0, 500.0));
+        // 右半屏: list 放 dot 左侧
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1000.0, 500.0), MON);
         assert_eq!(pos, Pos2::new(1000.0 - LIST_W - 12.0, 500.0 - LIST_H / 2.0));
-        let (_, pos) = window_geo(UiState::Fan, Pos2::new(1000.0, 500.0));
-        assert_eq!(pos, Pos2::new(1000.0 - FAN_WIN, 500.0 - FAN_WIN / 2.0));
+        // 右缘默认位: fan 右缘贴 dot 向左展开
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(1416.0, 450.0), MON);
+        assert_eq!(pos, Pos2::new(1416.0 - FAN_WIN, 450.0 - FAN_WIN / 2.0));
+    }
+
+    // 展开方向: 贴哪条屏幕缘就朝屏内展开 (右缘向左, 左缘向右, 上缘向下, 下缘向上)
+    #[test]
+    fn test_fan_dir_by_nearest_edge() {
+        assert_eq!(fan_dir(Pos2::new(1415.0, 450.0), MON), FanDir::Left);
+        assert_eq!(fan_dir(Pos2::new(25.0, 450.0), MON), FanDir::Right);
+        assert_eq!(fan_dir(Pos2::new(720.0, 25.0), MON), FanDir::Down);
+        assert_eq!(fan_dir(Pos2::new(720.0, 875.0), MON), FanDir::Up);
+        // 屏幕正中: 纵向留白 (450) 小于横向 (720) → 向下半区, 取 Up
+        assert_eq!(fan_dir(Pos2::new(720.0, 450.0), MON), FanDir::Up);
+    }
+
+    // 四方向的窗口定位: dot 贴在对应窗口边中点, list 在 dot 内侧
+    #[test]
+    fn test_window_geo_all_directions() {
+        // 右缘: fan 在 dot 左侧, 垂直居中
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(1415.0, 450.0), MON);
+        assert_eq!(pos, Pos2::new(1415.0 - FAN_WIN, 450.0 - FAN_WIN / 2.0));
+        // 左缘: fan 在 dot 右侧
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(25.0, 450.0), MON);
+        assert_eq!(pos, Pos2::new(25.0, 450.0 - FAN_WIN / 2.0));
+        // 上缘: fan 在 dot 下方, 水平居中
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(720.0, 25.0), MON);
+        assert_eq!(pos, Pos2::new(720.0 - FAN_WIN / 2.0, 25.0));
+        // 下缘: fan 在 dot 上方
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(720.0, 875.0), MON);
+        assert_eq!(pos, Pos2::new(720.0 - FAN_WIN / 2.0, 875.0 - FAN_WIN));
+        // 左缘 list: dot 右侧
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(25.0, 450.0), MON);
+        assert_eq!(pos, Pos2::new(25.0 + 12.0, 450.0 - LIST_H / 2.0));
+    }
+
+    // 贴上下缘且列表超出屏高: 夹到屏内 (dot 居中放不下时上移)
+    #[test]
+    fn test_window_geo_list_clamped_to_monitor() {
+        // dot 在 y=25 (距上缘 25): 居中会超出上缘 → 夹到 4
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1415.0, 25.0), MON);
+        assert_eq!(pos.y, 4.0);
+        // dot 在下缘: 夹到屏底
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1415.0, 875.0), MON);
+        assert_eq!(pos.y, MON.y - LIST_H - 4.0);
+        // 右侧放不下时夹进屏内 (dot 极靠左且窗口比剩余空间大时不会出屏)
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1395.0, 450.0), MON);
+        assert!(pos.x >= 4.0 && pos.x + LIST_W <= MON.x);
+    }
+
+    // 扇区命中: 半圆朝展开方向, 三扇区各 60°, 背向半圆不命中
+    #[test]
+    fn test_fan_hover_mirrors_by_direction() {
+        let r = FAN_R * 0.5;
+        // 向左展开: 左上=CORE, 正左=PLATFORM, 左下=APP; 右侧不命中
+        assert_eq!(fan_hover(Vec2::new(-r * 0.5, -r), FanDir::Left), Some(0));
+        assert_eq!(fan_hover(Vec2::new(-r, 0.0), FanDir::Left), Some(1));
+        assert_eq!(fan_hover(Vec2::new(-r * 0.5, r), FanDir::Left), Some(2));
+        assert_eq!(fan_hover(Vec2::new(r, 0.0), FanDir::Left), None);
+        // 向右展开: 右下=CORE, 正右=PLATFORM, 右上=APP; 左侧不命中
+        assert_eq!(fan_hover(Vec2::new(r * 0.5, r), FanDir::Right), Some(0));
+        assert_eq!(fan_hover(Vec2::new(r, 0.0), FanDir::Right), Some(1));
+        assert_eq!(fan_hover(Vec2::new(r * 0.5, -r), FanDir::Right), Some(2));
+        assert_eq!(fan_hover(Vec2::new(-r, 0.0), FanDir::Right), None);
+        // 向下展开: 左下=CORE, 正下=PLATFORM, 右下=APP; 上方不命中
+        assert_eq!(fan_hover(Vec2::new(-r, r * 0.5), FanDir::Down), Some(0));
+        assert_eq!(fan_hover(Vec2::new(0.0, r), FanDir::Down), Some(1));
+        assert_eq!(fan_hover(Vec2::new(r, r * 0.5), FanDir::Down), Some(2));
+        assert_eq!(fan_hover(Vec2::new(0.0, -r), FanDir::Down), None);
+        // 向上展开: 右上=CORE, 正上=PLATFORM, 左上=APP; 下方不命中
+        assert_eq!(fan_hover(Vec2::new(r, -r * 0.5), FanDir::Up), Some(0));
+        assert_eq!(fan_hover(Vec2::new(0.0, -r), FanDir::Up), Some(1));
+        assert_eq!(fan_hover(Vec2::new(-r, -r * 0.5), FanDir::Up), Some(2));
+        assert_eq!(fan_hover(Vec2::new(0.0, r), FanDir::Up), None);
+        // 超半径不命中
+        assert_eq!(fan_hover(Vec2::new(-FAN_R - 10.0, 0.0), FanDir::Left), None);
     }
 
     #[test]
