@@ -25,6 +25,105 @@ const LIST_W: f32 = 300.0;
 const LIST_H: f32 = 400.0;
 const FAN_R: f32 = 160.0;
 
+// PRD §4.2 拖动/贴边/位置记忆:
+// - 拖动: dot 按住拖移, 窗口逐帧跟手 (屏幕坐标差分, 与窗口自身移动解耦)。
+// - 贴边: 拖放释放时距屏幕缘 < SNAP_PX 吸附到贴边位置。
+// - 位置记忆: 释放即持久化 ~/.fusion-sv/tray.json, 启动恢复 (越界夹取防换屏漂移)。
+const DOT_DEFAULT_INSET: f32 = 24.0;
+const SNAP_PX: f32 = 20.0;
+const EDGE_MARGIN: f32 = 2.0;
+const POS_PATH: &str = ".fusion-sv/tray.json";
+
+// ---------- 位置记忆纯逻辑 (可测) ----------
+
+// dot 中心夹取在屏幕内 (窗口完整可见); 屏幕比窗口还小是防御分支 (回屏幕中心)。
+fn clamp_dot_pos(mut p: Pos2, monitor: Vec2) -> Pos2 {
+    let half = DOT_WIN / 2.0;
+    if monitor.x <= DOT_WIN + 2.0 * EDGE_MARGIN || monitor.y <= DOT_WIN + 2.0 * EDGE_MARGIN {
+        return Pos2::new(monitor.x / 2.0, monitor.y / 2.0);
+    }
+    p.x =
+        p.x.clamp(half + EDGE_MARGIN, monitor.x - half - EDGE_MARGIN);
+    p.y =
+        p.y.clamp(half + EDGE_MARGIN, monitor.y - half - EDGE_MARGIN);
+    p
+}
+
+// 贴边吸附: 中心距任一边缘 (减去半径) < SNAP_PX 时吸附, dot 缘距屏幕缘 EDGE_MARGIN。
+fn snap_dot_pos(p: Pos2, monitor: Vec2) -> Pos2 {
+    let c = clamp_dot_pos(p, monitor);
+    let half = DOT_WIN / 2.0;
+    let mut out = c;
+    if c.x - half <= SNAP_PX {
+        out.x = half + EDGE_MARGIN;
+    }
+    if monitor.x - (c.x + half) <= SNAP_PX {
+        out.x = monitor.x - half - EDGE_MARGIN;
+    }
+    if c.y - half <= SNAP_PX {
+        out.y = half + EDGE_MARGIN;
+    }
+    if monitor.y - (c.y + half) <= SNAP_PX {
+        out.y = monitor.y - half - EDGE_MARGIN;
+    }
+    out
+}
+
+// 各 UI 态窗口几何: dot 窗口中心 = dot 中心; fan 右缘贴 dot 向左展开 (竖放半圆);
+// list 在 dot 左侧垂直居中。
+fn window_geo(state: UiState, c: Pos2) -> (Vec2, Pos2) {
+    match state {
+        UiState::Dot => (
+            Vec2::new(DOT_WIN, DOT_WIN),
+            Pos2::new(c.x - DOT_WIN / 2.0, c.y - DOT_WIN / 2.0),
+        ),
+        UiState::Fan => (
+            Vec2::new(FAN_WIN, FAN_WIN),
+            Pos2::new(c.x - FAN_WIN, c.y - FAN_WIN / 2.0),
+        ),
+        UiState::List(_) => (
+            Vec2::new(LIST_W, LIST_H),
+            Pos2::new(c.x - LIST_W - 12.0, c.y - LIST_H / 2.0),
+        ),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DotPosFile {
+    x: f32,
+    y: f32,
+}
+
+fn default_pos_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(POS_PATH)
+}
+
+// 损坏/非有限值一律回退默认位置 (常驻组件 fail-open, 不因配置文件崩)。
+fn load_dot_pos_from(path: &std::path::Path) -> Option<Pos2> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<DotPosFile>(&text) {
+        Ok(f) if f.x.is_finite() && f.y.is_finite() => Some(Pos2::new(f.x, f.y)),
+        _ => {
+            tracing::warn!(path = %path.display(), "tray 位置文件损坏, 回退默认位置");
+            None
+        }
+    }
+}
+
+fn save_dot_pos_to(path: &std::path::Path, p: Pos2) {
+    if let Some(dir) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        tracing::error!(err = %e, dir = %dir.display(), "tray 位置目录创建失败");
+        return;
+    }
+    let body = serde_json::to_string(&DotPosFile { x: p.x, y: p.y }).unwrap_or_default();
+    if let Err(e) = std::fs::write(path, body) {
+        tracing::error!(err = %e, path = %path.display(), "tray 位置保存失败");
+    }
+}
+
 pub struct Shared {
     pub model: Mutex<Model>,
     ui_state: Mutex<UiState>,
@@ -70,6 +169,18 @@ fn main() -> eframe::Result<()> {
         base,
         token,
     });
+    // 位置记忆 (PRD §4.2): 启动恢复上次拖放位置, 无记忆走默认右缘垂直居中。
+    let pos_path = default_pos_path();
+    let dot_pos = match load_dot_pos_from(&pos_path) {
+        Some(p) => {
+            tracing::info!(x = p.x, y = p.y, path = %pos_path.display(), "dot 位置记忆已加载");
+            Some(p)
+        }
+        None => {
+            tracing::info!("无 dot 位置记忆, 使用默认位置 (右缘垂直居中)");
+            None
+        }
+    };
 
     // 后台轮询线程: 间隔随 UI 态切换, 失败 reachable=false 点变灰。
     {
@@ -104,6 +215,8 @@ fn main() -> eframe::Result<()> {
         pending_confirm: None,
         theme: theme_name,
         last_apply: None,
+        dot_pos,
+        prev_drag_screen: None,
     };
     eframe::run_native(
         "fusion-tray",
@@ -231,36 +344,46 @@ struct TrayApp {
     pending_confirm: Option<Confirm>,
     theme: String,
     last_apply: Option<UiState>,
+    // dot 中心屏幕坐标: Some = 已有位置记忆/拖动中, None = 默认右缘垂直居中。
+    dot_pos: Option<Pos2>,
+    // 拖动抓取点屏幕坐标 (逐帧差分求鼠标位移)。
+    prev_drag_screen: Option<Pos2>,
 }
 
 impl TrayApp {
-    // 窗口几何: dot 屏幕右缘垂直居中; fan 窗口右缘贴 dot 向左展开 (竖放半圆);
-    // list 在 dot 左侧垂直居中。
+    fn monitor_size(&self, ctx: &egui::Context) -> Vec2 {
+        ctx.input(|i| {
+            i.viewport()
+                .monitor_size
+                .unwrap_or(Vec2::new(1440.0, 900.0))
+        })
+    }
+
+    // dot 中心: 有记忆先夹取 (防换屏/分辨率变化漂移出屏), 无记忆走默认。
+    fn dot_center(&self, monitor: Vec2) -> Pos2 {
+        self.dot_pos
+            .map(|p| clamp_dot_pos(p, monitor))
+            .unwrap_or_else(|| Pos2::new(monitor.x - DOT_DEFAULT_INSET, monitor.y / 2.0))
+    }
+
+    // 鼠标屏幕坐标 = 窗口外框原点 + 窗口内坐标 (拖动差分用, 与窗口移动解耦)。
+    fn pointer_screen_pos(&self, ctx: &egui::Context) -> Option<Pos2> {
+        ctx.input(|i| {
+            let p = i.pointer.latest_pos()?;
+            let origin = i.viewport().outer_rect?.min;
+            Some(origin + p.to_vec2())
+        })
+    }
+
+    // 窗口几何: dot 屏幕右缘垂直居中 (或记忆位置); fan 窗口右缘贴 dot 向左展开
+    // (竖放半圆); list 在 dot 左侧垂直居中。
     fn apply_viewport(&mut self, ctx: &egui::Context) {
         if self.last_apply == Some(self.ui_state) {
             return;
         }
-        let monitor = ctx.input(|i| {
-            i.viewport()
-                .monitor_size
-                .unwrap_or(Vec2::new(1440.0, 900.0))
-        });
-        let dx = monitor.x - 24.0; // dot 中心 x (右缘内缩 24px)
-        let dy = monitor.y / 2.0; // dot 中心 y
-        let (size, pos) = match self.ui_state {
-            UiState::Dot => (
-                Vec2::new(DOT_WIN, DOT_WIN),
-                Pos2::new(dx - DOT_WIN / 2.0, dy - DOT_WIN / 2.0),
-            ),
-            UiState::Fan => (
-                Vec2::new(FAN_WIN, FAN_WIN),
-                Pos2::new(dx - FAN_WIN, dy - FAN_WIN / 2.0), // 右缘贴 dot, 垂直居中
-            ),
-            UiState::List(_) => (
-                Vec2::new(LIST_W, LIST_H),
-                Pos2::new(dx - LIST_W - 12.0, dy - LIST_H / 2.0),
-            ),
-        };
+        let monitor = self.monitor_size(ctx);
+        let center = self.dot_center(monitor);
+        let (size, pos) = window_geo(self.ui_state, center);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         self.last_apply = Some(self.ui_state);
@@ -438,8 +561,8 @@ impl TrayApp {
         egui::Area::new(egui::Id::new("dot"))
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::splat(DOT_WIN), egui::Sense::click());
+                let (rect, resp) = ui
+                    .allocate_exact_size(Vec2::splat(DOT_WIN), egui::Sense::click_and_drag());
                 let painter = ui.painter_at(rect);
                 painter.circle_filled(rect.center(), r, col);
                 painter.circle_stroke(
@@ -447,10 +570,41 @@ impl TrayApp {
                     r + 2.0,
                     Stroke::new(1.5_f32, col.gamma_multiply(0.35)),
                 );
+                // 拖动 (PRD §4.2): 屏幕坐标差分求位移 — 窗口自身移动不影响
+                // 差分基准 (外框原点 + 窗口内坐标 = 屏幕坐标, 逐帧自洽), 窗口逐帧跟手。
+                if resp.drag_started() {
+                    self.prev_drag_screen = self.pointer_screen_pos(ctx);
+                }
+                if resp.dragged() {
+                    if let (Some(prev), Some(cur)) =
+                        (self.prev_drag_screen, self.pointer_screen_pos(ctx))
+                    {
+                        let monitor = self.monitor_size(ctx);
+                        let center = clamp_dot_pos(self.dot_center(monitor) + (cur - prev), monitor);
+                        self.dot_pos = Some(center);
+                        let (size, pos) = window_geo(UiState::Dot, center);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    }
+                    self.prev_drag_screen = self.pointer_screen_pos(ctx);
+                }
+                if resp.drag_stopped() {
+                    // 贴边吸附 + 位置持久化 (PRD §4.2 贴边/位置记忆)。
+                    self.prev_drag_screen = None;
+                    let monitor = self.monitor_size(ctx);
+                    let snapped = snap_dot_pos(self.dot_center(monitor), monitor);
+                    self.dot_pos = Some(snapped);
+                    let (_, pos) = window_geo(UiState::Dot, snapped);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    let path = default_pos_path();
+                    save_dot_pos_to(&path, snapped);
+                    tracing::info!(x = snapped.x, y = snapped.y, path = %path.display(), "dot 位置已保存");
+                }
+                // egui 语义: 拖动过的释放不算 click — 点击展开与拖移互不误触。
                 if resp.clicked() {
                     self.ui_state = UiState::Fan;
                 }
-                resp.on_hover_text("fusion 状态悬浮点 (点击展开)");
+                resp.on_hover_text("fusion 状态悬浮点 (点击展开, 按住拖动)");
             });
     }
 }
@@ -812,5 +966,82 @@ mod font_tests {
         fn is_non_ascii_test(&self) -> bool {
             *self as u32 > 0x7E
         }
+    }
+}
+
+#[cfg(test)]
+mod pos_tests {
+    use super::*;
+
+    const MON: Vec2 = Vec2::new(1440.0, 900.0);
+
+    #[test]
+    fn test_clamp_keeps_inside() {
+        // 默认位 (右缘内缩 24) 合法, 原样保留
+        let p = clamp_dot_pos(Pos2::new(MON.x - 24.0, MON.y / 2.0), MON);
+        assert_eq!(p, Pos2::new(MON.x - 24.0, MON.y / 2.0));
+        // 屏外四角全部夹回屏内
+        let c = clamp_dot_pos(Pos2::new(-50.0, -50.0), MON);
+        assert!(c.x >= DOT_WIN / 2.0 && c.y >= DOT_WIN / 2.0);
+        let c = clamp_dot_pos(Pos2::new(MON.x + 500.0, MON.y + 500.0), MON);
+        assert!(c.x <= MON.x - DOT_WIN / 2.0 && c.y <= MON.y - DOT_WIN / 2.0);
+    }
+
+    #[test]
+    fn test_clamp_defensive_tiny_monitor() {
+        // 防御: 屏幕比窗口还小 → 屏幕中心, 不产生负区间 clamp 振荡
+        let p = clamp_dot_pos(Pos2::new(10.0, 10.0), Vec2::new(30.0, 20.0));
+        assert_eq!(p, Pos2::new(15.0, 10.0));
+    }
+
+    #[test]
+    fn test_snap_left_edge() {
+        // 中心 x=15, 半宽 22 → 距左缘 -7px (已出屏), 贴边吸附 (dot 缘距屏幕缘 2px)
+        let p = snap_dot_pos(Pos2::new(15.0, 400.0), MON);
+        assert_eq!(p, Pos2::new(DOT_WIN / 2.0 + EDGE_MARGIN, 400.0));
+    }
+
+    #[test]
+    fn test_snap_right_edge_matches_default_inset() {
+        // 右缘贴边位 (24 = 22 + 2) 恰为默认位 — 默认位即右贴边位
+        let p = snap_dot_pos(Pos2::new(MON.x - 24.0, 400.0), MON);
+        assert_eq!(p, Pos2::new(MON.x - 24.0, 400.0));
+    }
+
+    #[test]
+    fn test_snap_middle_unaffected() {
+        let p = snap_dot_pos(Pos2::new(700.0, 450.0), MON);
+        assert_eq!(p, Pos2::new(700.0, 450.0));
+    }
+
+    #[test]
+    fn test_snap_vertical_edges() {
+        let p = snap_dot_pos(Pos2::new(700.0, 10.0), MON);
+        assert_eq!(p.y, DOT_WIN / 2.0 + EDGE_MARGIN);
+        let p = snap_dot_pos(Pos2::new(700.0, MON.y - 10.0), MON);
+        assert_eq!(p.y, MON.y - DOT_WIN / 2.0 - EDGE_MARGIN);
+    }
+
+    #[test]
+    fn test_window_geo_list_offset() {
+        let (_, pos) = window_geo(UiState::List(Tier::App), Pos2::new(1000.0, 500.0));
+        assert_eq!(pos, Pos2::new(1000.0 - LIST_W - 12.0, 500.0 - LIST_H / 2.0));
+        let (_, pos) = window_geo(UiState::Fan, Pos2::new(1000.0, 500.0));
+        assert_eq!(pos, Pos2::new(1000.0 - FAN_WIN, 500.0 - FAN_WIN / 2.0));
+    }
+
+    #[test]
+    fn test_round_trip_persistence() {
+        let path =
+            std::env::temp_dir().join(format!("fusion-tray-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        save_dot_pos_to(&path, Pos2::new(123.5, 456.25));
+        assert_eq!(load_dot_pos_from(&path), Some(Pos2::new(123.5, 456.25)));
+        // 损坏 / 类型错 → None (fail-open, 回默认位)
+        std::fs::write(&path, "{corrupt").unwrap();
+        assert_eq!(load_dot_pos_from(&path), None);
+        std::fs::write(&path, r#"{"x":"abc","y":1}"#).unwrap();
+        assert_eq!(load_dot_pos_from(&path), None);
+        let _ = std::fs::remove_file(&path);
     }
 }

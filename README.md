@@ -195,7 +195,7 @@ cargo build --release --workspace   # binary: target/release/fusion-tray
 ./target/release/fusion-tray        # no config needed; env overrides below
 ```
 
-A 14px dot docked at the right screen edge (vertical center): green = all T0 healthy, yellow = T0 degraded, red = T0 down, gray = daemon unreachable. Click → fan menu opening leftward from the dot (vertical semicircle: top = CORE, middle = PLATFORM, bottom = APP; 3 tier sectors with per-tier aggregate color and per-tier service dots) → click a sector → service list (running-first sort, realtime search, per-service start/stop/pin, right-click restart/drain/rollout; CORE stop needs confirm). **Every tier has both one-click up and one-click stop** (`POST /api/v1/boot/group`; group stop is destructive and confirms first). ESC walks back list → fan → dot. Destructive ops (restart/drain/rollout/group-down/all-stop) confirm first.
+A 14px dot docked at the right screen edge (vertical center): green = all T0 healthy, yellow = T0 degraded, red = T0 down, gray = daemon unreachable. **Drag the dot anywhere** (press and hold; the window follows the pointer frame-by-frame) — on release it snaps to the nearest screen edge when within 20px and the position is persisted to `~/.fusion-sv/tray.json` and restored on next launch (out-of-range saved positions are clamped back on-screen, e.g. after a resolution change; a corrupt file falls back to the default position). Click → fan menu opening leftward from the dot (vertical semicircle: top = CORE, middle = PLATFORM, bottom = APP; 3 tier sectors with per-tier aggregate color and per-tier service dots) → click a sector → service list (running-first sort, realtime search, per-service start/stop/pin, right-click restart/drain/rollout; CORE stop needs confirm). **Every tier has both one-click up and one-click stop** (`POST /api/v1/boot/group`; group stop is destructive and confirms first). ESC walks back list → fan → dot. Destructive ops (restart/drain/rollout/group-down/all-stop) confirm first.
 
 When the daemon is unreachable the dot turns gray and the panel shows a "daemon 未运行" notice with one-click self-heal (`fusion-sv up`); no white screen. Unreachable is decided by a two-step probe: `GET /api/v1/boot` first, then `GET /health` (lock-free handler) as a busy-vs-dead discriminator — a timed-out `/boot` with a live `/health` keeps the current view and logs "daemon 忙" instead of flashing the unreachable notice (batch group ops hold the core mutex for seconds). Env: `FUSION_SV_BASE` (default `http://127.0.0.1:9100`), `FUSION_SV_TOKEN`, `FUSION_TRAY_THEME` (`dark`/`light`, default follows system appearance). Poll cadence: 5s panel open / 30s dot / 60s unreachable.
 
@@ -222,7 +222,7 @@ launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
 ## Test
 
 ```bash
-cargo test --all-targets          # 210 test fns (unit + 13 integration files)
+cargo test --workspace --all-targets   # 227 test fns (unit + 13 integration files + tray)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
