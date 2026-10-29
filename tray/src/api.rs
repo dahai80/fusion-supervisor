@@ -101,6 +101,21 @@ pub fn fetch_boot(agent: &ureq::Agent, base: &str) -> Result<Model, String> {
     Ok(model_from_boot(rows))
 }
 
+// daemon 活性探针: GET /health (handler 返回静态 {"ok":true}, 不锁核心 —
+// 批量组操作占住核心锁时也能应答)。/boot 超时但 /health 通 = daemon 忙而非挂。
+pub fn health_url(base: &str) -> String {
+    format!("{base}/health")
+}
+
+pub fn fetch_health(agent: &ureq::Agent, base: &str) -> Result<(), String> {
+    agent
+        .get(&health_url(base))
+        .timeout(Duration::from_secs(2))
+        .call()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 // 写操作统一: 返回 Ok(json string) / Err(描述)。token 可选 (daemon 未设 FUSION_SV_TOKEN 时免)。
 pub fn post_cmd(
     agent: &ureq::Agent,
@@ -146,4 +161,14 @@ pub fn new_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_url_shape() {
+        assert_eq!(health_url(DEFAULT_BASE), "http://127.0.0.1:9100/health");
+    }
 }

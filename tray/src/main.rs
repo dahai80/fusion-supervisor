@@ -158,8 +158,17 @@ fn poller_loop(shared: Arc<Shared>) {
                     *shared.model.lock().unwrap() = m;
                 }
                 Err(e) => {
-                    tracing::warn!(err = %e, interval, "boot poll failed (点变灰)");
-                    shared.model.lock().unwrap().reachable = false;
+                    // /boot 超时 ≠ daemon 挂: 批量组操作占住核心锁数秒→数十秒,
+                    // /health handler 不锁核心仍应答。/health 通 = 忙, 保持最后模型不置灰。
+                    match api::fetch_health(&agent, &shared.base) {
+                        Ok(()) => {
+                            tracing::info!(err = %e, "boot poll timeout 但 /health 可达 (daemon 忙, 保持现状)");
+                        }
+                        Err(he) => {
+                            tracing::warn!(err = %e, health_err = %he, interval, "boot + health 均失败 (点变灰)");
+                            shared.model.lock().unwrap().reachable = false;
+                        }
+                    }
                 }
             }
             last_poll = std::time::Instant::now();
@@ -200,7 +209,8 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    // 窗口几何: dot 屏幕右缘垂直居中; fan 底边中心锚 dot; list 在 dot 左侧垂直居中。
+    // 窗口几何: dot 屏幕右缘垂直居中; fan 窗口右缘贴 dot 向左展开 (竖放半圆);
+    // list 在 dot 左侧垂直居中。
     fn apply_viewport(&mut self, ctx: &egui::Context) {
         if self.last_apply == Some(self.ui_state) {
             return;
@@ -219,7 +229,7 @@ impl TrayApp {
             ),
             UiState::Fan => (
                 Vec2::new(FAN_WIN, FAN_WIN),
-                Pos2::new(dx - FAN_WIN / 2.0, dy - FAN_WIN), // 底边贴 dot
+                Pos2::new(dx - FAN_WIN, dy - FAN_WIN / 2.0), // 右缘贴 dot, 垂直居中
             ),
             UiState::List(_) => (
                 Vec2::new(LIST_W, LIST_H),
@@ -243,11 +253,11 @@ impl TrayApp {
         });
     }
 
-    // 扇区序: 右=PLATFORM, 中(顶)=CORE, 左=APP (列表锚右下, 阅读顺序右→左 = CORE→APP)。
+    // 扇区序 (竖放, 左半圆自顶向下): 顶=CORE, 中=PLATFORM, 底=APP。
     fn sector_tier(i: usize) -> Tier {
         match i {
-            1 => Tier::Core,
-            0 => Tier::Platform,
+            0 => Tier::Core,
+            1 => Tier::Platform,
             _ => Tier::App,
         }
     }
@@ -283,8 +293,17 @@ impl TrayApp {
     }
 
     // 自愈 (P3): spawn `fusion-sv up` — daemon 恢复后 boot-set 拉起 T0 ∪ pin=auto。
+    // 默认路径解析: FUSION_SV_BIN > 同目录 sibling (LaunchAgent/nohup 场景) > PATH。
+    // (相对名 "fusion-sv" 依赖 PATH 含 target/release — 生产日志验证过会 spawn fail)
     fn self_heal(&mut self) {
-        let bin = std::env::var("FUSION_SV_BIN").unwrap_or_else(|_| "fusion-sv".into());
+        let bin = std::env::var("FUSION_SV_BIN").unwrap_or_else(|_| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("fusion-sv")))
+                .filter(|p| p.exists())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "fusion-sv".into())
+        });
         match std::process::Command::new(&bin).arg("up").spawn() {
             Ok(_) => tracing::info!(%bin, "self-heal: fusion-sv up spawned"),
             Err(e) => tracing::error!(%bin, err = %e, "self-heal spawn failed"),
@@ -413,7 +432,7 @@ impl TrayApp {
                     .unwrap_or(Vec2::splat(FAN_WIN));
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 let painter = ui.painter_at(rect);
-                let center = Pos2::new(rect.center().x, rect.bottom()); // 扇心 = 底边中点 = dot
+                let center = Pos2::new(rect.right(), rect.center().y); // 扇心 = 右缘中点 = dot
                 painter.circle_filled(center, DOT_R + 1.0, pal.text);
 
                 let mpos = ctx.input(|i| i.pointer.latest_pos());
@@ -421,18 +440,25 @@ impl TrayApp {
                 if let Some(mp) = mpos {
                     let rel = mp - center;
                     let dist = rel.length();
-                    if dist <= FAN_R && rel.y < 0.0 {
-                        // 上半平面: 0=右 … PI=左, 每 60° 一扇区。
-                        let ang = (-rel.y).atan2(rel.x);
-                        let idx = ((ang / (std::f32::consts::PI / 3.0)) as usize).min(2);
+                    if dist <= FAN_R && rel.x < 0.0 {
+                        // 左半平面 (扇区向左展开): 顶=CORE, 中=PLATFORM, 底=APP, 每 60° 一扇区。
+                        let mut ang = (-rel.y).atan2(rel.x);
+                        if ang < 0.0 {
+                            ang += 2.0 * std::f32::consts::PI;
+                        }
+                        let idx = (((ang - std::f32::consts::FRAC_PI_2)
+                            / (std::f32::consts::PI / 3.0))
+                            as usize)
+                            .min(2);
                         hover = Some(idx);
                     }
                 }
 
                 for i in 0..3usize {
                     let tier = Self::sector_tier(i);
-                    let a0 = i as f32 * (std::f32::consts::PI / 3.0);
-                    let a1 = (i + 1) as f32 * (std::f32::consts::PI / 3.0);
+                    let a0 = std::f32::consts::FRAC_PI_2 + i as f32 * (std::f32::consts::PI / 3.0);
+                    let a1 =
+                        std::f32::consts::FRAC_PI_2 + (i + 1) as f32 * (std::f32::consts::PI / 3.0);
                     let svcs = model.tier_svcs(tier);
                     let agg = state::sector(&svcs);
                     let alpha = if hover == Some(i) { 70u8 } else { 38u8 };
@@ -459,18 +485,17 @@ impl TrayApp {
                         FontId::proportional(10.0),
                         pal.text_dim,
                     );
-                    // 健康点阵: 方阵排布在扇中带。
+                    // 健康点阵: 径向向外堆行, 切向排列 (适配竖放左半圆)。
                     let cols = ((agg.dots.len() as f32).sqrt().ceil() as usize).max(1);
+                    let (ux, uy) = (mid.cos(), -mid.sin());
+                    let (px, py) = (-uy, ux);
                     for (di, dc) in agg.dots.iter().enumerate() {
                         let row = (di / cols) as f32;
                         let colx = (di % cols) as f32;
-                        let dp = Pos2::new(
-                            center.x
-                                + mid.cos() * (FAN_R * 0.30)
-                                + (colx - (cols as f32 - 1.0) / 2.0) * 10.0
-                                - row * 4.0,
-                            center.y - mid.sin() * (FAN_R * 0.30) - row * 10.0,
-                        );
+                        let off = (colx - (cols as f32 - 1.0) / 2.0) * 10.0;
+                        let rr = FAN_R * 0.30 + row * 10.0;
+                        let dp =
+                            Pos2::new(center.x + ux * rr + px * off, center.y + uy * rr + py * off);
                         painter.circle_filled(dp, 2.5, dot_color_of(*dc));
                     }
                 }
@@ -562,42 +587,21 @@ impl TrayApp {
                     }
                 });
                 ui.separator();
-                // 分组动作: CORE = 一键重启 + 全部停止; T1/T2 = 一键拉起 + 全部停止。
+                // 分组动作: 三级统一 一键启动 + 一键停止 (停止为破坏性, 走确认弹窗)。
                 ui.horizontal(|ui| {
-                    if tier == Tier::Core {
-                        if ui.button("一键重启").clicked() {
-                            self.destructive(
-                                "确认重启 CORE 全部服务? (down T0 → up T0)",
-                                vec![
-                                    api::Cmd::Group {
-                                        group: api::TierKey::T0,
-                                        action: api::Action::Down,
-                                    },
-                                    api::Cmd::Group {
-                                        group: api::TierKey::T0,
-                                        action: api::Action::Up,
-                                    },
-                                ],
-                            );
-                        }
-                    } else if ui.button("一键拉起").clicked() {
-                        let g = if tier == Tier::Platform {
-                            api::TierKey::T1
-                        } else {
-                            api::TierKey::T2
-                        };
+                    let g = match tier {
+                        Tier::Core => api::TierKey::T0,
+                        Tier::Platform => api::TierKey::T1,
+                        Tier::App => api::TierKey::T2,
+                    };
+                    if ui.button("一键启动").clicked() {
                         self.enqueue(api::Cmd::Group {
                             group: g,
                             action: api::Action::Up,
                         });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("全部停止").clicked() {
-                            let g = match tier {
-                                Tier::Core => api::TierKey::T0,
-                                Tier::Platform => api::TierKey::T1,
-                                Tier::App => api::TierKey::T2,
-                            };
+                        if ui.button("一键停止").clicked() {
                             self.destructive(
                                 format!("确认停止 {} 全部服务?", tier.label()),
                                 vec![api::Cmd::Group {
