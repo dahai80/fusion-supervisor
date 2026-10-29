@@ -11,6 +11,37 @@ pub enum Layer {
     Cluster,
 }
 
+// PRD fusion-supervisor-app-tiering-1029: 启动分级 (boot tier), 与 Layer 正交 —
+// Layer 管启动顺序, Tier 管是否开机自启。缺省 T2 (新服务不抢开机资源)。
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum BootTier {
+    T0,
+    T1,
+    #[default]
+    T2,
+}
+
+impl BootTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootTier::T0 => "T0",
+            BootTier::T1 => "T1",
+            BootTier::T2 => "T2",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceDef {
     pub name: String,
@@ -22,6 +53,8 @@ pub struct ServiceDef {
     // up/down/tick/status 全跳过 — 注册表噪声与真实故障分离。
     pub managed: bool,
     pub layer: Layer,
+    // PRD app-tiering: 启动分级, 缺省 T2; supervise:false 豁免条目照常标注但不进 tier 操作面
+    pub boot_tier: BootTier,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +73,9 @@ struct ServiceEntry {
     // issue #31: 显式豁免标记。默认 true (可托管); false = 不建 runner。
     #[serde(default = "default_supervise")]
     supervise: bool,
+    // PRD app-tiering: 缺省 T2 (新注册服务默认不抢开机资源)
+    #[serde(default)]
+    boot: BootTier,
 }
 
 fn default_supervise() -> bool {
@@ -167,6 +203,7 @@ impl ServiceManifest {
                     purpose: entry.purpose,
                     fixed: entry.fixed,
                     managed: entry.supervise,
+                    boot_tier: entry.boot,
                 }
             })
             .collect();
@@ -363,5 +400,74 @@ external_tools: []
                     .position(|n| *n == "fusion-multi-node")
                     .unwrap()
         );
+    }
+
+    // PRD app-tiering: boot 字段解析 — 缺省 T2, 显式 T0/T1 生效, 非法值报错
+    #[test]
+    fn test_boot_tier_default_t2() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), FAKE_REGISTRY).unwrap();
+        let defs = ServiceManifest::load(tmp.path()).unwrap();
+        for name in ["fusion-mlx", "fusion-rag", "fusion-multi-node"] {
+            let d = defs.iter().find(|d| d.name == name).unwrap();
+            assert_eq!(d.boot_tier, BootTier::T2, "{name} 无 boot 字段应缺省 T2");
+        }
+    }
+
+    #[test]
+    fn test_boot_tier_explicit_parse() {
+        let yaml = r#"
+services:
+  fusion-mlx:
+    port: 11434
+    purpose: 推理
+    fixed: true
+    boot: T0
+  fusion-rag:
+    port: 11436
+    purpose: 知识库
+    boot: T1
+  fusion-health:
+    port: 11471
+    purpose: 健康
+    boot: T2
+reserved: []
+external_tools: []
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        let defs = ServiceManifest::load(tmp.path()).unwrap();
+        let mlx = defs.iter().find(|d| d.name == "fusion-mlx").unwrap();
+        assert_eq!(mlx.boot_tier, BootTier::T0);
+        let rag = defs.iter().find(|d| d.name == "fusion-rag").unwrap();
+        assert_eq!(rag.boot_tier, BootTier::T1);
+        let health = defs.iter().find(|d| d.name == "fusion-health").unwrap();
+        assert_eq!(health.boot_tier, BootTier::T2);
+    }
+
+    #[test]
+    fn test_boot_tier_illegal_value_rejected() {
+        let yaml = r#"
+services:
+  fusion-mlx:
+    port: 11434
+    purpose: 推理
+    boot: T9
+reserved: []
+external_tools: []
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), yaml).unwrap();
+        assert!(
+            ServiceManifest::load(tmp.path()).is_err(),
+            "T9 非法枚举应解析失败"
+        );
+    }
+
+    #[test]
+    fn test_boot_tier_as_str() {
+        assert_eq!(BootTier::T0.as_str(), "T0");
+        assert_eq!(BootTier::T1.as_str(), "T1");
+        assert_eq!(BootTier::T2.as_str(), "T2");
     }
 }

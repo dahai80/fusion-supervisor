@@ -23,6 +23,7 @@ fn def(name: &str, port: u16) -> ServiceDef {
         purpose: "x".into(),
         fixed: false,
         managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
         layer: Layer::App,
     }
 }

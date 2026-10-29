@@ -165,6 +165,7 @@ mod tests {
             fixed: false,
             managed: true,
             layer,
+            boot_tier: crate::manifest::BootTier::T2,
         }
     }
 

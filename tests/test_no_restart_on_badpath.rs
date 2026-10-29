@@ -15,6 +15,7 @@ async fn test_badpath_never_restarts() {
         purpose: "x".into(),
         fixed: false,
         managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
         layer: Layer::App,
     };
     let calls = Arc::new(Mutex::new(Vec::<String>::new()));

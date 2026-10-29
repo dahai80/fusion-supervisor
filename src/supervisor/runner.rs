@@ -407,6 +407,7 @@ mod tests {
             fixed: false,
             managed: true,
             layer: Layer::App,
+            boot_tier: crate::manifest::BootTier::T2,
         }
     }
 

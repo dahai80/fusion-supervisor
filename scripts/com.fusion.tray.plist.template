@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fusion-tray LaunchAgent template (PRD app-tiering P3, issue #62).
+
+  Install (fill in __FUSION_SUPERVISOR_DIR__ first):
+    cp scripts/com.fusion.tray.plist.template ~/Library/LaunchAgents/com.fusion.tray.plist
+    # edit the plist: replace __FUSION_SUPERVISOR_DIR__ with the real path
+    launchctl unload ~/Library/LaunchAgents/com.fusion.tray.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.fusion.tray.plist
+    rm ~/Library/LaunchAgents/com.fusion.tray.plist
+
+  No secrets required. Optional env overrides via the EnvironmentVariables dict:
+    FUSION_SV_BASE  (default http://127.0.0.1:9100)
+    FUSION_SV_TOKEN (only if the daemon runs with FUSION_SV_TOKEN auth)
+    FUSION_TRAY_THEME ("dark" / "light", default follows system appearance)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fusion.tray</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__FUSION_SUPERVISOR_DIR__/target/release/fusion-tray</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/fusion-tray.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/fusion-tray.log</string>
+</dict>
+</plist>

@@ -15,6 +15,7 @@ async fn test_lifecycle_crash_then_recover() {
         purpose: "x".into(),
         fixed: false,
         managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
         layer: Layer::App,
     };
     let probe_cell = Arc::new(Mutex::new(ProbeResult::Healthy { latency_ms: 1 }));

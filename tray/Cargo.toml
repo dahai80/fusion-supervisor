@@ -1,0 +1,18 @@
+[package]
+name = "fusion-tray"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Fusion supervisor desktop floating-dot tray (PRD app-tiering P2)"
+
+[[bin]]
+name = "fusion-tray"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

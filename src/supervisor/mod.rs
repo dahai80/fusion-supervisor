@@ -5,10 +5,10 @@ use crate::alert::Alerter;
 use crate::compose::{ComposeBackend, DockerCompose};
 use crate::config::Config;
 use crate::dep_map;
-use crate::manifest::{Layer, ServiceDef, ServiceManifest};
+use crate::manifest::{BootTier, Layer, ServiceDef, ServiceManifest};
 use crate::probe::{ProbeResult, ProbeSpec, probe};
 use crate::probe_map;
-use crate::store::HistoryStore;
+use crate::store::{HistoryStore, PinMode};
 use anyhow::Result;
 // issue #60: CommandExt::process_group — 服务子进程独立进程组, 隔离 daemon 重载的组信号
 use std::os::unix::process::CommandExt;
@@ -25,6 +25,16 @@ pub struct StatusEntry {
     pub state: String, // State 的字符串形式, 兼容容器平面 (Failed/Healthy/...)
     pub port: u16,
     pub plane: String, // "native" | "compose"
+}
+
+// PRD app-tiering: /api/v1/boot 行。pinned=None 表示无个人覆盖 (走注册表 boot 字段)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BootEntry {
+    pub name: String,
+    pub tier: &'static str,
+    pub pinned: Option<String>,
+    pub state: String,
+    pub port: u16,
 }
 
 pub struct SupervisorCore {
@@ -47,6 +57,8 @@ pub struct SupervisorCore {
     last_prune_ts: u64,
     // issue #37: 累计清除的 history.db 行数 (/metrics fusion_sv_events_pruned_total)
     pub events_pruned_total: u64,
+    // PRD app-tiering: pin 覆盖内存缓存 (boot_auto 零查询); 真源在 store.boot_pin 表
+    boot_pins: std::collections::HashMap<String, PinMode>,
 }
 
 impl SupervisorCore {
@@ -91,6 +103,7 @@ impl SupervisorCore {
                 )
             })
             .collect();
+        let boot_pins = load_boot_pins(&store);
         let compose = build_compose(&cfg);
         let compose_tracker = crate::compose_tracker::ComposeTracker::new(
             cfg.alert_dedup_sec,
@@ -108,6 +121,7 @@ impl SupervisorCore {
             last_backup_ts: 0,
             last_prune_ts: 0,
             events_pruned_total: 0,
+            boot_pins,
         })
     }
 
@@ -135,6 +149,7 @@ impl SupervisorCore {
         let db_path =
             std::env::temp_dir().join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
         let store = Arc::new(HistoryStore::open(&db_path).unwrap());
+        let boot_pins = load_boot_pins(&store);
         // issue #37: 测试构造同样注入事件 sink — native 告警落库行为与生产一致 (可测)
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
             .with_event_sink(make_event_sink(store.clone()));
@@ -174,6 +189,7 @@ impl SupervisorCore {
             last_backup_ts: 0,
             last_prune_ts: 0,
             events_pruned_total: 0,
+            boot_pins,
         }
     }
 
@@ -197,8 +213,22 @@ impl SupervisorCore {
 
     // native up: 按 layer 序, 层内并发 cap。先探活, 已健康跳过 (避双启)。
     async fn up_native(&mut self) -> Result<()> {
-        let sorted =
-            ServiceManifest::sort_by_layer(self.runners.iter().map(|r| r.def.clone()).collect());
+        self.up_native_where(&|_| true).await
+    }
+
+    // PRD app-tiering: 带 boot 集过滤的 native up — keep=true 的服务参与启动, 其余跳过。
+    // up_all 走全真谓词; up_boot_set / boot_group 走成员谓词。复用既有层序+并发+探活逻辑。
+    async fn up_native_where(
+        &mut self,
+        keep: &(dyn Fn(&ServiceDef) -> bool + Send + Sync),
+    ) -> Result<()> {
+        let sorted = ServiceManifest::sort_by_layer(
+            self.runners
+                .iter()
+                .map(|r| r.def.clone())
+                .filter(|d| keep(d))
+                .collect(),
+        );
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
         // 分层桶: 同 layer 内并发, 层间串行
         let mut by_layer: std::collections::BTreeMap<Layer, Vec<ServiceDef>> =
@@ -309,7 +339,20 @@ impl SupervisorCore {
 
     // native down: 逆序 (cluster→domain→app→platform→core)。
     async fn down_native(&mut self) -> Result<()> {
-        let mut defs: Vec<ServiceDef> = self.runners.iter().map(|r| r.def.clone()).collect();
+        self.down_native_where(&|_| true).await
+    }
+
+    // PRD app-tiering: 带 boot 集过滤的 native down (分组批量停用)。
+    async fn down_native_where(
+        &mut self,
+        keep: &(dyn Fn(&ServiceDef) -> bool + Send + Sync),
+    ) -> Result<()> {
+        let mut defs: Vec<ServiceDef> = self
+            .runners
+            .iter()
+            .map(|r| r.def.clone())
+            .filter(|d| keep(d))
+            .collect();
         defs = ServiceManifest::sort_by_layer(defs);
         defs.reverse(); // 逆序停
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
@@ -430,6 +473,162 @@ impl SupervisorCore {
         }
         if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
             r.state = runner::State::Stopped;
+        }
+        Ok(())
+    }
+
+    // ===== PRD app-tiering (issue #62): boot 分级启动 API =====
+
+    // 生效优先级: pin 覆盖 > 注册表 boot 字段。boot_pins 内存缓存 (构造时从 store 加载),
+    // set_boot_pin 时同步更新 — boot_auto 零查询, tick/RPC 热路径不碰 SQLite。
+    pub fn boot_auto(&self, d: &ServiceDef) -> bool {
+        match self.boot_pins.get(&d.name) {
+            Some(PinMode::Auto) => true,
+            Some(PinMode::Manual) => false,
+            None => d.boot_tier == BootTier::T0,
+        }
+    }
+
+    // 开机集 = T0 ∪ pin=auto。auto_up_on_start 语义收窄为只拉这批 (issue #62)。
+    // 复用 up_native_where: 层序 + 并发 cap + 探活跳过已健康, 行为与 up_all 一致。
+    pub async fn up_boot_set(&mut self) -> Result<()> {
+        // 先物化成员集再进 up_native_where — 闭包只捕获 owned set,
+        // 不借 &self.boot_pins (与循环内 &mut self 借用冲突)。
+        let members: std::collections::HashSet<String> = self
+            .runners
+            .iter()
+            .filter(|r| self.boot_auto(&r.def))
+            .map(|r| r.def.name.clone())
+            .collect();
+        tracing::info!(n = members.len(), "boot set: T0 + pin=auto");
+        self.up_native_where(&|d| members.contains(&d.name)).await
+    }
+
+    // 分组批量 up/down (面板 "一键拉起/全部停止")。复用逐服务路径,
+    // 返回部分失败汇总 (验收: group 部分失败可观测, 不因单个失败中断整批)。
+    pub async fn boot_group(&mut self, group: &str, action: &str) -> Result<serde_json::Value> {
+        if action != "up" && action != "down" {
+            anyhow::bail!("unknown boot action: {action}");
+        }
+        let keep: Box<dyn Fn(&ServiceDef) -> bool + Send + Sync> = match group {
+            "T0" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T0),
+            "T1" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T1),
+            "pinned" => {
+                // 克隆 pin 快照进闭包 — 不借 self
+                let pins: Vec<String> = self.boot_pins.keys().cloned().collect();
+                Box::new(move |d: &ServiceDef| pins.contains(&d.name))
+            }
+            other => anyhow::bail!("unknown boot group: {other}"),
+        };
+        if action == "up" {
+            self.up_native_where(&*keep).await?;
+        } else {
+            self.down_native_where(&*keep).await?;
+        }
+        let mut started = 0u32;
+        let mut already_up = 0u32;
+        let mut stopped = 0u32;
+        let mut failed = 0u32;
+        let mut skipped = 0u32;
+        for r in self.runners.iter() {
+            if !keep(&r.def) {
+                continue;
+            }
+            use runner::State as S;
+            match r.state {
+                S::Starting | S::Restarting => started += 1,
+                S::Healthy | S::Draining => already_up += 1,
+                S::Stopped if action == "down" => stopped += 1,
+                S::Stopped if action == "up" => skipped += 1, // dep-gate 跳过等
+                S::Failed => failed += 1,
+                _ => skipped += 1,
+            }
+        }
+        tracing::info!(
+            group,
+            action,
+            started,
+            already_up,
+            stopped,
+            failed,
+            skipped,
+            "boot group done"
+        );
+        Ok(serde_json::json!({
+            "group": group,
+            "action": action,
+            "started": started,
+            "already_up": already_up,
+            "stopped": stopped,
+            "failed": failed,
+            "skipped": skipped,
+        }))
+    }
+
+    // /api/v1/boot 冷启动全量 (只读, 无 token — 与 /api/v1/status 对齐)。
+    // tier 分组序 (T0→T1→T2), 同 tier 内稳定排序保持注册表书写顺序。
+    pub fn boot_status(&self) -> Vec<BootEntry> {
+        let mut out: Vec<BootEntry> = self
+            .runners
+            .iter()
+            .map(|r| BootEntry {
+                name: r.def.name.clone(),
+                tier: r.def.boot_tier.as_str(),
+                pinned: self
+                    .boot_pins
+                    .get(&r.def.name)
+                    .map(|m| m.as_str().to_string()),
+                state: format!("{:?}", r.state),
+                port: r.def.port,
+            })
+            .collect();
+        out.sort_by_key(|e| match e.tier {
+            "T0" => 0,
+            "T1" => 1,
+            _ => 2,
+        });
+        out
+    }
+
+    // 写/清个人覆盖: 真源 store.boot_pin 表 (重启不丢, 验收 §5.4), 内存缓存同步。
+    pub fn set_boot_pin(&mut self, service: &str, mode: Option<PinMode>) -> Result<()> {
+        if !self.runners.iter().any(|r| r.def.name == service) {
+            anyhow::bail!("unknown service: {service}");
+        }
+        self.store.set_boot_pin(service, mode)?;
+        match mode {
+            Some(m) => {
+                self.boot_pins.insert(service.to_string(), m);
+                tracing::info!(svc = %service, mode = m.as_str(), "boot pin set");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Err(e) = self.store.record_event(
+                    service,
+                    "BootPin",
+                    &format!("pin mode={}", m.as_str()),
+                    ts,
+                    "native",
+                    "info",
+                ) {
+                    tracing::warn!(svc = %service, err = %e, "BootPin 事件写库失败 (非致命)");
+                }
+            }
+            None => {
+                self.boot_pins.remove(service);
+                tracing::info!(svc = %service, "boot pin 清除 (回到注册表 boot 语义)");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Err(e) =
+                    self.store
+                        .record_event(service, "BootPin", "pin cleared", ts, "native", "info")
+                {
+                    tracing::warn!(svc = %service, err = %e, "BootPin 事件写库失败 (非致命)");
+                }
+            }
         }
         Ok(())
     }
@@ -835,6 +1034,19 @@ fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
     )
 }
 
+// PRD app-tiering: pin 覆盖从 store 加载 (重启不丢, 验收 §5.4)。失败降级空缓存
+// (pin 表损坏不杀 daemon, 行为同告警兜底哲学, tracing warn 留痕)。
+fn load_boot_pins(store: &Arc<HistoryStore>) -> std::collections::HashMap<String, PinMode> {
+    store
+        .all_boot_pins()
+        .unwrap_or_else(|e| {
+            tracing::warn!(err = %e, "boot pins 读取失败, 以空覆盖继续");
+            Vec::new()
+        })
+        .into_iter()
+        .collect()
+}
+
 // 据配置构建 compose 后端。enabled=false → None (仅 native)。
 // 文件不存在时告警但返回 None (不阻塞 native 启动, 操作员按提示补文件)。
 fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
@@ -1036,7 +1248,14 @@ mod tests {
             fixed: false,
             managed: true,
             layer,
+            boot_tier: BootTier::T2,
         }
+    }
+
+    fn def_tier(name: &str, layer: Layer, port: u16, tier: BootTier) -> ServiceDef {
+        let mut d = def(name, layer, port);
+        d.boot_tier = tier;
+        d
     }
 
     fn fake_cfg() -> Config {
@@ -2163,5 +2382,162 @@ mod tests {
             matches!(core.runners[0].state, runner::State::Stopped),
             "prewarm 失败应留 Stopped (不回滚)"
         );
+    }
+
+    // ===== PRD app-tiering (issue #62) boot API 单测 =====
+
+    // up_boot_set 只拉 T0 + pin=auto — T1/T2 无 pin 不参与
+    #[tokio::test]
+    async fn test_up_boot_set_only_t0_and_pin_auto() {
+        let defs = vec![
+            def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0),
+            def_tier("fusion-gateway", Layer::Core, 11432, BootTier::T0),
+            def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1),
+            def("fusion-health", Layer::Domain, 11471),
+        ];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        // pin fusion-rag 成 auto — 应进入 boot 集
+        core.set_boot_pin("fusion-rag", Some(PinMode::Auto))
+            .unwrap();
+        core.up_boot_set().await.unwrap();
+        let got: Vec<String> = calls.lock().unwrap().clone();
+        // 顺序: 层序 (fixed/layer) — mlx, gateway (Core), rag (Platform)
+        assert_eq!(
+            got,
+            vec![
+                "fusion-mlx/start",
+                "fusion-gateway/start",
+                "fusion-rag/start"
+            ]
+        );
+        // health (T2, 无 pin) 不参与
+        assert!(!got.iter().any(|s| s.starts_with("fusion-health")));
+    }
+
+    // boot_group T1 up: 部分失败汇总正确
+    #[tokio::test]
+    async fn test_boot_group_t1_up_partial_summary() {
+        let defs = vec![
+            def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1),
+            def_tier("fusion-cowork", Layer::App, 11460, BootTier::T1),
+        ];
+        let fail = Arc::new(Mutex::new(vec!["fusion-cowork".to_string()]));
+        let fail_p = fail.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, _cmd, _env| {
+                if fail_p.lock().unwrap().contains(&svc.to_string()) {
+                    anyhow::bail!("boom")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let res = core.boot_group("T1", "up").await.unwrap();
+        assert_eq!(res["started"], 1, "rag 起了");
+        assert_eq!(
+            res["failed"], 1,
+            "cowork start 失败 (fake start_fn 返回 Err, up_one 排进 Failed)"
+        );
+        assert_eq!(res["group"], "T1");
+        assert_eq!(res["action"], "up");
+    }
+
+    // pin 覆盖注册表: T0 unpin 成 manual 后不进 boot 集
+    #[tokio::test]
+    async fn test_boot_pin_overrides_registry() {
+        let defs = vec![def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0)];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        // T0 unpin 成 manual — 不再进 boot 集
+        core.set_boot_pin("fusion-mlx", Some(PinMode::Manual))
+            .unwrap();
+        assert!(!core.boot_auto(&core.runners[0].def));
+        assert_eq!(calls.lock().unwrap().len(), 0);
+    }
+
+    // boot_status: tier 分组序 + pinned 字段
+    #[tokio::test]
+    async fn test_boot_status_entries() {
+        let defs = vec![
+            def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1),
+            def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0),
+            def("fusion-health", Layer::Domain, 11471),
+        ];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.set_boot_pin("fusion-health", Some(PinMode::Auto))
+            .unwrap();
+        let rows = core.boot_status();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "fusion-mlx");
+        assert_eq!(rows[0].tier, "T0");
+        assert_eq!(rows[0].pinned, None);
+        assert_eq!(rows[1].name, "fusion-rag");
+        assert_eq!(rows[1].tier, "T1");
+        assert_eq!(rows[2].name, "fusion-health");
+        assert_eq!(rows[2].pinned.as_deref(), Some("auto"));
+        // 状态字符串非空
+        assert!(!rows[0].state.is_empty());
+    }
+
+    // 非法 group/action 直接 bail, 不动任何服务
+    #[tokio::test]
+    async fn test_boot_group_invalid_args() {
+        let defs = vec![def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        assert!(core.boot_group("T9", "up").await.is_err());
+        assert!(core.boot_group("T0", "sideways").await.is_err());
+        assert!(core.set_boot_pin("nope", Some(PinMode::Auto)).is_err());
+    }
+
+    // load_boot_pins: 从 store 重载 pin (重启不丢语义, 存取持久化由 store.rs 测)
+    #[test]
+    fn test_load_boot_pins_reads_store() {
+        use crate::store::HistoryStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let s = HistoryStore::open(tmp.path()).unwrap();
+        s.set_boot_pin("fusion-rag", Some(PinMode::Auto)).unwrap();
+        s.set_boot_pin("fusion-health", Some(PinMode::Manual))
+            .unwrap();
+        let pins = load_boot_pins(&Arc::new(s));
+        assert_eq!(pins.get("fusion-rag"), Some(&PinMode::Auto));
+        assert_eq!(pins.get("fusion-health"), Some(&PinMode::Manual));
     }
 }

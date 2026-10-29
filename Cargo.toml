@@ -1,3 +1,7 @@
+# issue #62: workspace 收纳 tray 子 crate (fusion-tray 悬浮点)
+[workspace]
+members = [".", "tray"]
+
 [package]
 name = "fusion-supervisor"
 version = "0.1.12"
