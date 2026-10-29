@@ -199,6 +199,12 @@ A 14px dot docked at the right screen edge (vertical center): green = all T0 hea
 
 When the daemon is unreachable the dot turns gray and the panel shows a "daemon 未运行" notice with one-click self-heal (`fusion-sv up`); no white screen. Unreachable is decided by a two-step probe: `GET /api/v1/boot` first, then `GET /health` (lock-free handler) as a busy-vs-dead discriminator — a timed-out `/boot` with a live `/health` keeps the current view and logs "daemon 忙" instead of flashing the unreachable notice (batch group ops hold the core mutex for seconds). Env: `FUSION_SV_BASE` (default `http://127.0.0.1:9100`), `FUSION_SV_TOKEN`, `FUSION_TRAY_THEME` (`dark`/`light`, default follows system appearance). Poll cadence: 5s panel open / 30s dot / 60s unreachable.
 
+**Resident-process robustness + memory** (PRD audit hardening):
+
+- **CJK font subset**: the tray embeds `tray/assets/cjk-subset.ttf` (~132KB, `include_bytes!` + `FontData::from_static`, zero-copy) instead of reading the 22.4MB system Hiragino Sans GB at runtime — the full font used to stay resident as 3 malloc copies (~70MB) plus glyph caches, pushing RSS to ~180MB. After subsetting: RSS ~100MB (GPU/GL baseline included), `MALLOC_LARGE` 69MB → 2MB. After adding new Chinese text run `bash tray/gen_font_subset.sh && cargo test -p fusion-tray`; `font_tests::test_subset_font_covers_source_charset` (ttf-parser) fails the build if the subset drifts from the source charset.
+- **Panic isolation**: poller and worker threads wrap each iteration in `catch_unwind` (a panic logs ERROR and continues instead of killing the tray); the daemon tick loop spawns each round in an inner task so a `tick_all` panic cannot silently stop supervision while RPC/HTTP stay alive. All tray mutexes use poison-recovery locks (`.lock().unwrap_or_else(|p| p.into_inner())`) so a panicked thread cannot cascade.
+- **Transparent dot window**: the L1 dot window overrides `eframe::App::clear_color` to fully transparent (eframe's default `rgba(12,12,12,180)` painted a gray square behind the half-circle dot); fan/list/unreachable states keep their opaque panel backgrounds.
+
 ### LaunchAgent (log in → tray resident)
 
 ```bash
@@ -216,7 +222,7 @@ launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
 ## Test
 
 ```bash
-cargo test --all-targets          # 195 test fns (unit + 13 integration files)
+cargo test --all-targets          # 210 test fns (unit + 13 integration files)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

@@ -1310,6 +1310,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "ureq",
 ]
 

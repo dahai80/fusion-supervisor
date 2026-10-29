@@ -133,12 +133,22 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut c = core_tick.lock().await;
-            c.tick_all(now).await;
-            // issue #10: 备份调度检查 (到期触发 run_backup, fail-closed 已告警)
-            c.check_backup_schedule(now).await;
-            // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
-            c.check_retention(now);
+            // tick 单轮 panic 隔离: panic 会杀掉整个 tick task — RPC/HTTP 仍活
+            // 但监督静默停摆 (探活/自愈/告警全停), 常驻组件不可接受。inner spawn
+            // 隔离 (JoinError 捕获 panic), 崩了记 ERROR 下一 tick 续跑。
+            // 锁纪律不变: tick 体内取锁, 外层 sleep 无锁。
+            let core_inner = core_tick.clone();
+            let tick_round = tokio::spawn(async move {
+                let mut c = core_inner.lock().await;
+                c.tick_all(now).await;
+                // issue #10: 备份调度检查 (到期触发 run_backup, fail-closed 已告警)
+                c.check_backup_schedule(now).await;
+                // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
+                c.check_retention(now);
+            });
+            if let Err(e) = tick_round.await {
+                tracing::error!(err = %e, "tick 单轮 panic (自愈续跑)");
+            }
         }
     });
     // issue #22/#26/#25: HTTP 面 (metrics + 只读 status/history/events + web

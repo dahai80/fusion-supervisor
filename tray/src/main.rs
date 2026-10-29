@@ -35,10 +35,10 @@ pub struct Shared {
 
 impl Shared {
     fn ui_state(&self) -> UiState {
-        *self.ui_state.lock().unwrap()
+        *self.ui_state.lock().unwrap_or_else(|p| p.into_inner())
     }
     fn set_ui_state(&self, s: UiState) {
-        *self.ui_state.lock().unwrap() = s;
+        *self.ui_state.lock().unwrap_or_else(|p| p.into_inner()) = s;
     }
 }
 
@@ -115,81 +115,106 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// CJK 字体: egui 默认字体无中文字形。加载 macOS 系统字体, 追加到 family 尾部
-// (拉丁走默认字形, 缺字回退 CJK)。全部候选失败仅 WARN — 不崩溃。
+// CJK 字体: egui 默认字体无中文字形。构建期 pyftsubset 子集化 Hiragino Sans GB
+// (tray/assets/cjk-subset.ttf ~120KB, 覆盖 src 全部非 ASCII 字符 — 回归测试
+// test_subset_font_covers_source_charset 守护漂移; 再生成脚本 tray/gen_font_subset.sh)。
+// 全量系统字体 22.4MB 会驻留 3 份 malloc 拷贝 (from_owned Vec + ab_glyph 解析副本 +
+// glyph 数据) — 常驻内存硬约束下必须子集化。缺字形 (◀◐📌📍🔍) 走 egui 默认字体兜底。
+const CJK_SUBSET: &[u8] = include_bytes!("../assets/cjk-subset.ttf");
+
 fn load_cjk_font(ctx: &egui::Context) {
-    let candidates = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/Library/Fonts/Arial Unicode.ttf",
-    ];
-    for path in candidates {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let mut fonts = egui::FontDefinitions::default();
-                fonts
-                    .font_data
-                    .insert("cjk".into(), egui::FontData::from_owned(bytes));
-                for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                    fonts.families.entry(fam).or_default().push("cjk".into());
-                }
-                ctx.set_fonts(fonts);
-                tracing::info!(%path, "CJK font loaded");
-                return;
-            }
-            Err(e) => tracing::warn!(%path, err = %e, "CJK font candidate unreadable"),
-        }
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("cjk".into(), egui::FontData::from_static(CJK_SUBSET));
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push("cjk".into());
     }
-    tracing::warn!("no CJK font found — 中文标签将显示为方块");
+    ctx.set_fonts(fonts);
+    tracing::info!(bytes = CJK_SUBSET.len(), "CJK subset font loaded");
 }
 
 fn poller_loop(shared: Arc<Shared>) {
     let agent = api::new_agent();
     let mut last_poll = std::time::Instant::now() - Duration::from_secs(3600);
     loop {
-        let (ui, reachable) = {
-            let m = shared.model.lock().unwrap();
-            (shared.ui_state(), m.reachable)
-        };
-        let interval = state::poll_interval_secs(ui, reachable);
-        if last_poll.elapsed() >= Duration::from_secs(interval) {
-            match api::fetch_boot(&agent, &shared.base) {
-                Ok(m) => {
-                    *shared.model.lock().unwrap() = m;
-                }
-                Err(e) => {
-                    // /boot 超时 ≠ daemon 挂: 批量组操作占住核心锁数秒→数十秒,
-                    // /health handler 不锁核心仍应答。/health 通 = 忙, 保持最后模型不置灰。
-                    match api::fetch_health(&agent, &shared.base) {
-                        Ok(()) => {
-                            tracing::info!(err = %e, "boot poll timeout 但 /health 可达 (daemon 忙, 保持现状)");
-                        }
-                        Err(he) => {
-                            tracing::warn!(err = %e, health_err = %he, interval, "boot + health 均失败 (点变灰)");
-                            shared.model.lock().unwrap().reachable = false;
-                        }
+        // 单轮 panic 隔离: catch_unwind 包裹, 崩了记 ERROR 下一轮续跑 —
+        // 轮询线程死掉 = 点永久停格, 常驻组件不可接受。
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_one(&shared, &agent, &mut last_poll)
+        }));
+        if let Err(p) = res {
+            tracing::error!(panic = ?p, "poller 单轮 panic (自愈续跑)");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn poll_one(shared: &Shared, agent: &ureq::Agent, last_poll: &mut std::time::Instant) {
+    let (ui, reachable) = {
+        let m = shared.model.lock().unwrap_or_else(|p| p.into_inner());
+        (shared.ui_state(), m.reachable)
+    };
+    let interval = state::poll_interval_secs(ui, reachable);
+    if last_poll.elapsed() >= Duration::from_secs(interval) {
+        match api::fetch_boot(agent, &shared.base) {
+            Ok(m) => {
+                *shared.model.lock().unwrap_or_else(|p| p.into_inner()) = m;
+            }
+            Err(e) => {
+                // /boot 超时 ≠ daemon 挂: 批量组操作占住核心锁数秒→数十秒,
+                // /health handler 不锁核心仍应答。/health 通 = 忙, 保持最后模型不置灰。
+                match api::fetch_health(agent, &shared.base) {
+                    Ok(()) => {
+                        tracing::info!(err = %e, "boot poll timeout 但 /health 可达 (daemon 忙, 保持现状)");
+                    }
+                    Err(he) => {
+                        tracing::warn!(err = %e, health_err = %he, interval, "boot + health 均失败 (点变灰)");
+                        shared
+                            .model
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .reachable = false;
                     }
                 }
             }
-            last_poll = std::time::Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(250));
+        *last_poll = std::time::Instant::now();
     }
 }
 
 fn worker_loop(shared: Arc<Shared>) {
     let agent = api::new_agent();
     loop {
-        let batch: Vec<api::Cmd> = shared.queue.lock().unwrap().drain(..).collect();
-        for cmd in &batch {
-            let (url, body) = api::cmd_request(&shared.base, cmd);
-            match api::post_cmd(&agent, &url, body, &shared.token) {
-                Ok(_) => tracing::info!(?cmd, "cmd ok"),
-                Err(e) => tracing::error!(?cmd, err = %e, "cmd failed (探活回填纠错)"),
-            }
+        // 单轮 panic 隔离: 同 poller — 崩了记 ERROR 续跑。
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker_one(&shared, &agent)));
+        if let Err(p) = res {
+            tracing::error!(panic = ?p, "worker 单轮 panic (自愈续跑)");
         }
-        if batch.is_empty() {
+        if shared
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
             std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+fn worker_one(shared: &Shared, agent: &ureq::Agent) {
+    let batch: Vec<api::Cmd> = shared
+        .queue
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(..)
+        .collect();
+    for cmd in &batch {
+        let (url, body) = api::cmd_request(&shared.base, cmd);
+        match api::post_cmd(agent, &url, body, &shared.token) {
+            Ok(_) => tracing::info!(?cmd, "cmd ok"),
+            Err(e) => tracing::error!(?cmd, err = %e, "cmd failed (探活回填纠错)"),
         }
     }
 }
@@ -242,7 +267,11 @@ impl TrayApp {
     }
 
     fn enqueue(&self, cmd: api::Cmd) {
-        self.shared.queue.lock().unwrap().push_back(cmd);
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(cmd);
     }
 
     // 破坏性操作确认 (PRD §4.2): CORE 停止 / 全部停止 / 一键重启 / drain / rollout。
@@ -312,6 +341,13 @@ impl TrayApp {
 }
 
 impl eframe::App for TrayApp {
+    // dot 态窗口背景必须全透明 — eframe 默认 clear rgba(12,12,12,180) 即用户看到的
+    // "灰色正方形底" (with_transparent 只开窗口能力, 清屏色仍不透明)。fan/list/
+    // unreachable 态由各自 CentralPanel paint pal.bg 不透明底, 不受影响。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_style(ctx, palette(&self.theme));
         self.apply_viewport(ctx);
@@ -380,7 +416,12 @@ impl eframe::App for TrayApp {
 
 impl TrayApp {
     fn ui_dot(&mut self, ctx: &egui::Context) {
-        let model = self.shared.model.lock().unwrap().clone();
+        let model = self
+            .shared
+            .model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let c = model.dot();
         let base = dot_color_of(c);
         // 呼吸仅异常态 (PRD §4.2: 2s 呼吸, 只在不健康时)。
@@ -418,7 +459,12 @@ impl TrayApp {
 
 impl TrayApp {
     fn ui_fan(&mut self, ctx: &egui::Context) {
-        let model = self.shared.model.lock().unwrap().clone();
+        let model = self
+            .shared
+            .model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if !model.reachable {
             self.ui_unreachable(ctx);
             return;
@@ -542,7 +588,12 @@ fn draw_sector(
 
 impl TrayApp {
     fn ui_list(&mut self, ctx: &egui::Context, tier: Tier) {
-        let model = self.shared.model.lock().unwrap().clone();
+        let model = self
+            .shared
+            .model
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if !model.reachable {
             self.ui_unreachable(ctx);
             return;
@@ -654,7 +705,11 @@ impl TrayApp {
                                 api::PinMode::Manual => Some("manual".into()),
                                 api::PinMode::Clear => None,
                             };
-                            self.shared.model.lock().unwrap().set_pin(&s.name, pin_val);
+                            self.shared
+                                .model
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .set_pin(&s.name, pin_val);
                             self.enqueue(api::Cmd::Pin {
                                 service: s.name.clone(),
                                 mode,
@@ -670,13 +725,13 @@ impl TrayApp {
                             self.shared
                                 .model
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|p| p.into_inner())
                                 .set_state(&s.name, SvcState::Stopped);
                         } else {
                             self.shared
                                 .model
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|p| p.into_inner())
                                 .set_state(&s.name, SvcState::Starting);
                         }
                         let cmd = if running {
@@ -714,5 +769,48 @@ impl TrayApp {
                 ui.close_menu();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    // 子集字体覆盖回归: src/*.rs 全部非 ASCII 字符必须命中 cjk-subset.ttf 的 cmap,
+    // 否则新增中文标签渲染成方块。例外 FONT_MISSING: 源字体 (Hiragino Sans GB)
+    // 本身缺这些字形 (◀◐ 几何形走 egui 默认字体兜底; emoji 无 sans 字形) —
+    // 与全量字体行为一致, 子集不引入回归。
+    use super::CJK_SUBSET;
+
+    const FONT_MISSING: &[char] = &['◀', '◐', '📌', '📍', '🔍'];
+
+    #[test]
+    fn test_subset_font_covers_source_charset() {
+        let face = ttf_parser::Face::parse(CJK_SUBSET, 0).expect("内嵌 cjk-subset.ttf 必须可解析");
+        let mut missing = Vec::new();
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(&src_dir).expect("src 目录可读") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("src 文件可读");
+            for ch in text.chars().filter(|c| c.is_non_ascii_test()) {
+                if face.glyph_index(ch).is_none() && !FONT_MISSING.contains(&ch) {
+                    missing.push((ch, path.display().to_string()));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "子集字体缺字形 (跑 tray/gen_font_subset.sh 再生成): {missing:?}"
+        );
+    }
+
+    trait NonAsciiTest {
+        fn is_non_ascii_test(&self) -> bool;
+    }
+    impl NonAsciiTest for char {
+        fn is_non_ascii_test(&self) -> bool {
+            *self as u32 > 0x7E
+        }
     }
 }
