@@ -115,43 +115,83 @@ fn read_env_file(path: &std::path::Path) -> HashMap<String, String> {
 // 非依赖服务 (required_vars=None) → 空 map (无注入, 不报错)。
 // issue #78: QDRANT_URL 注入前先探本地 6333 可达性 — qdrant 容器没起时
 // 跳过该 key (fusion-rag 上游有 :memory: 兜底), 不让整个注入失败。
-pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<String, String>> {
+// issue #78 补: FUSION_PG_PASSWORD 缺失时探本地 5432 — native 平面 (compose_on=false)
+// 是 brew trust auth (fusion-db-conventions-1030 §1, 根本没有密码), 可达则注入
+// 无密码连接串; 不可达则跳过 DATABASE_URL (应用走 SQLite 兜底)。
+// compose 平面 (compose_on=true) sidecar PG 是密码认证, 缺密码 = 配置错误,
+// 保持 fail-closed 拒绝 (不静默降级到 trust 串打错库)。
+pub fn native_env_for(
+    svc: &str,
+    env_file: &std::path::Path,
+    compose_on: bool,
+) -> Result<HashMap<String, String>> {
     let qdrant_up = qdrant_reachable();
-    native_env_for_opts(svc, env_file, qdrant_up)
+    let pg_up = pg_reachable();
+    native_env_for_opts(svc, env_file, compose_on, pg_up, qdrant_up)
 }
 
-// issue #78: 可测版本 — qdrant_up 由测试注入 (不做真实网络探测)。
+// issue #78: 可测版本 — pg_up/qdrant_up 由测试注入 (不做真实网络探测)。
 pub fn native_env_for_opts(
     svc: &str,
     env_file: &std::path::Path,
+    compose_on: bool,
+    pg_up: bool,
     qdrant_up: bool,
 ) -> Result<HashMap<String, String>> {
     let Some(keys) = required_vars(svc) else {
         return Ok(HashMap::new());
     };
     // PG 连接串依赖的公共片段
-    let pg_user = resolve("FUSION_PG_USER", env_file).unwrap_or_else(|| "fusion".into());
+    let pg_user = resolve("FUSION_PG_USER", env_file);
     let pg_pw = resolve("FUSION_PG_PASSWORD", env_file);
     let pg_host = "localhost";
     let pg_port = "5432";
 
     let mut out = HashMap::new();
-    let mut skipped_qdrant = false;
+    let mut skipped = false;
     for k in keys {
         let val = match *k {
             "DATABASE_URL" => {
-                let pw = pg_pw.as_ref().with_context(|| {
-                    format!(
-                        "FUSION_PG_PASSWORD 缺失 — 无法为 {svc} 构造 DATABASE_URL (fail-closed)"
-                    )
-                })?;
                 let db = pg_db_for(svc, env_file);
-                format!("postgresql://{pg_user}:{pw}@{pg_host}:{pg_port}/{db}")
+                match (&pg_pw, &pg_user) {
+                    (Some(pw), user) => {
+                        let user = user.as_deref().unwrap_or("fusion");
+                        format!("postgresql://{user}:{pw}@{pg_host}:{pg_port}/{db}")
+                    }
+                    // issue #78 补: compose 平台 sidecar PG 密码认证, 缺密码 =
+                    // 配置错误, 保持 fail-closed (check_env 之外的二道防线)。
+                    (None, _) if compose_on => {
+                        bail!(
+                            "FUSION_PG_PASSWORD 缺失 — 无法为 {svc} 构造 DATABASE_URL (compose 平面 fail-closed)"
+                        );
+                    }
+                    // issue #78 补: native 平面 brew trust auth 无密码 —
+                    // PG 可达即注入无密码串 (FUSION_PG_USER 缺省省略 user
+                    // 段, libpq/asyncpg 默认 OS user); 不可达跳过让应用兜底。
+                    (None, _) if pg_up => {
+                        tracing::info!(
+                            svc,
+                            "FUSION_PG_PASSWORD 未设但 5432 可达 (trust auth), 注入无密码 DATABASE_URL"
+                        );
+                        match &pg_user {
+                            Some(u) => format!("postgresql://{u}@{pg_host}:{pg_port}/{db}"),
+                            None => format!("postgresql://{pg_host}:{pg_port}/{db}"),
+                        }
+                    }
+                    (None, _) => {
+                        skipped = true;
+                        tracing::info!(
+                            svc,
+                            "FUSION_PG_PASSWORD 未设且 5432 不可达, 跳过 DATABASE_URL 注入"
+                        );
+                        continue;
+                    }
+                }
             }
             "REDIS_URL" => "redis://localhost:6379/1".to_string(),
             "QDRANT_URL" => {
                 if !qdrant_up {
-                    skipped_qdrant = true;
+                    skipped = true;
                     tracing::info!(
                         svc,
                         "qdrant 127.0.0.1:6333 不可达, 跳过 QDRANT_URL 注入 (rag 走 :memory: 兜底)"
@@ -164,9 +204,9 @@ pub fn native_env_for_opts(
         };
         out.insert((*k).to_string(), val);
     }
-    // QDRANT_URL 是唯一被跳过的 key 时允许空 map (issue #78, rag 有兜底);
+    // 被跳过的 key (qdrant down / pg down) 允许空 map (应用有兜底);
     // 其余情况空 map = 解析异常, fail-closed。
-    if out.is_empty() && !skipped_qdrant {
+    if out.is_empty() && !skipped {
         bail!("env_map: {svc} 所需连接变量解析为空 (fail-closed)");
     }
     tracing::info!(svc, keys = ?keys, "native env 注入解析完成");
@@ -176,11 +216,20 @@ pub fn native_env_for_opts(
 // issue #78: 本地 qdrant (127.0.0.1:6333) 可达性探测, 300ms 超时。
 // 探测失败不阻断注入 (调用方跳过 QDRANT_URL, rag 走上游兜底)。
 fn qdrant_reachable() -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6333));
+    tcp_reachable(6333, "qdrant")
+}
+
+// issue #78 补: 本地 PG (127.0.0.1:5432) 可达性探测 (trust auth 佐证)。
+fn pg_reachable() -> bool {
+    tcp_reachable(5432, "postgres")
+}
+
+fn tcp_reachable(port: u16, what: &str) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)) {
         Ok(_) => true,
         Err(e) => {
-            tracing::info!(err = %e, "qdrant 探测失败, QDRANT_URL 将跳过注入");
+            tracing::info!(err = %e, what, port, "探测失败, 对应连接 env 将跳过注入");
             false
         }
     }
@@ -349,7 +398,7 @@ pub(crate) mod tests {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=secret123\nFUSION_PG_USER=appuser\n");
-        let env = native_env_for("fusion-identity", f.path()).unwrap();
+        let env = native_env_for("fusion-identity", f.path(), false).unwrap();
         let url = env.get("DATABASE_URL").unwrap();
         assert!(
             url.contains("appuser:secret123@localhost:5432/identity"),
@@ -357,18 +406,60 @@ pub(crate) mod tests {
         );
     }
 
-    // FUSION_PG_PASSWORD 缺失 → fail-closed Err, 不静默
+    // issue #78 补: FUSION_PG_PASSWORD 缺失 + PG 可达 (brew trust auth) → 无密码连接串
     #[test]
-    fn test_native_env_fail_closed_missing_password() {
+    fn test_native_env_trust_auth_when_pg_up() {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_USER=fusion\n");
-        let r = native_env_for("fusion-identity", f.path());
-        assert!(r.is_err(), "缺密码应 fail-closed 拒绝");
-        let msg = r.unwrap_err().to_string();
+        let env = native_env_for_opts("fusion-identity", f.path(), false, true, true).unwrap();
+        assert_eq!(
+            env.get("DATABASE_URL").unwrap(),
+            "postgresql://fusion@localhost:5432/identity"
+        );
+    }
+
+    // issue #78 补: 密码与 FUSION_PG_USER 双缺 + PG 可达 → 省略 user 段 (libpq 默认 OS user)
+    #[test]
+    fn test_native_env_trust_auth_no_user() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        unsafe { std::env::remove_var("FUSION_PG_USER") };
+        let f = env_file("");
+        let env = native_env_for_opts("fusion-identity", f.path(), false, true, true).unwrap();
+        assert_eq!(
+            env.get("DATABASE_URL").unwrap(),
+            "postgresql://localhost:5432/identity"
+        );
+    }
+
+    // issue #78 补: 密码缺失 + PG 不可达 → 跳过 DATABASE_URL (应用走 SQLite 兜底),
+    // 不让整个注入失败; REDIS_URL 仍无条件注入
+    #[test]
+    fn test_native_env_pg_down_skips_db_keeps_redis() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        let f = env_file("");
+        let env = native_env_for_opts("fusion-cowork", f.path(), false, false, true).unwrap();
         assert!(
-            msg.contains("FUSION_PG_PASSWORD"),
-            "err 应点名缺失 key: {msg}"
+            !env.contains_key("DATABASE_URL"),
+            "PG 不可达且无密码不应注入 DATABASE_URL"
+        );
+        assert!(env.contains_key("REDIS_URL"), "REDIS_URL 不受 PG 状态影响");
+    }
+
+    // issue #78 补: compose 平面缺密码 → 仍 fail-closed Err (sidecar PG 密码认证,
+    // 静默降级 trust 串会打错库)
+    #[test]
+    fn test_compose_plane_missing_password_fail_closed() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        let f = env_file("FUSION_PG_USER=fusion\n");
+        let r = native_env_for_opts("fusion-identity", f.path(), true, true, true);
+        assert!(r.is_err(), "compose 平面缺密码应 fail-closed 拒绝");
+        assert!(
+            r.unwrap_err().to_string().contains("FUSION_PG_PASSWORD"),
+            "err 应点名缺失 key"
         );
     }
 
@@ -378,7 +469,7 @@ pub(crate) mod tests {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=x\n");
-        let env = native_env_for("fusion-mlx", f.path()).unwrap();
+        let env = native_env_for("fusion-mlx", f.path(), false).unwrap();
         assert!(env.is_empty(), "非依赖服务不应注入 env");
     }
 
@@ -397,7 +488,7 @@ pub(crate) mod tests {
         }
         let _cleanup = EnvCleanup;
         let f = env_file("FUSION_PG_PASSWORD=fromfile\n");
-        let env = native_env_for("fusion-identity", f.path()).unwrap();
+        let env = native_env_for("fusion-identity", f.path(), false).unwrap();
         let url = env.get("DATABASE_URL").unwrap();
         assert!(url.contains("fromproc"), "进程 env 应优先: {url}");
     }
@@ -408,7 +499,7 @@ pub(crate) mod tests {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=pw\n");
-        let env = native_env_for("fusion-cowork", f.path()).unwrap();
+        let env = native_env_for("fusion-cowork", f.path(), false).unwrap();
         assert!(env.contains_key("DATABASE_URL"));
         assert!(env.contains_key("REDIS_URL"));
         assert!(env["REDIS_URL"].contains("6379"));
@@ -418,7 +509,7 @@ pub(crate) mod tests {
     #[test]
     fn test_rag_gets_qdrant() {
         let f = env_file("");
-        let env = native_env_for_opts("fusion-rag", f.path(), true).unwrap();
+        let env = native_env_for_opts("fusion-rag", f.path(), false, true, true).unwrap();
         assert_eq!(env.get("QDRANT_URL").unwrap(), "http://localhost:6333");
     }
 
@@ -426,7 +517,7 @@ pub(crate) mod tests {
     #[test]
     fn test_rag_qdrant_down_skips_key() {
         let f = env_file("");
-        let env = native_env_for_opts("fusion-rag", f.path(), false).unwrap();
+        let env = native_env_for_opts("fusion-rag", f.path(), false, true, false).unwrap();
         assert!(
             !env.contains_key("QDRANT_URL"),
             "qdrant 不可达不应注入 QDRANT_URL"

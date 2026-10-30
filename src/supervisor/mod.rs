@@ -68,6 +68,7 @@ impl SupervisorCore {
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
             .with_event_sink(make_event_sink(store.clone()));
         let env_file = cfg.compose.env_file.clone();
+        let compose_on = cfg.compose.enabled;
         let runners: Vec<_> = defs
             .into_iter()
             .filter(|d| d.managed)
@@ -100,7 +101,7 @@ impl SupervisorCore {
                                     Vec::new()
                                 }
                             };
-                        match crate::env_map::native_env_for(&name, &env_file) {
+                        match crate::env_map::native_env_for(&name, &env_file, compose_on) {
                             Ok(m) => env.extend(m),
                             Err(e) => {
                                 tracing::error!(svc = %name, err = %e, "sidecar env 解析失败, 重启以剩余 env 继续");
@@ -261,6 +262,7 @@ impl SupervisorCore {
                 let probe_fn = self.probe_fn.clone();
                 let timeout = self.cfg.start_timeout_sec;
                 let env_file = self.cfg.compose.env_file.clone();
+                let compose_on = self.compose_enabled();
                 // 返回 (服务名, 是否跳过=已健康, 启动结果), join 后据其写 runner.state
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
@@ -286,7 +288,7 @@ impl SupervisorCore {
                         }
                     }
                     if crate::env_map::needs_injection(&d.name) {
-                        match crate::env_map::native_env_for(&d.name, &env_file) {
+                        match crate::env_map::native_env_for(&d.name, &env_file, compose_on) {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
                                 tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
@@ -436,7 +438,8 @@ impl SupervisorCore {
             env_overrides.extend(m);
         }
         if crate::env_map::needs_injection(&d.name) {
-            let m = crate::env_map::native_env_for(&d.name, &env_file).map_err(|e| {
+            let m = crate::env_map::native_env_for(&d.name, &env_file, self.compose_enabled())
+                .map_err(|e| {
                 tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
                 e
             })?;
