@@ -17,6 +17,11 @@ const FAST_FAIL_WINDOW_SEC: u64 = 10;
 const FAST_FAIL_STREAK: u32 = 3;
 // issue #47: config-fatal 封顶次数 (达限标 Failed, 人工 fusion-sv restart 复位)
 const CONFIG_FAIL_CAP: u32 = 5;
+// issue #79: 连续失败重启阈值 — 探活连续 N 次失败才进重启流。
+// 繁忙服务 (fusion-mlx GIL 高负载) /healthz 单次超时抖动不得升级重启;
+// 中间任一次成功探活即复位计数, 抖动永不升级。真宕机 3 连败
+// (poll_unhealthy_sec=2 ≈ 6s) 后照常重启, 仍然及时。
+const RESTART_FAIL_STREAK: u32 = 3;
 
 // issue #47: 熔断退避序列 10s → 60s → 300s (封顶)。区别于普通 crash 的 1→2→4→…:
 // config-fatal / 快速失败时快速重试只会空烧进程启动, 拉长间隔等人工修复。
@@ -74,6 +79,9 @@ pub struct ServiceRunner {
     fast_fail_alerted: bool,
     // issue #47: config-fatal (exit 78) 连续计数 — 达 CONFIG_FAIL_CAP 标 Failed。
     config_fail_streak: u32,
+    // issue #79: 探活连续失败计数 — 达 RESTART_FAIL_STREAK 才进重启流。
+    // 任一次成功探活即复位 (抖动不升级)。pub 供集成测试预置。
+    pub fail_streak: u32,
     probe_fn: ProbeFn,
     start_fn: StartFn,
 }
@@ -97,6 +105,7 @@ impl ServiceRunner {
             fast_fail_streak: 0,
             fast_fail_alerted: false,
             config_fail_streak: 0,
+            fail_streak: 0,
             probe_fn: Box::new(probe_fn),
             start_fn: Box::new(start_fn),
         }
@@ -136,7 +145,12 @@ impl ServiceRunner {
             ProbeResult::Healthy { latency_ms } => {
                 let was_down = matches!(self.state, State::Unhealthy | State::Restarting);
                 self.state = State::Healthy;
+                // issue #79: 任一次成功探活即复位连续失败计数 (抖动不升级)。
+                self.fail_streak = 0;
                 if was_down {
+                    // issue #79: 恢复时清掉上一轮失败留下的陈旧排期,
+                    // 否则下次进 Unhealthy 会直接命中过期 due 立即重启。
+                    self.restart_after = None;
                     tracing::info!(svc = %self.def.name, "recovered");
                     let _ = alerter
                         .alert(Alert {
@@ -206,6 +220,11 @@ impl ServiceRunner {
             return;
         }
         // 真宕机信号 (ConnectionRefused/Timeout)
+        // issue #79: 人工态 (Failed/Stopped) 不累计; 其余连续失败计数 +1,
+        // 达 RESTART_FAIL_STREAK 才进重启流。
+        if !matches!(self.state, State::Failed | State::Stopped) {
+            self.fail_streak += 1;
+        }
         match self.state {
             State::Healthy | State::Starting => {
                 tracing::warn!(svc = %self.def.name, reason = ?reason, "服务宕机");
@@ -221,6 +240,17 @@ impl ServiceRunner {
                 // 首次宕机不立即重启, 等下一 tick (避免抖动误判)
             }
             State::Unhealthy | State::Restarting => {
+                // issue #79: 连续失败未达阈值不排重启 — 繁忙服务 (fusion-mlx
+                // GIL 高负载) 探活抖动中间夹成功探活即复位, 永不升级;
+                // 真宕机 3 连败 (poll 2s ≈ 6s) 后排程, 仍然及时。
+                if self.fail_streak < RESTART_FAIL_STREAK {
+                    tracing::info!(
+                        svc = %self.def.name,
+                        streak = self.fail_streak,
+                        "连续失败未达阈值, 暂不排重启"
+                    );
+                    return;
+                }
                 // issue #31: 退避不持锁 sleep (旧实现扣锁数十秒饿死 status/metrics),
                 // 改为记截止时间本 tick 返回, 到点 tick 再真正重启。
                 // crash 记账语义与旧版一致: 每次实际重启尝试记 1 次。
@@ -492,7 +522,9 @@ mod tests {
             reason: UnhealthyReason::ConnectionRefused,
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
-        r.state = State::Unhealthy; // 已标 down, 这次进重启流
+        r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2; // 已标 down, 这次进重启流
         let s = store();
         let mut al = Alerter::new(300, String::new());
         // issue #31: 退避不再持锁 sleep — 第一 tick 排期, 未到点不重启
@@ -518,6 +550,8 @@ mod tests {
             r.policy.record_crash(900 + i);
         }
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         let s = store();
         let mut al = Alerter::new(300, String::new());
         // issue #31: 第一 tick 排期 (5 crash → 退避 30s), 到点 tick 封顶 → Failed 不重启
@@ -573,6 +607,8 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         // 改探活为健康, tick 应恢复
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 8 };
         let s = store();
@@ -590,6 +626,8 @@ mod tests {
         });
         let mut r = ServiceRunner::new(def(), "stop+start", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         let s = store();
         let mut al = Alerter::new(300, String::new());
         // issue #31: 第一 tick 排期 (delay=1s), 到点 tick 执行 stop+start
@@ -698,6 +736,8 @@ mod tests {
         };
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         let s = store();
         let mut al = Alerter::new(300, String::new());
         // 排期 tick (streak=0 → 走普通退避 1s)
@@ -732,6 +772,8 @@ mod tests {
         };
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         let s = store();
         let mut al = Alerter::new(300, String::new());
         let mut now = 1000u64;
@@ -761,6 +803,8 @@ mod tests {
         let sf = |_cmd: &str| -> Result<()> { Ok(()) };
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         let s = store();
         let mut al = Alerter::new(300, String::new());
         // 排期 1s → 到点 start 成功 (last_start_ts=1001)
@@ -792,6 +836,8 @@ mod tests {
         let (_, probe_cell, pf, sf) = harness(ProbeResult::Healthy { latency_ms: 5 });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Unhealthy;
+        // issue #79: 预置连续失败计数, 模拟已失败的中间态 (直接从 Unhealthy 起测)
+        r.fail_streak = 2;
         r.fast_fail_streak = 3;
         r.fast_fail_alerted = true;
         r.config_fail_streak = 2;
@@ -802,6 +848,64 @@ mod tests {
         assert_eq!(r.fast_fail_streak, 0);
         assert!(!r.fast_fail_alerted);
         assert_eq!(r.config_fail_streak, 0);
+        assert_eq!(r.fail_streak, 0, "恢复应复位连续失败计数");
         let _ = probe_cell;
+    }
+
+    // issue #79: 连续失败未达阈值 (3) 不排重启 — 繁忙服务探活抖动不升级
+    #[tokio::test]
+    async fn test_issue79_streak_gate_no_restart_below_threshold() {
+        let (calls, _, pf, sf) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::Timeout,
+        });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Healthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        // tick 1: streak=1 → Unhealthy + ServiceDown, 不排期
+        r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy));
+        assert!(r.restart_after.is_none(), "streak=1 不得排期");
+        assert_eq!(al.alerts_emitted(), 1);
+        // tick 2: streak=2 → 仍不排期
+        r.tick(1002, &s, &mut al).await.unwrap();
+        assert!(r.restart_after.is_none(), "streak=2 不得排期");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(r.policy.crash_count(), 0, "未重启不得记 crash");
+        // tick 3: streak=3 达阈值 → 排期 (首退避 1s)
+        r.tick(1004, &s, &mut al).await.unwrap();
+        assert_eq!(r.restart_after, Some(1005), "3 连败应排期重启");
+        assert!(calls.lock().unwrap().is_empty(), "排期 tick 不应重启");
+    }
+
+    // issue #79: 抖动 (失败-失败-恢复-失败-失败) 中间夹成功探活即复位, 永不升级
+    #[tokio::test]
+    async fn test_issue79_flap_recovery_resets_streak() {
+        let (calls, probe_cell, pf, sf) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::Timeout,
+        });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Healthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        // 两次失败 (streak 1→2)
+        r.tick(1000, &s, &mut al).await.unwrap();
+        r.tick(1002, &s, &mut al).await.unwrap();
+        assert_eq!(r.fail_streak, 2);
+        // 恢复 — 复位计数 + 清陈旧排期
+        *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 8 };
+        r.tick(1004, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Healthy));
+        assert_eq!(r.fail_streak, 0);
+        // 再两次失败 — streak 从 0 重新数, 不排期
+        *probe_cell.lock().unwrap() = ProbeResult::Unhealthy {
+            reason: UnhealthyReason::Timeout,
+        };
+        r.tick(1006, &s, &mut al).await.unwrap();
+        r.tick(1008, &s, &mut al).await.unwrap();
+        assert_eq!(r.fail_streak, 2);
+        assert!(r.restart_after.is_none(), "抖动不得升级排期");
+        assert!(calls.lock().unwrap().is_empty(), "抖动不得重启");
+        assert_eq!(r.policy.crash_count(), 0);
     }
 }

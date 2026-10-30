@@ -87,9 +87,12 @@ impl SupervisorCore {
                     move || real_probe_spec(&spec),
                     move |c: &str| {
                         // issue #29: crash 自动重启路径也注入 shell 注册 env。
-                        // 解析失败仅 ERROR + 空注入 (不 bail): 服务真起不来时探活失败
-                        // 告警兜底; 首次启动路径 up_native 才是严格 fail-closed。
-                        let env: Vec<(String, String)> =
+                        // issue #78: 同时注入 sidecar 连接 env (不 gate compose 开关,
+                        // 与 up_native/up_one 一致 — 否则崩溃重启的服务又静默
+                        // 落回 SQLite)。解析失败仅 ERROR + 已解析部分继续 (不 bail):
+                        // 服务真起不来时探活失败告警兜底; 首次启动路径 up_native
+                        // 才是严格 fail-closed。
+                        let mut env: Vec<(String, String)> =
                             match crate::env_map::shell_env_for(&name, &env_file) {
                                 Ok(m) => m.into_iter().collect(),
                                 Err(e) => {
@@ -97,6 +100,12 @@ impl SupervisorCore {
                                     Vec::new()
                                 }
                             };
+                        match crate::env_map::native_env_for(&name, &env_file) {
+                            Ok(m) => env.extend(m),
+                            Err(e) => {
+                                tracing::error!(svc = %name, err = %e, "sidecar env 解析失败, 重启以剩余 env 继续");
+                            }
+                        }
                         real_start_pair(&name, c, &env)
                     },
                     policy,
@@ -251,7 +260,6 @@ impl SupervisorCore {
                 let start_fn = self.start_fn.clone();
                 let probe_fn = self.probe_fn.clone();
                 let timeout = self.cfg.start_timeout_sec;
-                let compose_enabled = self.cfg.compose.enabled;
                 let env_file = self.cfg.compose.env_file.clone();
                 // 返回 (服务名, 是否跳过=已健康, 启动结果), join 后据其写 runner.state
                 handles.push(tokio::spawn(async move {
@@ -262,9 +270,11 @@ impl SupervisorCore {
                         tracing::info!(svc = %d.name, "skip start (already up)");
                         return (d.name, true, Ok(()));
                     }
-                    // env 注入分两类, 均解析失败 fail-closed 拒绝启动:
-                    // - issue #29: shell 注册 env (无条件, 不 gate 在 compose 上)
-                    // - issue #8: compose enabled 时 sidecar 连接 env
+                    // env 注入两类, 均解析失败 fail-closed 拒绝启动 (均不 gate 在
+                    // compose 开关上):
+                    // - issue #29: shell 注册 env
+                    // - issue #8/#78: sidecar 连接 env — 此前 gate 在 compose.enabled
+                    //   上, 默认 off 时 cowork 静默跑 SQLite / rag 静默跑 :memory:
                     let mut env_overrides: Vec<(String, String)> = Vec::new();
                     if crate::env_map::needs_shell_env(&d.name) {
                         match crate::env_map::shell_env_for(&d.name, &env_file) {
@@ -275,7 +285,7 @@ impl SupervisorCore {
                             }
                         }
                     }
-                    if compose_enabled && crate::env_map::needs_injection(&d.name) {
+                    if crate::env_map::needs_injection(&d.name) {
                         match crate::env_map::native_env_for(&d.name, &env_file) {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
@@ -414,7 +424,8 @@ impl SupervisorCore {
             tracing::info!(svc = %d.name, "skip start (already up)");
             return Ok(());
         }
-        // env 注入: shell 注册 (无条件) + sidecar 连接 (compose 开启), 均 fail-closed
+        // env 注入: shell 注册 + sidecar 连接, 均不 gate 在 compose 开关上
+        // (issue #78: 默认 off 时也要注入, 否则 cowork 静默跑 SQLite), 均 fail-closed
         let env_file = self.cfg.compose.env_file.clone();
         let mut env_overrides: Vec<(String, String)> = Vec::new();
         if crate::env_map::needs_shell_env(&d.name) {
@@ -424,7 +435,7 @@ impl SupervisorCore {
             })?;
             env_overrides.extend(m);
         }
-        if self.cfg.compose.enabled && crate::env_map::needs_injection(&d.name) {
+        if crate::env_map::needs_injection(&d.name) {
             let m = crate::env_map::native_env_for(&d.name, &env_file).map_err(|e| {
                 tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
                 e
@@ -1613,6 +1624,8 @@ mod tests {
         // 起始: 已 Unhealthy。issue #31: 退避不再持锁 sleep —
         // 首 tick 排期, 到点 tick (delay=1s) 重启 → Restarting
         core.runners[0].state = runner::State::Unhealthy;
+        // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
+        core.runners[0].fail_streak = 2;
         core.tick_all(1000).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Unhealthy),
@@ -2195,20 +2208,25 @@ mod tests {
         assert!(has_back, "恢复应写 ServiceBack 事件 plane=compose");
     }
 
-    // issue #8: compose disabled (单节点开发) → 依赖 sidecar 的服务照常启动, 无 env 注入。
-    // start_fn 收到空 env_overrides (第三参为空切片)。
+    // issue #78: compose disabled (单节点开发) 也要注入 sidecar 连接 env —
+    // 此前 gate 在 compose.enabled 上, 默认 off 时 cowork 静默跑 SQLite。
+    // .env 有 FUSION_PG_PASSWORD → identity 收到 DATABASE_URL。
     // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_up_native_no_env_injection_when_compose_disabled() {
+    async fn test_up_native_injects_env_when_compose_disabled() {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        let env_f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(env_f.path(), "FUSION_PG_PASSWORD=pw78\n").unwrap();
+        let mut cfg = fake_cfg(); // compose.enabled=false (默认)
+        cfg.compose.env_file = env_f.path().to_path_buf();
         let defs = vec![def("fusion-identity", Layer::App, 11450)];
         let received_env: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let re_p = received_env.clone();
         let mut core = SupervisorCore::new_with_fns(
             defs,
-            fake_cfg(), // compose.enabled=false (默认)
+            cfg,
             |_| ProbeResult::Unhealthy {
                 reason: crate::probe::UnhealthyReason::ConnectionRefused,
             },
@@ -2219,13 +2237,19 @@ mod tests {
         );
         assert!(!core.compose_enabled(), "compose 应未启用");
         core.up_all().await.unwrap();
+        let env = received_env.lock().unwrap();
+        let db_url = env
+            .iter()
+            .find(|(k, _)| k == "DATABASE_URL")
+            .expect("compose off 也应注入 DATABASE_URL (issue #78)");
         assert!(
-            received_env.lock().unwrap().is_empty(),
-            "compose disabled 时不应注入连接 env"
+            db_url.1.contains(":pw78@localhost:5432/"),
+            "got {}",
+            db_url.1
         );
         assert!(
             matches!(core.runners[0].state, runner::State::Starting),
-            "无注入时服务应正常 Starting"
+            "注入成功服务应 Starting"
         );
     }
 

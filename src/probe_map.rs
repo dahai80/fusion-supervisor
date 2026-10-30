@@ -8,7 +8,13 @@ use std::sync::OnceLock;
 fn build_table() -> HashMap<&'static str, ProbeSpec> {
     let mut m = HashMap::new();
     // core
-    m.insert("fusion-mlx", ProbeSpec::http(11434, "/healthz"));
+    // issue #79: mlx 高负载下 GIL 持有让 /healthz 应答 >2s — 全局 2s 超时
+    // 会把健康但繁忙的服务判 Timeout 连续 Unhealthy, 升级重启杀掉 in-flight
+    // 推理流量。单独放宽到 10s。
+    m.insert(
+        "fusion-mlx",
+        ProbeSpec::http_with_timeout(11434, "/healthz", 10),
+    );
     m.insert("fusion-gateway", ProbeSpec::http(11432, "/healthz"));
     // platform
     m.insert("fusion-rag", ProbeSpec::http(11436, "/health"));

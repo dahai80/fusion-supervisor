@@ -1,7 +1,11 @@
-// issue #8: compose enabled 时, 依赖 sidecar 的 native 服务需显式注入连接 env。
+// issue #8: 依赖 sidecar (PG/Redis/Qdrant) 的 native 服务需显式注入连接 env。
 // 本模块按服务名给出所需连接变量, 并从 .env / 环境变量解析具体值。
 // fail-closed: 必需值解析不出 → 返回 Err, 拒绝启动该服务 (非静默降级)。
-// compose disabled 时 (单节点开发), 调用方跳过本模块, 服务照旧读自身 env。
+// issue #78: 注入不再 gate 在 compose 开关上 — 此前两处调用点都先判
+// compose.enabled, 默认 (compose off) 时 fusion-cowork 静默跑 SQLite、
+// fusion-rag 静默跑 :memory:。现在两个平面 (bare-metal compose off /
+// 容器化 compose on) 均注入; Qdrant 例外: 本地 6333 不可达时跳过
+// QDRANT_URL 注入 (rag 有 :memory: 兜底), 不 fail-closed。
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -109,7 +113,19 @@ fn read_env_file(path: &std::path::Path) -> HashMap<String, String> {
 // 为某服务解析需注入的连接 env (name → value)。
 // fail-closed: 任一必需值无法解析 → Err (带服务名与缺失 key)。
 // 非依赖服务 (required_vars=None) → 空 map (无注入, 不报错)。
+// issue #78: QDRANT_URL 注入前先探本地 6333 可达性 — qdrant 容器没起时
+// 跳过该 key (fusion-rag 上游有 :memory: 兜底), 不让整个注入失败。
 pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<String, String>> {
+    let qdrant_up = qdrant_reachable();
+    native_env_for_opts(svc, env_file, qdrant_up)
+}
+
+// issue #78: 可测版本 — qdrant_up 由测试注入 (不做真实网络探测)。
+pub fn native_env_for_opts(
+    svc: &str,
+    env_file: &std::path::Path,
+    qdrant_up: bool,
+) -> Result<HashMap<String, String>> {
     let Some(keys) = required_vars(svc) else {
         return Ok(HashMap::new());
     };
@@ -120,6 +136,7 @@ pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<S
     let pg_port = "5432";
 
     let mut out = HashMap::new();
+    let mut skipped_qdrant = false;
     for k in keys {
         let val = match *k {
             "DATABASE_URL" => {
@@ -132,16 +149,41 @@ pub fn native_env_for(svc: &str, env_file: &std::path::Path) -> Result<HashMap<S
                 format!("postgresql://{pg_user}:{pw}@{pg_host}:{pg_port}/{db}")
             }
             "REDIS_URL" => "redis://localhost:6379/1".to_string(),
-            "QDRANT_URL" => "http://localhost:6333".to_string(),
+            "QDRANT_URL" => {
+                if !qdrant_up {
+                    skipped_qdrant = true;
+                    tracing::info!(
+                        svc,
+                        "qdrant 127.0.0.1:6333 不可达, 跳过 QDRANT_URL 注入 (rag 走 :memory: 兜底)"
+                    );
+                    continue;
+                }
+                "http://localhost:6333".to_string()
+            }
             other => bail!("env_map: 未知连接 key {other} for {svc}"),
         };
         out.insert((*k).to_string(), val);
     }
-    if out.is_empty() {
+    // QDRANT_URL 是唯一被跳过的 key 时允许空 map (issue #78, rag 有兜底);
+    // 其余情况空 map = 解析异常, fail-closed。
+    if out.is_empty() && !skipped_qdrant {
         bail!("env_map: {svc} 所需连接变量解析为空 (fail-closed)");
     }
     tracing::info!(svc, keys = ?keys, "native env 注入解析完成");
     Ok(out)
+}
+
+// issue #78: 本地 qdrant (127.0.0.1:6333) 可达性探测, 300ms 超时。
+// 探测失败不阻断注入 (调用方跳过 QDRANT_URL, rag 走上游兜底)。
+fn qdrant_reachable() -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6333));
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::info!(err = %e, "qdrant 探测失败, QDRANT_URL 将跳过注入");
+            false
+        }
+    }
 }
 
 // issue #29: 解析某服务的 shell 注册 env。
@@ -372,12 +414,24 @@ pub(crate) mod tests {
         assert!(env["REDIS_URL"].contains("6379"));
     }
 
-    // rag 需 QDRANT_URL
+    // rag 需 QDRANT_URL (issue #78: 用 opts 可测版本, 不做真实网络探测)
     #[test]
     fn test_rag_gets_qdrant() {
         let f = env_file("");
-        let env = native_env_for("fusion-rag", f.path()).unwrap();
+        let env = native_env_for_opts("fusion-rag", f.path(), true).unwrap();
         assert_eq!(env.get("QDRANT_URL").unwrap(), "http://localhost:6333");
+    }
+
+    // issue #78: qdrant 不可达 → 跳过 QDRANT_URL 注入, rag 允许空 map (兜底 :memory:)
+    #[test]
+    fn test_rag_qdrant_down_skips_key() {
+        let f = env_file("");
+        let env = native_env_for_opts("fusion-rag", f.path(), false).unwrap();
+        assert!(
+            !env.contains_key("QDRANT_URL"),
+            "qdrant 不可达不应注入 QDRANT_URL"
+        );
+        assert!(env.is_empty(), "rag 唯一 key 被跳过时允许空 map");
     }
 
     // read_env_file 跳过注释与空行, 解析 key=value

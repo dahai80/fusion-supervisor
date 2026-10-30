@@ -15,6 +15,10 @@ pub struct ProbeSpec {
     pub port: u16,
     pub path: Option<String>,
     pub socket: Option<String>,
+    // issue #79: 按服务覆盖探活超时。None=全局默认 2s。
+    // GIL 密集型推理服务 (fusion-mlx) 高负载下 /healthz 可能 >2s 才答,
+    // 2s 超时会把健康但繁忙的服务误判宕机触发重启 (杀掉 in-flight 流量)。
+    pub timeout: Option<Duration>,
 }
 
 impl ProbeSpec {
@@ -24,6 +28,14 @@ impl ProbeSpec {
             port,
             path: Some(path.to_string()),
             socket: None,
+            timeout: None,
+        }
+    }
+    // issue #79: 带超时覆盖的 HTTP 探活 spec
+    pub fn http_with_timeout(port: u16, path: &str, secs: u64) -> Self {
+        Self {
+            timeout: Some(Duration::from_secs(secs)),
+            ..Self::http(port, path)
         }
     }
     pub fn uds(socket: &str) -> Self {
@@ -32,6 +44,7 @@ impl ProbeSpec {
             port: 0,
             path: None,
             socket: Some(socket.to_string()),
+            timeout: None,
         }
     }
     pub fn tcp(port: u16) -> Self {
@@ -40,7 +53,13 @@ impl ProbeSpec {
             port,
             path: None,
             socket: None,
+            timeout: None,
         }
+    }
+
+    // 生效超时: spec 覆盖 > 全局默认
+    fn effective_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(PROBE_TIMEOUT)
     }
 }
 
@@ -99,7 +118,7 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
     let path = spec.path.as_deref().unwrap_or("/health");
     let url = format!("http://127.0.0.1:{}{}", spec.port, path);
     let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
+        .timeout(spec.effective_timeout())
         .build()
         .unwrap_or_default();
     let start = std::time::Instant::now();
@@ -135,7 +154,11 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
 
 async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
     let sock = spec.socket.as_deref().unwrap_or("/tmp/fusion-sv.sock");
-    let conn = tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(sock)).await;
+    let conn = tokio::time::timeout(
+        spec.effective_timeout(),
+        tokio::net::UnixStream::connect(sock),
+    )
+    .await;
     let mut stream = match conn {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
@@ -163,7 +186,12 @@ async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
 
 async fn probe_tcp(spec: &ProbeSpec) -> ProbeResult {
     let addr = format!("127.0.0.1:{}", spec.port);
-    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await {
+    match tokio::time::timeout(
+        spec.effective_timeout(),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
         Ok(Ok(_)) => ProbeResult::Healthy { latency_ms: 0 },
         Ok(Err(_)) => ProbeResult::Unhealthy {
             reason: UnhealthyReason::ConnectionRefused,
@@ -191,6 +219,20 @@ mod tests {
         let s = ProbeSpec::uds("/tmp/fusion-sv.sock");
         assert!(matches!(s.kind, ProbeKind::Uds));
         assert_eq!(s.socket.as_deref(), Some("/tmp/fusion-sv.sock"));
+    }
+
+    // issue #79: 超时覆盖构造器 + 默认 None (全局 2s)
+    #[test]
+    fn test_probe_spec_timeout_override() {
+        let s = ProbeSpec::http(11434, "/healthz");
+        assert_eq!(s.timeout, None);
+        assert_eq!(s.effective_timeout(), PROBE_TIMEOUT);
+        let s = ProbeSpec::http_with_timeout(11434, "/healthz", 10);
+        assert_eq!(s.timeout, Some(Duration::from_secs(10)));
+        assert_eq!(s.effective_timeout(), Duration::from_secs(10));
+        // 未覆盖的构造器不受影响
+        assert_eq!(ProbeSpec::tcp(1).timeout, None);
+        assert_eq!(ProbeSpec::uds("/tmp/x.sock").timeout, None);
     }
 
     #[test]

@@ -48,10 +48,14 @@ async fn test_lifecycle_crash_then_recover() {
     r.tick(1001, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     // issue #31: 退避改为排期 — 再次宕机 tick 排期, 到点 tick (delay=1s) 重启
+    // issue #79: 连续失败计数 — tick1001 streak=1, tick1002 streak=2 (未达阈值 3 不排),
+    // tick1003 streak=3 排期, tick1004 到点才进 Restarting
     r.tick(1002, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     assert_eq!(calls.lock().unwrap().len(), 0);
     r.tick(1003, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Unhealthy));
+    r.tick(1004, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Restarting));
     assert_eq!(calls.lock().unwrap().len(), 1);
     // 恢复

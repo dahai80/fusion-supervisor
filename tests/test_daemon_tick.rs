@@ -41,7 +41,9 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
     );
     // 起始 Unhealthy。issue #31: 退避改为排期 — 首 tick_all 排期不重启,
     // 到点 tick_all (delay=1s) 才进重启流 → Restarting
+    // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
     core.runners[0].state = State::Unhealthy;
+    core.runners[0].fail_streak = 2;
     core.tick_all(1000).await;
     assert!(
         matches!(core.runners[0].state, State::Unhealthy),
