@@ -49,7 +49,11 @@ fn shell_vars(svc: &str) -> Option<&'static [&'static str]> {
         | "ai-information-search"
         | "ai-OperaBase"
         | "ai-charactervoice"
-        | "ai-charactervoice-session" => Some(&["FUSION_CLIENT_KEY"]),
+        | "ai-charactervoice-session"
+        // fusion-rag /ask 生成的 LLM 通道同样打 gateway — 不注入则回退 daemon
+        // 快照里的废弃别名 FUSION_MLX_API_KEY（已轮换失效），/health 记
+        // llm_auth=rejected（2026-10-31 夜检发现）。
+        | "fusion-rag" => Some(&["FUSION_CLIENT_KEY"]),
         _ => None,
     }
 }
@@ -690,6 +694,8 @@ pub(crate) mod tests {
         assert!(!needs_shell_env("ai-apparelmockup-web"));
         // ai-family 源码不消费该 key (自建鉴权), 不注入
         assert!(!needs_shell_env("ai-family"));
+        // 2026-10-31: fusion-rag /ask LLM 通道同样打 gateway, 需要注入
+        assert!(needs_shell_env("fusion-rag"));
     }
 
     // .env 给 key → 进程 env 缺失时从文件解析
