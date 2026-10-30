@@ -68,6 +68,17 @@ pub struct Config {
     // 默认 false (开发机手动 fusion-sv up 的行为不变)。
     #[serde(default)]
     pub auto_up_on_start: bool,
+    // issue #77: native 备份平面 (compose.enabled=false 时生效) 的 pg_dumpall 二进制覆盖。
+    // None → 从 PATH 解析 "pg_dumpall"。版本须与目标 server 匹配 (brew 多版本共存时注意)。
+    #[serde(default)]
+    pub pg_dump_bin: Option<String>,
+    // issue #77: native brew PostgreSQL 连接参数 (authoritative 实例,
+    // 见 architecture/fusion-db-conventions-1030.md §1)。用户名走 FUSION_PG_USER env,
+    // 未设则省略 -U (pg_dumpall 默认 OS 用户, brew trust auth 下即安装用户)。
+    #[serde(default = "default_native_pg_host")]
+    pub native_pg_host: String,
+    #[serde(default = "default_native_pg_port")]
+    pub native_pg_port: u16,
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
@@ -164,6 +175,13 @@ fn default_backup_retention() -> u32 {
 fn default_metrics_addr() -> Option<String> {
     Some("127.0.0.1:9100".to_string())
 }
+// issue #77: native brew PG 默认连接参数 (authoritative 实例)。
+fn default_native_pg_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_native_pg_port() -> u16 {
+    5432
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -191,6 +209,9 @@ impl Default for Config {
             metrics_addr: default_metrics_addr(),
             web_dir: None,
             auto_up_on_start: false,
+            pg_dump_bin: None,
+            native_pg_host: default_native_pg_host(),
+            native_pg_port: default_native_pg_port(),
         }
     }
 }
