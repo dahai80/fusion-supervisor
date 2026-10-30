@@ -33,6 +33,8 @@ const DOT_DEFAULT_INSET: f32 = 24.0;
 const SNAP_PX: f32 = 20.0;
 const EDGE_MARGIN: f32 = 2.0;
 const POS_PATH: &str = ".fusion-sv/tray.json";
+// 单实例锁: UDS lock socket 路径 (与 tray.json 同目录)。
+const LOCK_PATH: &str = ".fusion-sv/tray.lock";
 
 // ---------- 位置记忆纯逻辑 (可测) ----------
 
@@ -171,6 +173,39 @@ fn default_pos_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join(POS_PATH)
 }
 
+fn default_lock_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(LOCK_PATH)
+}
+
+// 单实例守卫 (常驻组件纪律: 同一用户只允许一个 tray 实例)。
+// bind 成功 = 拿到锁 (listener 持有到进程退出, socket 文件残留由下次陈旧分支清理);
+// bind 失败 connect 探活: 连得上 = 已有活实例 (None, 调用方退出);
+// 连不上 = 上次崩溃残留的陈旧 socket 文件, rm 后重绑一次。
+// 重绑仍失败 (权限/IO 异常) 返回 None — 宁可不启动, 不出现双实例双悬浮点。
+fn acquire_single_instance(path: &std::path::Path) -> Option<std::os::unix::net::UnixListener> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::os::unix::net::UnixListener::bind(path) {
+        Ok(l) => {
+            tracing::info!(path = %path.display(), "tray 单实例锁已获取");
+            Some(l)
+        }
+        Err(_) => match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "已有 fusion-tray 实例在运行");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(path = %path.display(), "陈旧 tray lock socket, 清除后重绑");
+                let _ = std::fs::remove_file(path);
+                std::os::unix::net::UnixListener::bind(path).ok()
+            }
+        },
+    }
+}
+
 // 损坏/非有限值一律回退默认位置 (常驻组件 fail-open, 不因配置文件崩)。
 fn load_dot_pos_from(path: &std::path::Path) -> Option<Pos2> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -232,6 +267,16 @@ fn main() -> eframe::Result<()> {
     let base = std::env::var("FUSION_SV_BASE").unwrap_or_else(|_| api::DEFAULT_BASE.into());
     let token = std::env::var("FUSION_SV_TOKEN").unwrap_or_default();
     tracing::info!(%base, "fusion-tray starting");
+
+    // 单实例守卫: 已有实例 (或锁不可得) 直接退出, listener 持有到进程结束。
+    let lock_path = default_lock_path();
+    let _single_lock = match acquire_single_instance(&lock_path) {
+        Some(l) => l,
+        None => {
+            tracing::warn!(path = %lock_path.display(), "单实例守卫拦截, 本进程退出");
+            return Ok(());
+        }
+    };
 
     let theme_name = theme::detect_theme().to_string();
     let shared = Arc::new(Shared {
@@ -856,7 +901,7 @@ impl TrayApp {
             .show(ctx, |ui| {
                 // 头部: 返回 + 标题 + 运行计数。
                 ui.horizontal(|ui| {
-                    if ui.button("◀").clicked() {
+                    if ui.button("▶").clicked() {
                         self.ui_state = UiState::Fan;
                     }
                     ui.label(egui::RichText::new(tier.label()).strong());
@@ -1023,11 +1068,11 @@ impl TrayApp {
 mod font_tests {
     // 子集字体覆盖回归: src/*.rs 全部非 ASCII 字符必须命中 cjk-subset.ttf 的 cmap,
     // 否则新增中文标签渲染成方块。例外 FONT_MISSING: 源字体 (Hiragino Sans GB)
-    // 本身缺这些字形 (◀◐ 几何形走 egui 默认字体兜底; emoji 无 sans 字形) —
+    // 本身缺这些字形 (◀▶◐ 几何形走 egui 默认字体兜底; emoji 无 sans 字形) —
     // 与全量字体行为一致, 子集不引入回归。
     use super::CJK_SUBSET;
 
-    const FONT_MISSING: &[char] = &['◀', '◐', '📌', '📍', '🔍'];
+    const FONT_MISSING: &[char] = &['◀', '▶', '◐', '📌', '📍', '🔍'];
 
     #[test]
     fn test_subset_font_covers_source_charset() {
@@ -1210,6 +1255,36 @@ mod pos_tests {
         assert_eq!(load_dot_pos_from(&path), None);
         std::fs::write(&path, r#"{"x":"abc","y":1}"#).unwrap();
         assert_eq!(load_dot_pos_from(&path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn lock_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fusion-tray-lock-{}-{tag}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn test_single_instance_second_acquire_rejected() {
+        let path = lock_path("second");
+        let _ = std::fs::remove_file(&path);
+        let first = acquire_single_instance(&path);
+        assert!(first.is_some(), "首个实例应拿到锁");
+        // 活实例持锁期间, 第二次 acquire → None (连得上 = 有活实例)
+        assert!(acquire_single_instance(&path).is_none(), "第二实例应被拒绝");
+        drop(first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_single_instance_stale_socket_recovered() {
+        let path = lock_path("stale");
+        // 陈旧 socket 文件 (上次崩溃残留, 无人 listen) → rm + 重绑成功
+        std::fs::write(&path, b"").unwrap();
+        let lock = acquire_single_instance(&path);
+        assert!(lock.is_some(), "陈旧 socket 应被清除并重绑");
+        drop(lock);
         let _ = std::fs::remove_file(&path);
     }
 }

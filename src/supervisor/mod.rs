@@ -513,6 +513,9 @@ impl SupervisorCore {
         let keep: Box<dyn Fn(&ServiceDef) -> bool + Send + Sync> = match group {
             "T0" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T0),
             "T1" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T1),
+            // T2 = 按需层 (注册表无 boot 字段的缺省 tier), tray "APP · 按需" 面板
+            // 一键启动/停止走这里 — 此前缺该 arm, tray 发 T2 直接 bail。
+            "T2" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T2),
             "pinned" => {
                 // 克隆 pin 快照进闭包 — 不借 self
                 let pins: Vec<String> = self.boot_pins.keys().cloned().collect();
@@ -2510,6 +2513,37 @@ mod tests {
         assert_eq!(rows[2].pinned.as_deref(), Some("auto"));
         // 状态字符串非空
         assert!(!rows[0].state.is_empty());
+    }
+
+    // T2 分组 (APP · 按需面板): down 批量停 T2 服务, 不碰 T0
+    #[tokio::test]
+    async fn test_boot_group_t2_down_skips_core() {
+        let defs = vec![
+            def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0),
+            def_tier("fusion-health", Layer::Domain, 11471, BootTier::T2),
+            def_tier("fusion-finance", Layer::Domain, 11466, BootTier::T2),
+        ];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        let res = core.boot_group("T2", "down").await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert!(calls.contains(&"fusion-health/stop".to_string()));
+        assert!(calls.contains(&"fusion-finance/stop".to_string()));
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fusion-mlx/")),
+            "T0 不动"
+        );
+        assert_eq!(res["group"], "T2");
+        assert_eq!(res["action"], "down");
     }
 
     // 非法 group/action 直接 bail, 不动任何服务

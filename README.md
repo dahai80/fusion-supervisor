@@ -204,12 +204,20 @@ When the daemon is unreachable the dot turns gray and the panel shows a "daemon 
 - **CJK font subset**: the tray embeds `tray/assets/cjk-subset.ttf` (~132KB, `include_bytes!` + `FontData::from_static`, zero-copy) instead of reading the 22.4MB system Hiragino Sans GB at runtime — the full font used to stay resident as 3 malloc copies (~70MB) plus glyph caches, pushing RSS to ~180MB. After subsetting: RSS ~100MB (GPU/GL baseline included), `MALLOC_LARGE` 69MB → 2MB. After adding new Chinese text run `bash tray/gen_font_subset.sh && cargo test -p fusion-tray`; `font_tests::test_subset_font_covers_source_charset` (ttf-parser) fails the build if the subset drifts from the source charset.
 - **Panic isolation**: poller and worker threads wrap each iteration in `catch_unwind` (a panic logs ERROR and continues instead of killing the tray); the daemon tick loop spawns each round in an inner task so a `tick_all` panic cannot silently stop supervision while RPC/HTTP stay alive. All tray mutexes use poison-recovery locks (`.lock().unwrap_or_else(|p| p.into_inner())`) so a panicked thread cannot cascade.
 - **Transparent dot window**: the L1 dot window overrides `eframe::App::clear_color` to fully transparent (eframe's default `rgba(12,12,12,180)` painted a gray square behind the half-circle dot); fan/list/unreachable states keep their opaque panel backgrounds.
+- **Single instance**: `main()` acquires a std-only UDS lock socket (`~/.fusion-sv/tray.lock`) before launching the GUI. A second launch detects the live first instance (connect probe) and exits with a log line; a stale socket file left by a crashed run is removed and re-bound. If the lock cannot be acquired at all the process refuses to start — never two floating dots. Note the stop boundary: group stop only reaches services the supervisor itself started — processes launched by their own LaunchAgents (KeepAlive restarts them anyway) or manual `nohup` are outside its reach.
 
-### LaunchAgent (log in → tray resident)
+### LaunchAgent (log in → daemon + tray resident)
+
+Two agents give full reboot self-healing: the daemon starts with its production env and `auto_up_on_start = true` brings up the boot set, then the tray connects to it.
 
 ```bash
-cp scripts/com.fusion.tray.plist.template ~/Library/LaunchAgents/com.fusion.tray.plist
-# edit: replace __FUSION_SUPERVISOR_DIR__ with the real path
+# daemon agent (restored from ~/.fusion-sv/launchagents-backup-20261029/, carries prod env secrets, 600 perms)
+cp ~/.fusion-sv/launchagents-backup-20261029/com.fusion.supervisor.plist ~/Library/LaunchAgents/
+chmod 600 ~/Library/LaunchAgents/com.fusion.supervisor.plist
+# tray agent (no secrets; generate from template)
+sed "s|__FUSION_SUPERVISOR_DIR__|$(pwd)|" scripts/com.fusion.tray.plist.template \
+    > ~/Library/LaunchAgents/com.fusion.tray.plist
+launchctl load ~/Library/LaunchAgents/com.fusion.supervisor.plist
 launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
 ```
 
