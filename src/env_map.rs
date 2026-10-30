@@ -152,7 +152,7 @@ pub fn native_env_for_opts(
     for k in keys {
         let val = match *k {
             "DATABASE_URL" => {
-                let db = pg_db_for(svc, env_file);
+                let db = pg_db_for(svc, env_file, compose_on);
                 match (&pg_pw, &pg_user) {
                     (Some(pw), user) => {
                         let user = user.as_deref().unwrap_or("fusion");
@@ -362,15 +362,24 @@ fn read_gateway_client_key() -> Result<String> {
 }
 
 // 据服务名决定 PG 库名: modelhub/cowork 用各自 env, identity/rag 用服务名。
-fn pg_db_for(svc: &str, env_file: &std::path::Path) -> String {
+// issue #78 补: db 名回退按平面分 — compose sidecar pg-init 建的是去前缀短名
+// (cowork/identity/rag, 见 docker-compose.sidecar.yml FUSION_PG_DATABASES),
+// native brew PG 建的是下划线全名 (fusion_cowork/fusion_identity, 见
+// fusion-db-conventions-1030)。FUSION_*_DB env 覆盖两平面均优先。
+fn pg_db_for(svc: &str, env_file: &std::path::Path, compose_on: bool) -> String {
+    let fallback = if compose_on {
+        svc.replace("fusion-", "")
+    } else {
+        svc.replace('-', "_")
+    };
     let key = match svc {
         "fusion-model-hub" => "FUSION_MODELHUB_DB",
         "fusion-cowork" => "FUSION_COWORK_DB",
         "fusion-identity" => "FUSION_IDENTITY_DB",
         "fusion-rag" => "FUSION_RAG_DB",
-        _ => return svc.replace("fusion-", ""),
+        _ => return fallback,
     };
-    resolve(key, env_file).unwrap_or_else(|| svc.replace("fusion-", ""))
+    resolve(key, env_file).unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -401,7 +410,7 @@ pub(crate) mod tests {
         let env = native_env_for("fusion-identity", f.path(), false).unwrap();
         let url = env.get("DATABASE_URL").unwrap();
         assert!(
-            url.contains("appuser:secret123@localhost:5432/identity"),
+            url.contains("appuser:secret123@localhost:5432/fusion_identity"),
             "got {url}"
         );
     }
@@ -415,7 +424,7 @@ pub(crate) mod tests {
         let env = native_env_for_opts("fusion-identity", f.path(), false, true, true).unwrap();
         assert_eq!(
             env.get("DATABASE_URL").unwrap(),
-            "postgresql://fusion@localhost:5432/identity"
+            "postgresql://fusion@localhost:5432/fusion_identity"
         );
     }
 
@@ -429,7 +438,7 @@ pub(crate) mod tests {
         let env = native_env_for_opts("fusion-identity", f.path(), false, true, true).unwrap();
         assert_eq!(
             env.get("DATABASE_URL").unwrap(),
-            "postgresql://localhost:5432/identity"
+            "postgresql://localhost:5432/fusion_identity"
         );
     }
 
@@ -523,6 +532,27 @@ pub(crate) mod tests {
             "qdrant 不可达不应注入 QDRANT_URL"
         );
         assert!(env.is_empty(), "rag 唯一 key 被跳过时允许空 map");
+    }
+
+    // issue #78 补: db 名回退按平面分 — compose=短名 (pg-init), native=下划线全名 (brew)
+    #[test]
+    fn test_pg_db_name_per_plane() {
+        let _g = env_lock().lock().unwrap();
+        unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
+        unsafe { std::env::remove_var("FUSION_COWORK_DB") };
+        let f = env_file("FUSION_PG_PASSWORD=pw\n");
+        let native = native_env_for_opts("fusion-cowork", f.path(), false, true, true).unwrap();
+        assert!(
+            native["DATABASE_URL"].ends_with("/fusion_cowork"),
+            "got {}",
+            native["DATABASE_URL"]
+        );
+        let compose = native_env_for_opts("fusion-cowork", f.path(), true, true, true).unwrap();
+        assert!(
+            compose["DATABASE_URL"].ends_with("/cowork"),
+            "got {}",
+            compose["DATABASE_URL"]
+        );
     }
 
     // read_env_file 跳过注释与空行, 解析 key=value
