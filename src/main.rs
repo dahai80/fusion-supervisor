@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use fusion_supervisor::cli;
-use fusion_supervisor::config::Config;
+use fusion_supervisor::config::{self, Config};
 use fusion_supervisor::manifest;
 use fusion_supervisor::rpc;
 use fusion_supervisor::rpc::client::RpcClient;
@@ -87,6 +87,23 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     tracing::info!("fusion-sv daemon starting");
+    // issue #80: launchd 默认 PATH 不含 Homebrew bin — node/brew 系 start.sh 在
+    // daemon 拉起时 `command -v node` 全挂。启动时把 native_extra_path 中缺失的
+    // 项追加到 daemon 自身 PATH 尾部; 所有子进程 (exec_bash_script /
+    // exec_start_spec) 继承 daemon env, 单一注入点覆盖全部 exec 路径。
+    // 空串禁用 (保持 launchd 原始 PATH 行为)。
+    if !cfg.native_extra_path.trim().is_empty() {
+        let cur = std::env::var("PATH").unwrap_or_default();
+        let merged = config::append_path_entries(&cur, &cfg.native_extra_path);
+        if merged != cur {
+            tracing::info!(
+                extra = %cfg.native_extra_path,
+                "daemon PATH 追加 Homebrew 目录 (子进程继承)"
+            );
+            // SAFETY: run_daemon 入口, 尚未 spawn 任何并发读 PATH 的线程。
+            unsafe { std::env::set_var("PATH", merged) };
+        }
+    }
     // issue #31: FUSION_ROOT 未设且 cwd 不像 monorepo 根时一次告警。
     // start.sh 路径解析 env > cwd, cwd 错误时 up_native 会全量 fail-closed。
     if std::env::var("FUSION_ROOT").is_err() {

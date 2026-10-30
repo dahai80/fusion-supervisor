@@ -79,6 +79,12 @@ pub struct Config {
     pub native_pg_host: String,
     #[serde(default = "default_native_pg_port")]
     pub native_pg_port: u16,
+    // issue #80: daemon 自身 PATH 的追加项 (冒号分隔)。launchd 默认 PATH 不含
+    // /opt/homebrew/bin — node/brew 系 start.sh 在 daemon 拉起时 `command -v node`
+    // 全挂。daemon 启动时把缺失项追加到自身 PATH 尾部, 子进程 (start.sh /
+    // daemonize) 全部继承; 空串禁用 (保持 launchd 原始 PATH)。
+    #[serde(default = "default_native_extra_path")]
+    pub native_extra_path: String,
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
@@ -182,6 +188,24 @@ fn default_native_pg_host() -> String {
 fn default_native_pg_port() -> u16 {
     5432
 }
+// issue #80: Apple Silicon (/opt/homebrew) + Intel (/usr/local) 两处 Homebrew bin。
+fn default_native_extra_path() -> String {
+    "/opt/homebrew/bin:/usr/local/bin".to_string()
+}
+
+// issue #80: 把 extra 中的 PATH 项追加到 cur 尾部 — 已存在的项跳过 (保序去重,
+// 追加-only 不改变既有解析优先级), 空项/空白项忽略。纯函数便于单测。
+pub fn append_path_entries(cur: &str, extra: &str) -> String {
+    let mut entries: Vec<&str> = cur.split(':').filter(|s| !s.is_empty()).collect();
+    for e in extra.split(':') {
+        let e = e.trim();
+        if e.is_empty() || entries.contains(&e) {
+            continue;
+        }
+        entries.push(e);
+    }
+    entries.join(":")
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -212,6 +236,7 @@ impl Default for Config {
             pg_dump_bin: None,
             native_pg_host: default_native_pg_host(),
             native_pg_port: default_native_pg_port(),
+            native_extra_path: default_native_extra_path(),
         }
     }
 }
@@ -396,5 +421,53 @@ mod tests {
         let abs = root.join("abs.env");
         assert_eq!(resolve_env_file(&abs), abs, "绝对路径原样返回");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // issue #80: 缺失项追加到尾部 (追加-only, 不改变既有解析顺序)
+    #[test]
+    fn test_append_path_entries_appends_missing() {
+        assert_eq!(
+            append_path_entries("/usr/bin:/bin", "/opt/homebrew/bin:/usr/local/bin"),
+            "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
+        );
+    }
+
+    // issue #80: 已存在的项跳过 — launchd 环境已含 Homebrew bin 时幂等
+    #[test]
+    fn test_append_path_entries_dedups_existing() {
+        assert_eq!(
+            append_path_entries(
+                "/opt/homebrew/bin:/usr/bin:/bin",
+                "/opt/homebrew/bin:/usr/local/bin"
+            ),
+            "/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin"
+        );
+        // 全部已存在 → 不变
+        assert_eq!(append_path_entries("/a:/b", "/a:/b"), "/a:/b");
+    }
+
+    // issue #80: extra 为空串 (禁用) / 空项 / 空白项 → cur 原样 (仅去空项)
+    #[test]
+    fn test_append_path_entries_empty_and_trim() {
+        assert_eq!(append_path_entries("/usr/bin:/bin", ""), "/usr/bin:/bin");
+        assert_eq!(
+            append_path_entries("/usr/bin:::/bin", "  "),
+            "/usr/bin:/bin"
+        );
+        // 空白项 trim 后追加
+        assert_eq!(
+            append_path_entries("/usr/bin", "  /opt/homebrew/bin  "),
+            "/usr/bin:/opt/homebrew/bin"
+        );
+    }
+
+    // issue #80: cur 为空 (PATH 未设) → 仅剩 extra 的有效项
+    #[test]
+    fn test_append_path_entries_empty_cur() {
+        assert_eq!(
+            append_path_entries("", "/opt/homebrew/bin:/usr/local/bin"),
+            "/opt/homebrew/bin:/usr/local/bin"
+        );
+        assert_eq!(append_path_entries("", ""), "");
     }
 }
