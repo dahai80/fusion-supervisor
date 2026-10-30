@@ -112,6 +112,9 @@ pub fn name_to_dir(name: &str) -> &str {
         ("customer-insight", "business/ai-customer-insight"),
         ("customer-insight-api", "business/ai-customer-insight"),
         ("ai-apparelmockup-web", "business/ai-apparelmockup"),
+        // issue #83: AI 试衣后端 (11515), repo 在 business/ai-trysuite;
+        // 根 start.sh 是 wrapper, exec 委托 server/start.sh
+        ("ai-trysuite", "business/ai-trysuite"),
     ];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
@@ -332,6 +335,8 @@ external_tools: []
             name_to_dir("ai-ads-videobuilder"),
             "business/ai-ads-videobuilder"
         );
+        // issue #83: AI 试衣后端, 根 start.sh 是 wrapper 委托 server/start.sh
+        assert_eq!(name_to_dir("ai-trysuite"), "business/ai-trysuite");
     }
 
     // issue #29: shell-ecosystem 子服务 → 父 repo; 父名本身 → 自身
