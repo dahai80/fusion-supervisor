@@ -137,6 +137,11 @@ pub fn name_to_dir(name: &str) -> &str {
         // osagent issue#6: registry 只有 fusion-osagent-metrics 子服务 key,
         // 磁盘 repo 是 fusion-osagent (无 start.sh, 启动见 start_map Daemon spec)
         ("fusion-osagent", "fusion-osagent"),
+        // issue #81: fusion-office-api 子服务 → 父 repo fusion-office。
+        // 根 start.sh 只管 11485 shell; api 生命周期脚本在 services/office-api/
+        // (启动走 start_map Script spec), name_to_dir 默认映射指向不存在的
+        // fusion-office-api/ 目录 (logs/start_sh_path 兜底路径 fail-closed)
+        ("fusion-office", "fusion-office"),
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
             return dir;
@@ -296,6 +301,8 @@ external_tools: []
         );
         assert_eq!(name_to_dir("fusion-mlx"), "fusion-mlx");
         assert_eq!(name_to_dir("fusion-cowork-ws"), "fusion-cowork");
+        // issue #81: office-api 落父 repo fusion-office (默认映射目录不存在)
+        assert_eq!(name_to_dir("fusion-office-api"), "fusion-office");
     }
 
     // issue #45: business 平台服务 → business/ 子目录

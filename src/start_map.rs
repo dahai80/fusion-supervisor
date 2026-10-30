@@ -52,6 +52,13 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         "fusion-trainer-bridge" => Some(StartSpec::Script(
             fusion_root().join("fusion-trainer/scripts/trainer-bridge.sh"),
         )),
+        // issue #81: fusion-office 根 start.sh 只管 11485 shell (shell-serve.mjs),
+        // api (registry :11492) 的生命周期脚本在嵌套 services/office-api/ 下
+        // (start|stop|restart|status|log, 自带 pidfile + /healthz 健康等待)。
+        // 走 Script 编排脚本原样, 不改上游 (只能修改本工程, 上游问题提 issue)。
+        "fusion-office-api" => Some(StartSpec::Script(
+            fusion_root().join("fusion-office/services/office-api/start.sh"),
+        )),
         "fusion-cowork-web" => Some(daemon(
             "fusion-cowork",
             &["web", "serve", "--port", "11461"],
@@ -411,6 +418,22 @@ mod tests {
     fn test_trainer_bridge_uses_script() {
         let spec = start_spec_for("fusion-trainer-bridge").unwrap();
         assert!(matches!(spec, StartSpec::Script(_)));
+    }
+
+    // issue #81: office-api 走嵌套 services/office-api/start.sh (非仓库根脚本)
+    #[test]
+    fn test_office_api_uses_script() {
+        let spec = start_spec_for("fusion-office-api").unwrap();
+        match spec {
+            StartSpec::Script(p) => {
+                assert!(
+                    p.ends_with("fusion-office/services/office-api/start.sh"),
+                    "office-api 脚本路径错误: {:?}",
+                    p
+                );
+            }
+            _ => panic!("office-api 应为 Script spec"),
+        }
     }
 
     // issue #34: cowork-ws 用 remote serve 前台进程 daemonize

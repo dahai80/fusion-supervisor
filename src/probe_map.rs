@@ -98,6 +98,9 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("customer-insight", ProbeSpec::tcp(11594));
     m.insert("customer-insight-api", ProbeSpec::tcp(11501));
     m.insert("ai-apparelmockup-web", ProbeSpec::tcp(11593));
+    // issue #81: office-api 自带健康口 (上游 start.sh 启动后同 curl 验证,
+    // services/office-api, :11492)
+    m.insert("fusion-office-api", ProbeSpec::http(11492, "/healthz"));
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -208,6 +211,15 @@ mod tests {
         for name in ["fusion-store", "fusion-smallbusiness", "fusion-simulation"] {
             assert_eq!(restart_cmd_for(name), "stop+start", "{name}");
         }
+    }
+
+    // issue #81: office-api HTTP /healthz 探活 + start_map 覆盖 → stop+start
+    #[test]
+    fn test_issue81_office_api_probe() {
+        let s = probe_spec_for("fusion-office-api", 11492);
+        assert!(matches!(s.kind, ProbeKind::Http), "office-api 应 HTTP 探活");
+        assert_eq!(s.path.as_deref(), Some("/healthz"));
+        assert_eq!(restart_cmd_for("fusion-office-api"), "stop+start");
     }
 
     // issue #34: 探活路径对齐上游实况 — model-hub/health/finance 换真实路径,
