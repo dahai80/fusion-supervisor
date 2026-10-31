@@ -252,12 +252,18 @@ async fn cli_top(cfg: Config) -> anyhow::Result<()> {
     }
 }
 
+// issue #82: CLI 请求带来源 — daemon 侧停止/停止全部操作可追溯发起进程
+fn cli_origin() -> String {
+    let argv = std::env::args().collect::<Vec<_>>().join(" ");
+    format!("cli pid={} argv: {}", std::process::id(), argv)
+}
+
 async fn cli_call(cfg: Config, method: &str) -> anyhow::Result<()> {
     let mut client = connect_client(&cfg).await?;
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
         method: method.into(),
-        params: Value::Null,
+        params: serde_json::json!({"origin": cli_origin()}),
         id: 1,
     };
     let resp = client.call(req).await?;
@@ -279,7 +285,7 @@ async fn cli_call_param(cfg: Config, method: &str, service: String) -> anyhow::R
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
         method: method.into(),
-        params: serde_json::json!({"service": service}),
+        params: serde_json::json!({"service": service, "origin": cli_origin()}),
         id: 1,
     };
     let resp = client.call(req).await?;

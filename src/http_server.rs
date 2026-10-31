@@ -46,8 +46,15 @@ pub async fn serve(
                 let web_dir = web_dir.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_conn(&mut stream, &core, &token, &web_dir, &shutdown_tx).await
+                    if let Err(e) = handle_conn(
+                        &mut stream,
+                        &peer.to_string(),
+                        &core,
+                        &token,
+                        &web_dir,
+                        &shutdown_tx,
+                    )
+                    .await
                     {
                         tracing::debug!(peer = %peer, err = %e, "http conn error");
                     }
@@ -112,6 +119,7 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 
 pub async fn handle_conn(
     stream: &mut tokio::net::TcpStream,
+    peer: &str,
     core: &Arc<tokio::sync::Mutex<SupervisorCore>>,
     token: &Option<String>,
     web_dir: &Option<PathBuf>,
@@ -125,13 +133,14 @@ pub async fn handle_conn(
     }
     let req = parse_request(&String::from_utf8_lossy(&buf[..n]));
 
-    let resp = route(&req, core, token, web_dir, shutdown_tx).await;
+    let resp = route(&req, peer, core, token, web_dir, shutdown_tx).await;
     stream.write_all(resp.as_bytes()).await?;
     Ok(())
 }
 
 async fn route(
     req: &Request,
+    peer: &str,
     core: &Arc<tokio::sync::Mutex<SupervisorCore>>,
     token: &Option<String>,
     web_dir: &Option<PathBuf>,
@@ -163,14 +172,12 @@ async fn route(
             http_text("200 OK", "application/json", &body)
         }
         ("POST", "/api/v1/boot/pin") => {
-            let resp = crate::rpc::server::dispatch_http(
-                "boot.pin",
-                boot_post_params(&req.body, &req.token),
-                core,
-                token,
-                shutdown_tx,
-            )
-            .await;
+            // issue #82: boot 面请求同带来源
+            let mut params = boot_post_params(&req.body, &req.token);
+            params["origin"] = json!(format!("http POST /api/v1/boot/pin from {peer}"));
+            let resp =
+                crate::rpc::server::dispatch_http("boot.pin", params, core, token, shutdown_tx)
+                    .await;
             let status = if resp.error.is_some() {
                 "500 Internal Server Error"
             } else {
@@ -183,14 +190,12 @@ async fn route(
             )
         }
         ("POST", "/api/v1/boot/group") => {
-            let resp = crate::rpc::server::dispatch_http(
-                "boot.group",
-                boot_post_params(&req.body, &req.token),
-                core,
-                token,
-                shutdown_tx,
-            )
-            .await;
+            // issue #82: 分组停止波也是操作员意图, 来源可追溯
+            let mut params = boot_post_params(&req.body, &req.token);
+            params["origin"] = json!(format!("http POST /api/v1/boot/group from {peer}"));
+            let resp =
+                crate::rpc::server::dispatch_http("boot.group", params, core, token, shutdown_tx)
+                    .await;
             let status = if resp.error.is_some() {
                 "500 Internal Server Error"
             } else {
@@ -300,6 +305,16 @@ async fn route(
             }
             if !req.token.is_empty() {
                 params["token"] = json!(req.token);
+            }
+            // issue #82: HTTP 编排操作来源可追溯 (方法+路径+对端地址);
+            // 请求体自带 origin 时不覆盖
+            if params
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                params["origin"] = json!(format!("http {} {} from {}", m, p, peer));
             }
             let resp =
                 crate::rpc::server::dispatch_http(method, params, core, token, shutdown_tx).await;

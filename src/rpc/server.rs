@@ -113,10 +113,40 @@ async fn dispatch(
         }
         Some(Method::Down) => {
             // issue #31: 同 Up — service 参数此前被忽略, down <svc> 会全停, 危险。
+            // issue #82: 停止是操作员意图, 必须记录来源 (CLI argv / HTTP 路由+对端 /
+            // UDS 直连) 并与探活失败区分 — stop-all 全停波打醒目 banner + 事件表。
+            let origin = origin_of(&req.params, "uds client (origin not provided)");
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let mut c = core.lock().await;
             let res = match req.params.get("service").and_then(|v| v.as_str()) {
-                Some(svc) if !svc.is_empty() => c.down_one(svc).await,
-                _ => c.down_all().await,
+                Some(svc) if !svc.is_empty() => {
+                    tracing::warn!(svc = %svc, origin = %origin, "manual stop (operator intent)");
+                    if let Err(e) =
+                        c.store
+                            .record_event(svc, "ManualStop", &origin, now_ts, "native", "warn")
+                    {
+                        tracing::warn!(err = %e, "ManualStop event write fail");
+                    }
+                    c.down_one(svc).await
+                }
+                _ => {
+                    // 醒目 banner: 全停波普通逐行日志易漏看 (2026-10-30 22:53 事故)
+                    tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    tracing::warn!("!! STOP-ALL requested — entire fleet will be stopped");
+                    tracing::warn!("!! fleet stays DOWN until manually restarted");
+                    tracing::warn!("!! origin: {origin}");
+                    tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    if let Err(e) = c
+                        .store
+                        .record_event("*", "StopAll", &origin, now_ts, "native", "warn")
+                    {
+                        tracing::warn!(err = %e, "StopAll event write fail");
+                    }
+                    c.down_all().await
+                }
             };
             match res {
                 Ok(()) => make_result(json!("ok"), req.id),
@@ -308,9 +338,11 @@ async fn dispatch(
                 _ => return make_error(-32602, "invalid params: action required", req.id),
             };
             let mut c = core.lock().await;
+            // issue #82: 分组停止波也是操作员意图, 日志带来源
+            let origin = origin_of(&req.params, "uds client (origin not provided)");
             match c.boot_group(&group, &action).await {
                 Ok(summary) => {
-                    tracing::info!(group = %group, action = %action, "boot group done (rpc)");
+                    tracing::info!(group = %group, action = %action, origin = %origin, "boot group done (rpc)");
                     make_result(summary, req.id)
                 }
                 Err(e) => make_error(-32000, &e.to_string(), req.id),
@@ -340,4 +372,46 @@ pub async fn dispatch_http(
         shutdown_tx,
     )
     .await
+}
+
+// issue #82: 停止命令来源解析 — 客户端显式带 origin (CLI argv / HTTP 路由) 优先,
+// 缺失回退调用方面默认值 (UDS 直连无法取对端进程, 标记为未知来源)。
+fn origin_of(params: &serde_json::Value, fallback: &str) -> String {
+    params
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_of;
+
+    #[test]
+    fn test_origin_of_prefers_explicit() {
+        let params = serde_json::json!({"origin": "cli pid=1 argv: fusion-sv down"});
+        assert_eq!(
+            origin_of(&params, "uds client"),
+            "cli pid=1 argv: fusion-sv down"
+        );
+    }
+
+    #[test]
+    fn test_origin_of_falls_back() {
+        assert_eq!(
+            origin_of(&serde_json::json!({}), "uds client"),
+            "uds client"
+        );
+        assert_eq!(
+            origin_of(&serde_json::Value::Null, "uds client"),
+            "uds client"
+        );
+        // 空串视为缺失
+        assert_eq!(
+            origin_of(&serde_json::json!({"origin": ""}), "uds client"),
+            "uds client"
+        );
+    }
 }
