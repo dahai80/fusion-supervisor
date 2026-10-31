@@ -123,8 +123,10 @@ pub fn probe_spec_for(name: &str, port: u16) -> ProbeSpec {
 pub fn restart_cmd_for(name: &str) -> &'static str {
     // issue #45: ai-family start.sh 只有 start/stop/status/log/doctor,
     // 无 restart 子命令 (bash start.sh restart → usage exit 1) → stop+start
+    // issue #83: ai-trysuite server/start.sh 同款 usage (无 restart)
     if name == "fusion-store"
         || name == "ai-family"
+        || name == "ai-trysuite"
         || crate::start_map::start_spec_for(name).is_some()
     {
         "stop+start"
@@ -180,6 +182,8 @@ mod tests {
             restart_cmd_for("fusion-plugins-ecosystem-console"),
             "stop+start"
         );
+        // issue #83: ai-trysuite server/start.sh 只有 start|stop|status|log|doctor
+        assert_eq!(restart_cmd_for("ai-trysuite"), "stop+start");
     }
 
     // issue #31: MCP server 无 /health, TCP 探活
