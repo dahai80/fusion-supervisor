@@ -348,6 +348,19 @@ pub fn log_path(svc: &str) -> PathBuf {
         .join(format!("{svc}.log"))
 }
 
+// 防 idle sleep 陪护: launchd 迁 supervisor 后, 原 plist 的 caffeinate -i 随迁
+// 丢失 (2026-10-30)。fusion-gupiao 凌晨 01:00 daily_suggest 长扫描会被系统
+// idle sleep 打断。start/restart 成功后以 `caffeinate -i -w <服务 pid>` 挂
+// 系统断言 — 服务退出/被停时 caffeinate 自动退出释放断言, 无需 stop 路径配合。
+// 上游正解是 gupiao start.sh 自带 caffeinate 选项 (fusion-gupiao#6),
+// 此表为 supervisor 侧过渡补丁。
+pub fn caffeinate_pidfile(svc: &str) -> Option<&'static str> {
+    match svc {
+        "fusion-gupiao" => Some("~/.fusion-gupiao/run.pid"),
+        _ => None,
+    }
+}
+
 // daemonize start 命令 (bash -c 执行): nohup 后台 + 日志重定向 + pidfile。
 // 注意 mkdir/cd/export 用 `;` 分隔而非 `&&`: `A && B &` 会把整个列表后台化为
 // 子 shell, $! 拿到的是子 shell pid 而非真实进程 pid — stop 时 kill 掉的是壳,
@@ -413,6 +426,17 @@ pub fn daemon_stop_cmd(svc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // caffeinate 陪护表: gupiao 有, 其他服务无
+    #[test]
+    fn test_caffeinate_pidfile_table() {
+        assert_eq!(
+            caffeinate_pidfile("fusion-gupiao"),
+            Some("~/.fusion-gupiao/run.pid")
+        );
+        assert_eq!(caffeinate_pidfile("fusion-mlx"), None);
+        assert_eq!(caffeinate_pidfile("unknown-svc"), None);
+    }
 
     #[test]
     fn test_trainer_bridge_uses_script() {

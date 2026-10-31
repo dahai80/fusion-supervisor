@@ -93,6 +93,10 @@ pub fn name_to_dir(name: &str) -> &str {
         // (active v0.20.2, start.sh master 127.0.0.1:11452); 默认映射目录不存在
         // → start 路径 fail-closed 长期 Failed
         ("fusion-multi-node", "fusion-multi-nodes"),
+        // registry key 无 s, 磁盘 repo 目录带 s (fusion-models-hub, active v1.2.10,
+        // start.sh 11444) — 旧默认映射指向已不存在的 fusion-model-hub/, start 路径
+        // fail-closed, 服务长期只能手工拉起 (2026-10-31 11444 孤儿进程即手工残留)
+        ("fusion-model-hub", "fusion-models-hub"),
         ("ai-family", "business/ai-family"),
         // ai-fit: registry key + actual dir are both ai-fit (issue: boot
         // auto-start failed because the old 'fit-ai' exception pointed to a
@@ -362,6 +366,13 @@ external_tools: []
         assert_eq!(name_to_dir("fusion-multi-node"), "fusion-multi-nodes");
         assert_eq!(name_to_dir("fusion-multi-node-agent"), "fusion-multi-nodes");
         assert_eq!(name_to_dir("fusion-multi-node-mcp"), "fusion-multi-nodes");
+    }
+
+    // fusion-model-hub: registry key 无 s, 磁盘 repo 目录带 s — 默认映射指向
+    // 不存在的 fusion-model-hub/, start 路径 fail-closed
+    #[test]
+    fn test_name_to_dir_model_hub_plural_dir() {
+        assert_eq!(name_to_dir("fusion-model-hub"), "fusion-models-hub");
     }
 
     // osagent issue#6: fusion-osagent-metrics 子服务 key 落真实 repo 目录

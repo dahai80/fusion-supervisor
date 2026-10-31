@@ -1093,8 +1093,49 @@ fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> 
         None => {
             let repo_dir = crate::manifest::name_to_dir(svc);
             let sh = probe_map::start_sh_path(repo_dir);
-            exec_bash_script(svc, &sh, cmd, env_overrides)
+            let r = exec_bash_script(svc, &sh, cmd, env_overrides);
+            // 防 idle sleep 陪护 (gupiao 过渡补丁): start/restart 成功后挂
+            // caffeinate -i -w <pid> 断言, 服务退出自动释放
+            if r.is_ok()
+                && matches!(cmd, "start" | "restart")
+                && let Some(pidfile) = crate::start_map::caffeinate_pidfile(svc)
+            {
+                spawn_caffeinate(svc, pidfile);
+            }
+            r
         }
+    }
+}
+
+// caffeinate 陪护: 读服务 pidfile, `sh -c 'caffeinate -i -w <pid> & ...'` 方式
+// 孤儿化 — sh 即刻退出 (status() 回收防僵尸), caffeinate 重父到 launchd。
+// pidfile 缺失/内容非数字 (start.sh 尚未写好) → WARN 跳过, 下次重启再挂。
+fn spawn_caffeinate(svc: &str, pidfile: &str) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = pidfile.replace('~', &home);
+    let pid = match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            tracing::warn!(svc, pidfile = %path, err = %e, "caffeinate 陪护跳过: pidfile 不可读");
+            return;
+        }
+    };
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        tracing::warn!(svc, pidfile = %path, "caffeinate 陪护跳过: pidfile 内容非法");
+        return;
+    }
+    let cmdline = format!("caffeinate -i -w {pid} >/dev/null 2>&1 &");
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmdline)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(_) => {
+            tracing::info!(svc, pid = %pid, "caffeinate 断言已挂 (防 idle sleep, 服务退出自动释放)")
+        }
+        Err(e) => tracing::warn!(svc, err = %e, "caffeinate 陪护拉起失败"),
     }
 }
 
@@ -1357,6 +1398,58 @@ mod tests {
         );
         // 清理测试过程文件 (孙进程 sleep 已被 tempdir 之外清理策略兜底: 60s 后自然退出)
         let _ = std::fs::remove_file(crate::start_map::log_path("ut-linger"));
+    }
+
+    // caffeinate 陪护: pidfile 指向活进程 → 断言挂上; 进程死 → caffeinate 退出
+    // (绝对路径直传, 不走 ~ 展开 — 避免 HOME 全局 env 竞态)
+    #[test]
+    fn test_spawn_caffeinate_attaches_and_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        // 陪护目标: sleep 进程
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = target.id().to_string();
+        let pidfile = dir.path().join("run.pid");
+        std::fs::write(&pidfile, &pid).unwrap();
+        spawn_caffeinate("ut-caffeinate", pidfile.to_str().unwrap());
+        // caffeinate 进程应存在且 -w 指向 target pid
+        let mut attached = false;
+        for _ in 0..40 {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", &format!("caffeinate -i -w {pid}")])
+                .output()
+                .unwrap();
+            if out.status.success() && !out.stdout.is_empty() {
+                attached = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(attached, "caffeinate 断言应挂到目标 pid");
+        // 目标死亡 → caffeinate 自动退出 (-w 语义)
+        let _ = target.kill();
+        let _ = target.wait();
+        let mut released = false;
+        for _ in 0..60 {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", &format!("caffeinate -i -w {pid}")])
+                .output()
+                .unwrap();
+            if !out.status.success() || out.stdout.is_empty() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(released, "目标进程死后 caffeinate 应自动退出");
+    }
+
+    // caffeinate 陪护: pidfile 缺失 → 跳过不 panic
+    #[test]
+    fn test_spawn_caffeinate_skips_bad_pidfile() {
+        spawn_caffeinate("ut-caffeinate", "/nonexistent-ut-xyz/run.pid");
     }
 
     // issue #60 回归: exec 启动的子进程必须落在独立进程组 — launchd bootout 按
