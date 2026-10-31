@@ -84,6 +84,8 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("ai-family", ProbeSpec::tcp(11483));
     // issue #55: apparelmockup 上游已改 FastAPI 但未见公开健康口 → 保守 TCP
     m.insert("ai-apparelmockup", ProbeSpec::tcp(11520));
+    // issue #84: ai-trysuite 公开健康口 /healthz (无鉴权), 优于 TCP 兜底
+    m.insert("ai-trysuite", ProbeSpec::http(11515, "/healthz"));
     // issue #55: 批量登记条目 — 有鉴权豁免 /health 的走 HTTP, 其余 (ads_vb /
     // operabase 未见公开健康口, 静态 http.server 恒 404) 退 TCP
     m.insert("ai-doc-automation", ProbeSpec::http(11550, "/health"));
@@ -184,6 +186,10 @@ mod tests {
         );
         // issue #83: ai-trysuite server/start.sh 只有 start|stop|status|log|doctor
         assert_eq!(restart_cmd_for("ai-trysuite"), "stop+start");
+        // issue #84: ai-trysuite 公开健康口 /healthz
+        let s = probe_spec_for("ai-trysuite", 11515);
+        assert!(matches!(s.kind, ProbeKind::Http));
+        assert_eq!(s.path.as_deref(), Some("/healthz"));
     }
 
     // issue #31: MCP server 无 /health, TCP 探活
