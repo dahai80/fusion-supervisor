@@ -27,43 +27,51 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
 // issue #45: business 平台服务的 FUSION_CLIENT_KEY (gateway 客户端 key, 约定 1)
 // 也走此注入通道 — 三个 arg-less start.sh 均硬性要求该 key, 缺失 fail-fast。
 // 这些注入不受 compose 开关控制 (与 sidecar 连接 env 不同)。
-fn shell_vars(svc: &str) -> Option<&'static [&'static str]> {
+// issue #85: FUSION_CLIENT_KEY 反转默认 — 全部托管 native 服务统一注入,
+// 仅明确排除的服务例外。手工 allowlist 已三次漏登 (fusion-rag 2026-10-31
+// 夜 / ai-trysuite #84 / fusion-code-modenization #85), 每个新 gateway
+// 消费服务都会静默降级 (回退 daemon env 快照里已轮换失效的旧别名
+// FUSION_MLX_API_KEY → 401) 直到有人注意到。不读该 env 的服务直接忽略,
+// 注入无副作用; fail-fast `:?` 消费方由注入满足; 解析链不变
+// (进程 env → env_file → gateway config 兜底, 全缺 Err 拒启动)。
+// 排除表 (不注入 FUSION_CLIENT_KEY):
+// - fusion-gateway: 上游 config.go 刻意不 BindEnv FUSION_CLIENT_KEY —
+//   ambient 客户端 key 会经 api_key_env 引用覆写 mlx backend key
+//   (fusion-gateway#412), 注入属于越权。
+// - fusion-mlx: 推理服务端, 鉴权单一真源是 settings.json (strip_env_for
+//   同理), 客户端 key 不该进服务端 env。
+// - 纯静态托管 (http.server web/dist, 不打 gateway)。
+fn shell_vars(svc: &str) -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> = Vec::new();
+    if !matches!(
+        svc,
+        "fusion-gateway"
+            | "fusion-mlx"
+            | "customer-insight"
+            | "customer-insight-api"
+            | "ai-apparelmockup-web"
+    ) {
+        vars.push("FUSION_CLIENT_KEY");
+    }
     match svc {
         // issue #54: 上游已迁 conventions §6 新名 — cowork shell_registry.py 读
         // FUSION_SHELL_GATEWAY_URL + FUSION_ADMIN_KEY (URL 尚未迁 BASE_URL,
         // 迁移期保留旧名); plugins console v0.4.7 (fusion-plugins-ecosystem#39)
         // 读 FUSION_GATEWAY_BASE_URL + FUSION_ADMIN_KEY, 不再认旧名。
-        "fusion-cowork-web" => Some(&["FUSION_SHELL_GATEWAY_URL", "FUSION_ADMIN_KEY"]),
+        "fusion-cowork-web" => vars.extend(["FUSION_SHELL_GATEWAY_URL", "FUSION_ADMIN_KEY"]),
         "fusion-plugins-ecosystem-console" => {
-            Some(&["FUSION_GATEWAY_BASE_URL", "FUSION_ADMIN_KEY"])
+            vars.extend(["FUSION_GATEWAY_BASE_URL", "FUSION_ADMIN_KEY"])
         }
-        "fusion-trainer-bridge" => Some(&["FUSION_TRAINER_BRIDGE_KEY"]),
-        // issue #55: 2026-10-27/28 批量登记的 FastAPI business 服务同样消费
-        // gateway 客户端 key (约定 1); 纯静态托管 (customer-insight ×2,
-        // apparelmockup-web) 不打 gateway, 不注入。
-        "ai-fit"
-        | "ai-speech-exam"
-        | "ai-apparelmockup"
-        | "ai-ads-videobuilder"
-        | "ai-doc-automation"
-        | "ai-information-search"
-        | "ai-OperaBase"
-        | "ai-charactervoice"
-        | "ai-charactervoice-session"
-        // issue #83: ai-trysuite server/start.sh 约定 1 fail-fast 硬要求
-        // FUSION_CLIENT_KEY (LLM 穿搭推荐打 gateway)
-        | "ai-trysuite"
-        // fusion-rag /ask 生成的 LLM 通道同样打 gateway — 不注入则回退 daemon
-        // 快照里的废弃别名 FUSION_MLX_API_KEY（已轮换失效），/health 记
-        // llm_auth=rejected（2026-10-31 夜检发现）。
-        | "fusion-rag" => Some(&["FUSION_CLIENT_KEY"]),
-        _ => None,
+        "fusion-trainer-bridge" => vars.push("FUSION_TRAINER_BRIDGE_KEY"),
+        _ => {}
     }
+    vars
 }
 
 // 该服务是否需要 shell 注册 env (调用方无条件注入, 不 gate 在 compose 上)。
+// issue #85 反转默认后, 除排除表外的全部服务都需要 (FUSION_CLIENT_KEY)。
 pub fn needs_shell_env(svc: &str) -> bool {
-    shell_vars(svc).is_some()
+    !shell_vars(svc).is_empty()
 }
 
 // issue #39/#40: 启动子进程前须剥离的 env 变量名。
@@ -253,11 +261,12 @@ fn tcp_reachable(port: u16, what: &str) -> bool {
 //   (bridge 自身要求此 key, 缺了起不来, 早失败早告警)
 // 非 shell 模块服务 → 空 map。
 pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, String>> {
-    let Some(keys) = shell_vars(svc) else {
+    let keys = shell_vars(svc);
+    if keys.is_empty() {
         return Ok(HashMap::new());
-    };
+    }
     let mut out = HashMap::new();
-    for k in keys {
+    for k in &keys {
         match *k {
             "FUSION_SHELL_GATEWAY_URL" => {
                 let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
@@ -579,6 +588,8 @@ pub(crate) mod tests {
     #[test]
     fn test_shell_env_from_process_env() {
         let _g = env_lock().lock().unwrap();
+        // issue #85: 反转默认后 cowork-web 也注入 FUSION_CLIENT_KEY, 测试显式供 key
+        let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-proc");
         let _c = EnvGuard::set("FUSION_ADMIN_KEY", "fromproc");
         let f = env_file("");
         let env = shell_env_for("fusion-cowork-web", f.path()).unwrap();
@@ -597,7 +608,7 @@ pub(crate) mod tests {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_ADMIN_KEY") };
         unsafe { std::env::remove_var("FUSION_GATEWAY_BASE_URL") };
-        let f = env_file("FUSION_ADMIN_KEY=fromfile\n");
+        let f = env_file("FUSION_ADMIN_KEY=fromfile\nFUSION_CLIENT_KEY=ck-file\n");
         let env = shell_env_for("fusion-plugins-ecosystem-console", f.path()).unwrap();
         assert_eq!(env.get("FUSION_ADMIN_KEY").unwrap(), "fromfile");
         assert_eq!(
@@ -616,7 +627,7 @@ pub(crate) mod tests {
             "FUSION_GATEWAY_CONFIG",
             "/nonexistent/fusion-gateway-config-test.yaml",
         );
-        let f = env_file("");
+        let f = env_file("FUSION_CLIENT_KEY=ck-file\n");
         let r = shell_env_for("fusion-cowork-web", f.path());
         assert!(r.is_err(), "admin key 全缺应 fail-closed");
         let msg = r.unwrap_err().to_string();
@@ -690,17 +701,22 @@ pub(crate) mod tests {
         assert!(needs_shell_env("ai-fit"));
         assert!(needs_shell_env("ai-speech-exam"));
         assert!(needs_shell_env("ai-apparelmockup"));
-        // issue #55: 批量登记的 FastAPI 条目同注入; 纯静态托管不注入
+        // issue #55: 批量登记的 FastAPI 条目同注入
         assert!(needs_shell_env("ai-ads-videobuilder"));
         assert!(needs_shell_env("ai-charactervoice"));
+        // issue #85 反转默认: 排除表外全部注入 — 静态托管/gateway/mlx 除外
         assert!(!needs_shell_env("customer-insight"));
+        assert!(!needs_shell_env("customer-insight-api"));
         assert!(!needs_shell_env("ai-apparelmockup-web"));
-        // ai-family 源码不消费该 key (自建鉴权), 不注入
-        assert!(!needs_shell_env("ai-family"));
-        // 2026-10-31: fusion-rag /ask LLM 通道同样打 gateway, 需要注入
+        assert!(!needs_shell_env("fusion-gateway"));
+        assert!(!needs_shell_env("fusion-mlx"));
+        // 未知/未登记服务同样注入 (不读则忽略)
+        assert!(needs_shell_env("ai-family"));
         assert!(needs_shell_env("fusion-rag"));
-        // issue #83: ai-trysuite start.sh 约定 1 fail-fast 硬要求该 key
         assert!(needs_shell_env("ai-trysuite"));
+        // issue #85 直接触发服务: /health gateway 检查 401
+        assert!(needs_shell_env("fusion-code-modenization"));
+        assert!(needs_shell_env("fusion-unknown-new-service"));
     }
 
     // .env 给 key → 进程 env 缺失时从文件解析

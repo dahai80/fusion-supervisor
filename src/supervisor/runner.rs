@@ -44,6 +44,33 @@ fn exit_code_of(err_msg: &str) -> Option<i32> {
     digits.parse().ok()
 }
 
+// issue #86: 检测操作员是否正在对该服务跑 start.sh (任意子命令)。
+// 端口探活无法区分 "操作员 do_restart 的 stop 窗口" 与 "真宕机" — 两者都
+// ConnectionRefused。supervisor 若在操作员 restart 期间抢跑自动重启:
+// 1) 与操作员的 do_start 竞态双拉进程; 2) supervisor 的 exec 只带 daemon
+// env 快照 (env_n=0), 操作员行内 env 覆盖被静默丢弃 (2026-10-31 fusion-mlx
+// FUSION_MLX_HEAVY_ADMISSION_LINE=0.99 实证丢失)。
+// 检测: pgrep -f "<repo_dir>/start[.]sh" — 操作员脚本进程存活期间 cmdline
+// 含该路径。supervisor 自身 exec 在核心锁内同步执行, tick 不会并发看到
+// 自己的 start.sh 进程, 无自匹配。模式用 [.] 括号写法: 同 repo 的并发
+// pgrep 进程 cmdline 含字面 "start[.]sh", 正则 "start[.]sh" 只匹配
+// "start.sh" 不匹配 "start[.]sh", 杜绝 pgrep 互相自匹配 (测试并行跑出
+// 过 7 个假阳性)。pgrep 不可用 → false (pass-open, 行为回落到修复前)。
+fn start_sh_process_alive(repo_dir: &str) -> bool {
+    let pat = format!("{repo_dir}/start[.]sh");
+    match std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg(&pat)
+        .output()
+    {
+        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Err(e) => {
+            tracing::warn!(err = %e, "pgrep 不可用, 视为无操作员脚本在跑 (pass-open)");
+            false
+        }
+    }
+}
+
 // 状态机: Stopped→Starting→Healthy→(Unhealthy)→Restarting→Healthy|Failed
 //         Healthy→Draining→Stopped (drain 完成) | Healthy→Draining→Healthy (drain 取消)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +109,9 @@ pub struct ServiceRunner {
     // issue #79: 探活连续失败计数 — 达 RESTART_FAIL_STREAK 才进重启流。
     // 任一次成功探活即复位 (抖动不升级)。pub 供集成测试预置。
     pub fail_streak: u32,
+    // issue #86: 操作员 start.sh 竞态告警 latch — 首次跳过自动重启时 WARN
+    // 一次 (含行内 env 丢失提示), 持续跳过期间静默; 恢复 Healthy 复位。
+    operator_race_notified: bool,
     probe_fn: ProbeFn,
     start_fn: StartFn,
 }
@@ -102,6 +132,7 @@ impl ServiceRunner {
             drain_grace_until: None,
             restart_after: None,
             last_start_ts: None,
+            operator_race_notified: false,
             fast_fail_streak: 0,
             fast_fail_alerted: false,
             config_fail_streak: 0,
@@ -165,6 +196,8 @@ impl ServiceRunner {
                     self.fast_fail_streak = 0;
                     self.fast_fail_alerted = false;
                     self.config_fail_streak = 0;
+                    // issue #86: 恢复复位操作员竞态告警 latch
+                    self.operator_race_notified = false;
                 }
             }
             ProbeResult::Unhealthy { reason } => {
@@ -272,6 +305,25 @@ impl ServiceRunner {
                         // 未到点, 等后续 tick
                     }
                     Some(_) => {
+                        // issue #86: 操作员 start.sh 进行中 → 跳过本轮自动重启。
+                        // 端口探活分不清操作员 do_stop 窗口与真宕机; 抢跑会双拉
+                        // 进程且 exec 只带 daemon env 快照 (env_n=0), 操作员行内
+                        // env 覆盖被静默丢弃。保留 restart_after (下一 tick 重查),
+                        // 不记 crash — 操作员动作不是崩溃。脚本退出后探活恢复则
+                        // 自愈, 仍宕机则下一轮正常重启。
+                        if start_sh_process_alive(&self.def.repo_dir) {
+                            if !self.operator_race_notified {
+                                self.operator_race_notified = true;
+                                tracing::warn!(
+                                    svc = %self.def.name,
+                                    repo = %self.def.repo_dir,
+                                    "操作员 start.sh 进行中, 跳过自动重启 (避免竞态双拉 + \\
+                                     行内 env 被 daemon env 快照覆盖; 操作员 restart 期间 \\
+                                     行内 env 覆盖仅操作员自己的 exec 生效)"
+                                );
+                            }
+                            return;
+                        }
                         self.restart_after = None;
                         let capped = self.policy.record_crash(now_ts);
                         if capped {
@@ -876,6 +928,111 @@ mod tests {
         r.tick(1004, &s, &mut al).await.unwrap();
         assert_eq!(r.restart_after, Some(1005), "3 连败应排期重启");
         assert!(calls.lock().unwrap().is_empty(), "排期 tick 不应重启");
+    }
+
+    // issue #86: 操作员 start.sh 进程检测 — 真实 pgrep 路径
+    #[test]
+    fn test_start_sh_process_alive_detection() {
+        // 无进程 → false
+        assert!(
+            !start_sh_process_alive("no-such-repo-xyz-987"),
+            "无操作员脚本应不检出"
+        );
+        // 模拟操作员脚本: bash 进程 cmdline 含 "<repo>/start.sh"
+        // (bash -c 的 $0 参数进 cmdline, pgrep -f 可匹配)
+        // 复合命令防 bash exec 优化 (单命令会 exec 成 sleep, argv 丢失)
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 3; true")
+            .arg("race-probe-repo-xyz/start.sh")
+            .spawn()
+            .unwrap();
+        let mut seen = false;
+        for _ in 0..40 {
+            if start_sh_process_alive("race-probe-repo-xyz") {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "操作员脚本进程存活应被检出");
+        // 进程退出后不再检出 (pgrep 有毫秒级延迟, 轮询等待清零)
+        let mut cleared = false;
+        for _ in 0..60 {
+            if !start_sh_process_alive("race-probe-repo-xyz") {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(cleared, "脚本退出后应不再检出");
+    }
+
+    // issue #86: 到点重启时操作员 start.sh 在跑 → 跳过本轮 (不 invoke_start,
+    // 不记 crash, restart_after 保留); 脚本退出后下一轮正常重启。
+    #[tokio::test]
+    async fn test_operator_start_sh_running_skips_auto_restart() {
+        let (calls, _, pf, sf) = harness(ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ConnectionRefused,
+        });
+        let mut d = def();
+        d.repo_dir = "race-flow-repo-xyz".into();
+        let mut r = ServiceRunner::new(d, "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Healthy;
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 2; true")
+            .arg("race-flow-repo-xyz/start.sh")
+            .spawn()
+            .unwrap();
+        // 等 pgrep 可见 (bash spawn 毫秒级)
+        for _ in 0..40 {
+            if start_sh_process_alive("race-flow-repo-xyz") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        // 预置 streak: tick1 (Healthy→Unhealthy 记宕机) → tick2 (streak 达阈值排期,
+        // 首退避 1s, due=1002) → tick3 到点, 应被操作员脚本闸门拦下
+        r.fail_streak = 2;
+        r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy));
+        r.tick(1001, &s, &mut al).await.unwrap();
+        assert_eq!(r.restart_after, Some(1002), "3 连败应排期重启");
+        r.tick(1002, &s, &mut al).await.unwrap();
+        // 关键: 未 invoke_start, 未记 crash, 排期保留 (下 tick 重查)
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "操作员脚本在跑不得抢跑自动重启"
+        );
+        assert_eq!(
+            r.policy.crash_count(),
+            0,
+            "操作员动作不是崩溃, 不得记 crash"
+        );
+        assert!(r.restart_after.is_some(), "排期应保留, 下 tick 重查");
+        assert!(r.operator_race_notified, "首次跳过应置告警 latch");
+        // 等操作员脚本退出 (sleep 2 到期) → 下一轮排期到点正常重启
+        let _ = child.wait();
+        let mut gone = false;
+        for _ in 0..60 {
+            if !start_sh_process_alive("race-flow-repo-xyz") {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "操作员脚本应已退出");
+        r.tick(1002, &s, &mut al).await.unwrap();
+        r.tick(1003, &s, &mut al).await.unwrap();
+        assert!(
+            !calls.lock().unwrap().is_empty(),
+            "脚本退出后应恢复正常自动重启"
+        );
     }
 
     // issue #79: 抖动 (失败-失败-恢复-失败-失败) 中间夹成功探活即复位, 永不升级
