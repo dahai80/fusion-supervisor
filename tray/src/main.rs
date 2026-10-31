@@ -899,6 +899,43 @@ impl TrayApp {
                     .inner_margin(8.0),
             )
             .show(ctx, |ui| {
+                // 底部动作行先用 TopBottomPanel::bottom 预留, ScrollArea 只占剩余高度。
+                // 2026-10-31 修复: APP 41 行时列表内容远超窗口, ScrollArea 占满全部
+                // 剩余高度, 排在其后的一键启动/一键停止被挤出可视区 (Core/Platform
+                // 行少 auto_shrink 收缩, 按钮可见) — 用户报告 "app 没有一键停止"。
+                egui::TopBottomPanel::bottom("list_actions")
+                    .frame(egui::Frame::none())
+                    .show_inside(ui, |ui| {
+                        ui.separator();
+                        // 分组动作: 三级统一 一键启动 + 一键停止 (停止为破坏性, 走确认弹窗)。
+                        ui.horizontal(|ui| {
+                            let g = match tier {
+                                Tier::Core => api::TierKey::T0,
+                                Tier::Platform => api::TierKey::T1,
+                                Tier::App => api::TierKey::T2,
+                            };
+                            if ui.button("一键启动").clicked() {
+                                self.enqueue(api::Cmd::Group {
+                                    group: g,
+                                    action: api::Action::Up,
+                                });
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("一键停止").clicked() {
+                                        self.destructive(
+                                            format!("确认停止 {} 全部服务?", tier.label()),
+                                            vec![api::Cmd::Group {
+                                                group: g,
+                                                action: api::Action::Down,
+                                            }],
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    });
                 // 头部: 返回 + 标题 + 运行计数。
                 ui.horizontal(|ui| {
                     if ui.button("▶").clicked() {
@@ -928,32 +965,6 @@ impl TrayApp {
                     for s in &shown {
                         self.row_ui(ui, s);
                     }
-                });
-                ui.separator();
-                // 分组动作: 三级统一 一键启动 + 一键停止 (停止为破坏性, 走确认弹窗)。
-                ui.horizontal(|ui| {
-                    let g = match tier {
-                        Tier::Core => api::TierKey::T0,
-                        Tier::Platform => api::TierKey::T1,
-                        Tier::App => api::TierKey::T2,
-                    };
-                    if ui.button("一键启动").clicked() {
-                        self.enqueue(api::Cmd::Group {
-                            group: g,
-                            action: api::Action::Up,
-                        });
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("一键停止").clicked() {
-                            self.destructive(
-                                format!("确认停止 {} 全部服务?", tier.label()),
-                                vec![api::Cmd::Group {
-                                    group: g,
-                                    action: api::Action::Down,
-                                }],
-                            );
-                        }
-                    });
                 });
             });
     }
