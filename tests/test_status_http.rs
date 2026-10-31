@@ -221,6 +221,58 @@ async fn test_mutation_requires_token_and_reuses_dispatch() {
     handle.abort();
 }
 
+// 2026-10-31: 全量 up 与单服务 up 都要记录来源事件 (与 down 侧 #82 对称) —
+// 此前 01:05 全 fleet 启动波在日志/事件表零痕迹, 无法定位触发方。
+#[tokio::test]
+async fn test_up_records_startall_and_manualstart_events() {
+    let core = SupervisorCore::new_with_fns(
+        vec![def("fusion-mlx", 11434), def("fusion-rag", 11436)],
+        cfg(),
+        |_| ProbeResult::Healthy { latency_ms: 1 },
+        |_, _, _| Ok(()),
+    );
+    let core_arc = Arc::new(tokio::sync::Mutex::new(core));
+    let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
+
+    // 单服务 up (JSON body) → ManualStart 事件
+    let body = r#"{"service":"fusion-mlx"}"#;
+    let req = format!(
+        "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n{body}"
+    );
+    let resp = http_req(&addr, &req).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{}", &resp[..30]);
+
+    // 全量 up (无 body) → StartAll 事件 (service="*")
+    let all = http_req(
+        &addr,
+        "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(all.starts_with("HTTP/1.1 200"), "{}", &all[..30]);
+
+    {
+        let c = core_arc.lock().await;
+        let evs = c.store.recent_events_all(10).unwrap();
+        let manual = evs
+            .iter()
+            .find(|e| e.kind == "ManualStart")
+            .expect("ManualStart 事件缺失");
+        assert_eq!(manual.service, "fusion-mlx");
+        assert!(
+            manual.detail.contains("http POST /api/v1/up from"),
+            "origin 应带 http 来源: {}",
+            manual.detail
+        );
+        let star = evs
+            .iter()
+            .find(|e| e.kind == "StartAll")
+            .expect("StartAll 事件缺失");
+        assert_eq!(star.service, "*");
+        assert!(star.detail.contains("http POST /api/v1/up from"));
+    }
+    handle.abort();
+}
+
 #[tokio::test]
 async fn test_static_serving_and_traversal_rejected() {
     let core = SupervisorCore::new_with_fns(

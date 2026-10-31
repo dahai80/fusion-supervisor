@@ -101,10 +101,39 @@ async fn dispatch(
         Some(Method::Up) => {
             // issue #31: service 参数此前被忽略 (up <svc> 实际跑全量 up_all)。
             // 有 service → 单服务 up_one; 无 → 全量 up_all。
+            // 2026-10-31: up 与 down 对称记录来源 — 此前 01:05 全 fleet 启动波
+            // 在日志/事件表零痕迹, 无法定位触发方 (down 侧 #82 已有同款)。
+            let origin = origin_of(&req.params, "uds client (origin not provided)");
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let mut c = core.lock().await;
             let res = match req.params.get("service").and_then(|v| v.as_str()) {
-                Some(svc) if !svc.is_empty() => c.up_one(svc).await,
-                _ => c.up_all().await,
+                Some(svc) if !svc.is_empty() => {
+                    tracing::info!(svc = %svc, origin = %origin, "manual start (operator intent)");
+                    if let Err(e) =
+                        c.store
+                            .record_event(svc, "ManualStart", &origin, now_ts, "native", "info")
+                    {
+                        tracing::warn!(err = %e, "ManualStart event write fail");
+                    }
+                    c.up_one(svc).await
+                }
+                _ => {
+                    // 醒目 banner: 全量启动波与 stop-all 对称, 逐行日志易漏看
+                    tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    tracing::warn!("!! START-ALL requested — entire fleet will be started");
+                    tracing::warn!("!! origin: {origin}");
+                    tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    if let Err(e) = c
+                        .store
+                        .record_event("*", "StartAll", &origin, now_ts, "native", "info")
+                    {
+                        tracing::warn!(err = %e, "StartAll event write fail");
+                    }
+                    c.up_all().await
+                }
             };
             match res {
                 Ok(()) => make_result(json!("ok"), req.id),
