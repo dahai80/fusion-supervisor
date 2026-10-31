@@ -50,25 +50,79 @@ fn exit_code_of(err_msg: &str) -> Option<i32> {
 // 1) 与操作员的 do_start 竞态双拉进程; 2) supervisor 的 exec 只带 daemon
 // env 快照 (env_n=0), 操作员行内 env 覆盖被静默丢弃 (2026-10-31 fusion-mlx
 // FUSION_MLX_HEAVY_ADMISSION_LINE=0.99 实证丢失)。
-// 检测: pgrep -f "<repo_dir>/start[.]sh" — 操作员脚本进程存活期间 cmdline
-// 含该路径。supervisor 自身 exec 在核心锁内同步执行, tick 不会并发看到
-// 自己的 start.sh 进程, 无自匹配。模式用 [.] 括号写法: 同 repo 的并发
-// pgrep 进程 cmdline 含字面 "start[.]sh", 正则 "start[.]sh" 只匹配
-// "start.sh" 不匹配 "start[.]sh", 杜绝 pgrep 互相自匹配 (测试并行跑出
-// 过 7 个假阳性)。pgrep 不可用 → false (pass-open, 行为回落到修复前)。
-fn start_sh_process_alive(repo_dir: &str) -> bool {
-    let pat = format!("{repo_dir}/start[.]sh");
+// 检测两阶段:
+//   阶段 1: pgrep -f "<repo_dir>/start[.]sh" — cmdline 含带 repo 前缀的路径
+//   (绝对路径调用 / `bash fusion-mlx/start.sh` 相对 monorepo 根调用)。
+//   阶段 2 (2026-10-31 生产补): 操作员 cd 进 repo 后 `./start.sh restart` —
+//   cmdline 只有 "./start.sh", 无 repo 前缀, 阶段 1 漏检 (fusion-mlx
+//   env_n=0 抢跑实证)。按 basename 捞候选进程, 逐个用 lsof 读 cwd, 与
+//   FUSION_ROOT/<repo_dir> 比对。
+// 自匹配防护: 模式用 [.] 括号写法, 同 repo 并发 pgrep cmdline 含字面
+// "start[.]sh", 正则只匹配 "start.sh" 不匹配 "start[.]sh", 杜绝 pgrep 互配
+// (测试并行跑出过 7 个假阳性); supervisor 自身 exec 在核心锁内同步执行,
+// tick 不会并发看到自己的 start.sh 进程。pgrep/lsof 不可用 → false
+// (pass-open, 行为回落到修复前)。
+fn pgrep_pids(pat: &str) -> Option<Vec<String>> {
     match std::process::Command::new("pgrep")
         .arg("-f")
-        .arg(&pat)
+        .arg(pat)
         .output()
     {
-        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Ok(o) if o.status.success() => Some(
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+        ),
+        Ok(_) => Some(Vec::new()),
         Err(e) => {
             tracing::warn!(err = %e, "pgrep 不可用, 视为无操作员脚本在跑 (pass-open)");
-            false
+            None
         }
     }
+}
+
+// lsof 读进程 cwd: `lsof -a -p <pid> -d cwd -Fn` 输出 p<pid> / n<path> 两行。
+// 返回 canonicalize 后路径 (/var 系 symlink 目录在 macOS 上解析为 /private/...)。
+fn proc_cwd(pid: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", pid, "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix('n') {
+            return std::fs::canonicalize(p).ok().or_else(|| Some(p.into()));
+        }
+    }
+    None
+}
+
+fn start_sh_process_alive(repo_dir: &str) -> bool {
+    // 阶段 1: cmdline 带路径前缀
+    let pat = format!("{repo_dir}/start[.]sh");
+    if pgrep_pids(&pat).is_some_and(|p| !p.is_empty()) {
+        return true;
+    }
+    // 阶段 2: cwd 相对调用 (./start.sh), 按 cwd 鉴别归属
+    let Some(pids) = pgrep_pids("start[.]sh") else {
+        return false;
+    };
+    let root = std::env::var("FUSION_ROOT").unwrap_or_else(|_| ".".to_string());
+    let want = std::path::Path::new(&root).join(repo_dir);
+    let want = std::fs::canonicalize(&want).unwrap_or(want);
+    for pid in pids {
+        if let Some(cwd) = proc_cwd(&pid)
+            && cwd == want
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // 状态机: Stopped→Starting→Healthy→(Unhealthy)→Restarting→Healthy|Failed
@@ -968,6 +1022,59 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(cleared, "脚本退出后应不再检出");
+    }
+
+    // issue #86 生产补: 操作员 cd 进 repo 目录用 ./start.sh (cmdline 无 repo
+    // 前缀) 也要检出 — 阶段 2 cwd 鉴别路径
+    #[test]
+    fn test_start_sh_alive_relative_cwd_invocation() {
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, val: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                // SAFETY: 仅本测试读写此 key; 恢复在 Drop, panic 不泄漏。
+                unsafe { std::env::set_var(key, val) };
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: 同上。
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(self.key, v) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+        let base = std::env::temp_dir().join("race-cwd-repo-base-xyz");
+        let repo = base.join("fake-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let _guard = EnvGuard::set("FUSION_ROOT", base.to_str().unwrap());
+        // 模拟操作员在 repo 目录用 ./start.sh — cmdline 无 repo 前缀,
+        // 复合命令防 bash exec 优化丢 argv
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 3; true")
+            .arg("./start.sh")
+            .current_dir(&repo)
+            .spawn()
+            .unwrap();
+        let mut seen = false;
+        for _ in 0..60 {
+            if start_sh_process_alive("fake-repo") {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        // 清理临时目录 (只留测试产物外的最终输出件)
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(seen, "cwd 相对调用 ./start.sh 应被阶段 2 检出");
     }
 
     // issue #86: 到点重启时操作员 start.sh 在跑 → 跳过本轮 (不 invoke_start,
