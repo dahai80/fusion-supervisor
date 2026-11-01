@@ -66,6 +66,12 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
         ProbeSpec::http(8795, "/health"),
     );
     m.insert("fusion-agent-studio", ProbeSpec::http(11442, "/health"));
+    // issue #88: fusion-security 公开健康口 (start.sh 头注: 鉴权豁免), 优于 TCP 兜底
+    // (/health 与 /api/v1/health 均挂鉴权恒 401, 不能用作探活路径)
+    m.insert(
+        "fusion-security",
+        ProbeSpec::http(11454, "/api/v1/system/health"),
+    );
     // issue #31: MCP server (sse) 无 /health 端点, TCP 端口探活
     m.insert("fusion-plugins-ecosystem", ProbeSpec::tcp(8765));
     // issue #33: fs-serve /health (deploy/start.sh, :11463)
@@ -161,6 +167,15 @@ mod tests {
         // issue #34: memory 改 HTTP 后, UDS 探活以 fusion-projects 为代表
         let s = probe_spec_for("fusion-projects", 11440);
         assert!(matches!(s.kind, ProbeKind::Uds));
+    }
+
+    #[test]
+    fn test_issue88_security_probe() {
+        // issue #88: fusion-security 鉴权豁免健康口, 不再退化 TCP 兜底
+        let s = probe_spec_for("fusion-security", 11454);
+        assert!(matches!(s.kind, ProbeKind::Http));
+        assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
+        assert_eq!(s.port, 11454);
     }
 
     #[test]
