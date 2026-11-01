@@ -309,6 +309,39 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
+        // issue #88: venv 重建后 fleet 审计发现的两条 — start.sh 前台 exec 且
+        // 忽略子命令 (bash start.sh stop 会 START), 同款 Daemon 接管。
+        // 端口钉 registry 值 (start.sh 默认同值, 防上游 config 漂移)
+        "ai-assistant-agent" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "uvicorn".into(),
+                "ai_assistant_agent.main:app".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11511".into(),
+            ],
+            cwd: Some("business/ai-assistant-agent".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
+        "ai-lead-qualifier" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "ai_lead_qualifier.cli".into(),
+                "serve".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11552".into(),
+            ],
+            cwd: Some("business/ai-lead-qualifier".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
         _ => None,
     }
 }
@@ -773,6 +806,47 @@ mod tests {
                 }
                 _ => panic!("{name} 应为 Daemon spec"),
             }
+        }
+
+        // issue #88: fleet 审计收编的两条 business 条目 (start.sh 前台 exec
+        // 且忽略子命令), 端口钉 registry 值
+        let spec = start_spec_for("ai-assistant-agent").unwrap();
+        match &spec {
+            StartSpec::Daemon { args, cwd, .. } => {
+                assert_eq!(
+                    args,
+                    &[
+                        "-m".to_string(),
+                        "uvicorn".to_string(),
+                        "ai_assistant_agent.main:app".to_string(),
+                        "--host".to_string(),
+                        "127.0.0.1".to_string(),
+                        "--port".to_string(),
+                        "11511".to_string(),
+                    ]
+                );
+                assert_eq!(cwd.as_deref(), Some("business/ai-assistant-agent"));
+            }
+            _ => panic!("ai-assistant-agent 应为 Daemon spec"),
+        }
+        let spec = start_spec_for("ai-lead-qualifier").unwrap();
+        match &spec {
+            StartSpec::Daemon { args, cwd, .. } => {
+                assert_eq!(
+                    args,
+                    &[
+                        "-m".to_string(),
+                        "ai_lead_qualifier.cli".to_string(),
+                        "serve".to_string(),
+                        "--host".to_string(),
+                        "127.0.0.1".to_string(),
+                        "--port".to_string(),
+                        "11552".to_string(),
+                    ]
+                );
+                assert_eq!(cwd.as_deref(), Some("business/ai-lead-qualifier"));
+            }
+            _ => panic!("ai-lead-qualifier 应为 Daemon spec"),
         }
 
         // osagent issue#6: serve-metrics Daemon spec (9100→11571 迁移后接管)

@@ -95,6 +95,13 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     // issue #55: 批量登记条目 — 有鉴权豁免 /health 的走 HTTP, 其余 (ads_vb /
     // operabase 未见公开健康口, 静态 http.server 恒 404) 退 TCP
     m.insert("ai-doc-automation", ProbeSpec::http(11550, "/health"));
+    // issue #88: fleet 审计收编的两条 business 条目 — assistant /health
+    // (api/system.py), lead-qualifier /api/v1/system/health (app.py)
+    m.insert("ai-assistant-agent", ProbeSpec::http(11511, "/health"));
+    m.insert(
+        "ai-lead-qualifier",
+        ProbeSpec::http(11552, "/api/v1/system/health"),
+    );
     m.insert("ai-information-search", ProbeSpec::http(11595, "/health"));
     m.insert("ai-charactervoice", ProbeSpec::http(11505, "/health"));
     m.insert(
@@ -176,6 +183,17 @@ mod tests {
         assert!(matches!(s.kind, ProbeKind::Http));
         assert_eq!(s.path.as_deref(), Some("/api/v1/system/health"));
         assert_eq!(s.port, 11454);
+    }
+
+    #[test]
+    fn test_issue88_business_audit_probes() {
+        // issue #88: fleet 审计收编的两条 business 条目健康口
+        let a = probe_spec_for("ai-assistant-agent", 11511);
+        assert!(matches!(a.kind, ProbeKind::Http));
+        assert_eq!(a.path.as_deref(), Some("/health"));
+        let l = probe_spec_for("ai-lead-qualifier", 11552);
+        assert!(matches!(l.kind, ProbeKind::Http));
+        assert_eq!(l.path.as_deref(), Some("/api/v1/system/health"));
     }
 
     #[test]

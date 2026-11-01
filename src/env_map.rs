@@ -41,6 +41,8 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
 // - fusion-mlx: 推理服务端, 鉴权单一真源是 settings.json (strip_env_for
 //   同理), 客户端 key 不该进服务端 env。
 // - 纯静态托管 (http.server web/dist, 不打 gateway)。
+// - fusion-health (issue #88): 直连 mlx :11434 的非 gateway 消费方,
+//   v1.2.3 起 env 优先的 _mlx_key() 见 FUSION_CLIENT_KEY 即采用 → 401。
 fn shell_vars(svc: &str) -> Vec<&'static str> {
     let mut vars: Vec<&'static str> = Vec::new();
     if !matches!(
@@ -50,6 +52,7 @@ fn shell_vars(svc: &str) -> Vec<&'static str> {
             | "customer-insight"
             | "customer-insight-api"
             | "ai-apparelmockup-web"
+            | "fusion-health"
     ) {
         vars.push("FUSION_CLIENT_KEY");
     }
@@ -86,7 +89,11 @@ pub fn strip_env_for(svc: &str) -> &'static [&'static str] {
         // issue #45: fusion-health 的 config.py env 优先级高于 ~/.fusion-mlx/
         // settings.json — daemon 快照里的旧 key 让 backend 探活 401 (503 degraded)。
         // 剥离后其配置回退解析 settings.json, 与 mlx 实例的 key 单一真源一致。
-        "fusion-health" => &["FUSION_MLX_API_KEY"],
+        // issue #88: 加剥 FUSION_CLIENT_KEY — v1.2.3 (upstream #28) 起 _mlx_key()
+        // 见到该 env 就优先采用, 但 fusion-health 直连 :11434 (非 gateway 消费方),
+        // client key 对 mlx 无效 → backend 401 → /api/v1/health 恒 503 degraded。
+        // 同时加入 shell_vars 排除表不注入, 双保险 (strip 兜底手动启动带 .env 的继承)。
+        "fusion-health" => &["FUSION_MLX_API_KEY", "FUSION_CLIENT_KEY"],
         _ => &[],
     }
 }
@@ -679,13 +686,27 @@ pub(crate) mod tests {
 
     // issue #39/#40: fusion-mlx 子进程剥离 FUSION_MLX_API_KEY (防旧 key 钉死),
     // 其它服务不剥离。issue #45: fusion-health 同剥离 (config.py env 优先于
-    // settings.json, 旧 key 让 backend 探活 401)。
+    // settings.json, 旧 key 让 backend 探活 401)。issue #88: fusion-health 再加剥
+    // FUSION_CLIENT_KEY (v1.2.3 _mlx_key() env 优先, 直连 mlx 用 client key 恒 401)。
     #[test]
     fn test_strip_env_for_mlx_only() {
         assert_eq!(strip_env_for("fusion-mlx"), &["FUSION_MLX_API_KEY"]);
-        assert_eq!(strip_env_for("fusion-health"), &["FUSION_MLX_API_KEY"]);
+        assert_eq!(
+            strip_env_for("fusion-health"),
+            &["FUSION_MLX_API_KEY", "FUSION_CLIENT_KEY"]
+        );
         assert!(strip_env_for("fusion-gateway").is_empty());
         assert!(strip_env_for("fusion-rag").is_empty());
+    }
+
+    // issue #88: fusion-health 非 gateway 消费方 — 不注入 FUSION_CLIENT_KEY
+    // (shell_vars 排除), 但仍是 shell 生态一员 (needs_shell_env 走 match 分支)。
+    // trainer-bridge 等其它服务不受影响。
+    #[test]
+    fn test_issue88_health_excluded_from_client_key() {
+        assert!(!shell_vars("fusion-health").contains(&"FUSION_CLIENT_KEY"));
+        assert!(shell_vars("fusion-rag").contains(&"FUSION_CLIENT_KEY"));
+        assert!(shell_vars("ai-trysuite").contains(&"FUSION_CLIENT_KEY"));
     }
 
     // ---- issue #45: business 平台 FUSION_CLIENT_KEY 注入 ----

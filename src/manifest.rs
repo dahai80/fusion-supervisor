@@ -119,6 +119,11 @@ pub fn name_to_dir(name: &str) -> &str {
         // issue #83: AI 试衣后端 (11515), repo 在 business/ai-trysuite;
         // 根 start.sh 是 wrapper, exec 委托 server/start.sh
         ("ai-trysuite", "business/ai-trysuite"),
+        // issue #88: venv 重建后 fleet 审计发现的两条 business 条目 —
+        // 默认映射 ~/fusion/<key> 不存在, start fail-closed (脚本不存在),
+        // registry key 无 fusion- 前缀, repo 落在 business/ 子目录
+        ("ai-assistant-agent", "business/ai-assistant-agent"),
+        ("ai-lead-qualifier", "business/ai-lead-qualifier"),
     ];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
@@ -373,6 +378,20 @@ external_tools: []
     #[test]
     fn test_name_to_dir_model_hub_plural_dir() {
         assert_eq!(name_to_dir("fusion-model-hub"), "fusion-models-hub");
+    }
+
+    // issue #88: fleet 审计发现的两条 business 条目 — 默认映射指向不存在的
+    // 根目录 <key>/, repo 实际在 business/ 子目录下
+    #[test]
+    fn test_name_to_dir_issue88_business_entries() {
+        assert_eq!(
+            name_to_dir("ai-assistant-agent"),
+            "business/ai-assistant-agent"
+        );
+        assert_eq!(
+            name_to_dir("ai-lead-qualifier"),
+            "business/ai-lead-qualifier"
+        );
     }
 
     // osagent issue#6: fusion-osagent-metrics 子服务 key 落真实 repo 目录
