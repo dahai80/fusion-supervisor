@@ -38,6 +38,19 @@ fn escalated_delay(n: u32) -> u64 {
     }
 }
 
+// issue #90: 启动失败重试曲线 5s → 15s → 60s → 300s (封顶)。与 escalated_delay
+// (熔断用) 分开: 开机依赖竞态 (PG stale pid / launchd 晚起) 多在 1 分钟内自愈,
+// 前两次快速补拉把 core 空窗压到秒级; 之后升级防长期故障空烧 start.sh。
+// 生产实证 2026-11-02: gateway 依赖竞态 13.5min, 旧 escalated 曲线每次空窗 5min。
+fn start_retry_delay(n: u32) -> u64 {
+    match n {
+        0 | 1 => 5,
+        2 => 15,
+        3 => 60,
+        _ => 300,
+    }
+}
+
 // issue #47: 从 exec_* 失败信息提取退出码 (约定格式 "exit code=<n>",
 // 见 supervisor/mod.rs 的 bail! 格式 — 改一处必须同步另一处)。
 fn exit_code_of(err_msg: &str) -> Option<i32> {
@@ -368,7 +381,7 @@ impl ServiceRunner {
                             // 不走普通 crash 的 1→2→4 快速序列 (空烧进程启动)。
                             escalated_delay(self.config_fail_streak)
                         } else if self.start_retry {
-                            escalated_delay(self.start_fail_streak.max(1))
+                            start_retry_delay(self.start_fail_streak.max(1))
                         } else if self.fast_fail_streak >= FAST_FAIL_STREAK {
                             escalated_delay(self.fast_fail_streak)
                         } else {
@@ -556,7 +569,7 @@ impl ServiceRunner {
         // 直接置满失败 streak, 下一 tick 即进入排程分支
         self.fail_streak = RESTART_FAIL_STREAK;
         self.start_retry = true;
-        let delay = escalated_delay(self.start_fail_streak.max(1));
+        let delay = start_retry_delay(self.start_fail_streak.max(1));
         self.restart_after = Some(now_ts + delay);
         tracing::warn!(
             svc = %self.def.name,
@@ -631,6 +644,17 @@ mod tests {
     use crate::manifest::Layer;
     use crate::probe::{ProbeResult, UnhealthyReason};
     use std::sync::{Arc, Mutex};
+
+    // issue #90: 启动重试曲线 — 前两次快速补拉 (5/15s), 之后 60/300 升级
+    #[test]
+    fn test_start_retry_delay_curve() {
+        assert_eq!(start_retry_delay(0), 5);
+        assert_eq!(start_retry_delay(1), 5);
+        assert_eq!(start_retry_delay(2), 15);
+        assert_eq!(start_retry_delay(3), 60);
+        assert_eq!(start_retry_delay(4), 300);
+        assert_eq!(start_retry_delay(9), 300);
+    }
 
     fn def() -> ServiceDef {
         ServiceDef {
