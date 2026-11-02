@@ -82,6 +82,9 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("fusion-smallbusiness", ProbeSpec::http(11490, "/health"));
     // issue #33: 仿真 gRPC 服务无 HTTP 面, TCP 端口探活 (:11447)
     m.insert("fusion-simulation", ProbeSpec::tcp(11447));
+    // issue #89: fusion-design (fd-server) 健康口 /api/health (router.rs, 200=活;
+    // deep=1 是重探测, 探活不用)
+    m.insert("fusion-design", ProbeSpec::http(11493, "/api/health"));
     // issue #45: business 平台探活 — ai-fit 公开健康口 (server/main.py 同款鉴权豁免),
     // speech-exam /health 无鉴权; ai-family 全 router 挂 verify_service_key (恒 401)
     // 与 apparelmockup (静态 http.server 无 /health, 恒 404=BadPath 不重启) 退 TCP
@@ -142,6 +145,8 @@ pub fn restart_cmd_for(name: &str) -> &'static str {
     if name == "fusion-store"
         || name == "ai-family"
         || name == "ai-trysuite"
+        // issue #89: fusion-design start.sh 只有 start|stop|status|log, 无 restart
+        || name == "fusion-design"
         || crate::start_map::start_spec_for(name).is_some()
     {
         "stop+start"
@@ -194,6 +199,17 @@ mod tests {
         let l = probe_spec_for("ai-lead-qualifier", 11552);
         assert!(matches!(l.kind, ProbeKind::Http));
         assert_eq!(l.path.as_deref(), Some("/api/v1/system/health"));
+    }
+
+    // issue #89: fusion-design (fd-server) HTTP /api/health 探活 + start.sh 无
+    // restart 子命令 → stop+start
+    #[test]
+    fn test_issue89_design_probe() {
+        let s = probe_spec_for("fusion-design", 11493);
+        assert!(matches!(s.kind, ProbeKind::Http));
+        assert_eq!(s.path.as_deref(), Some("/api/health"));
+        assert_eq!(s.port, 11493);
+        assert_eq!(restart_cmd_for("fusion-design"), "stop+start");
     }
 
     #[test]
