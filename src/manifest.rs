@@ -305,6 +305,40 @@ external_tools: []
         assert!(!web_shell.managed, "supervise: false 应豁免");
     }
 
+    // issue #91: boot tier 解析 — 显式 T1 生效, 缺省 T2 (菜单常驻服务需开机自启)
+    #[test]
+    fn test_boot_tier_parse_default_and_explicit() {
+        const REG: &str = r#"
+services:
+  fusion-mlx:
+    port: 11434
+    purpose: 推理
+    fixed: true
+    boot: T0
+  fusion-trainer-bridge:
+    port: 8790
+    purpose: Trainer bridge
+    boot: T1
+  fusion-health:
+    port: 11471
+    purpose: 健康助手
+reserved: []
+external_tools: []
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), REG).unwrap();
+        let defs = ServiceManifest::load(tmp.path()).unwrap();
+        let mlx = defs.iter().find(|d| d.name == "fusion-mlx").unwrap();
+        assert_eq!(mlx.boot_tier, BootTier::T0);
+        let bridge = defs
+            .iter()
+            .find(|d| d.name == "fusion-trainer-bridge")
+            .unwrap();
+        assert_eq!(bridge.boot_tier, BootTier::T1, "显式 boot: T1 应生效");
+        let health = defs.iter().find(|d| d.name == "fusion-health").unwrap();
+        assert_eq!(health.boot_tier, BootTier::T2, "缺省应 T2");
+    }
+
     #[test]
     fn test_name_to_dir_exception() {
         assert_eq!(
