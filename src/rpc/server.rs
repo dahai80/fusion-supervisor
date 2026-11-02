@@ -193,6 +193,9 @@ async fn dispatch(
                 None => return make_error(-32602, &format!("unknown service: {svc}"), req.id),
             };
             runner.policy.reset();
+            // issue #90: 人工 restart 复位启动失败重试计数 (重试封顶后人工介入)
+            runner.start_fail_streak = 0;
+            runner.start_retry = false;
             runner.state = crate::supervisor::runner::State::Stopped;
             match runner.invoke_start() {
                 Ok(()) => {

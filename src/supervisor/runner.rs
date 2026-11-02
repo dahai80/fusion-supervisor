@@ -17,11 +17,16 @@ const FAST_FAIL_WINDOW_SEC: u64 = 10;
 const FAST_FAIL_STREAK: u32 = 3;
 // issue #47: config-fatal 封顶次数 (达限标 Failed, 人工 fusion-sv restart 复位)
 const CONFIG_FAIL_CAP: u32 = 5;
+// issue #90: 启动失败重试封顶 — 从未成功 start 的服务按 escalated 退避
+// (10→60→300s) 重试, 连续 N 次仍起不来标 Failed (人工修依赖/配置)。
+// N=10 覆盖 ~41 分钟 (开机 launchd 并发竞态的典型窗口), 且不占
+// crash-window 名额 (未启动的服务不是 crash-loop)。
+pub(crate) const START_FAIL_CAP: u32 = 10;
 // issue #79: 连续失败重启阈值 — 探活连续 N 次失败才进重启流。
 // 繁忙服务 (fusion-mlx GIL 高负载) /healthz 单次超时抖动不得升级重启;
 // 中间任一次成功探活即复位计数, 抖动永不升级。真宕机 3 连败
 // (poll_unhealthy_sec=2 ≈ 6s) 后照常重启, 仍然及时。
-const RESTART_FAIL_STREAK: u32 = 3;
+pub(crate) const RESTART_FAIL_STREAK: u32 = 3;
 
 // issue #47: 熔断退避序列 10s → 60s → 300s (封顶)。区别于普通 crash 的 1→2→4→…:
 // config-fatal / 快速失败时快速重试只会空烧进程启动, 拉长间隔等人工修复。
@@ -153,7 +158,7 @@ pub struct ServiceRunner {
     // 后续 tick 到点再真正 invoke_start (poll_unhealthy_sec=2s, 误差 ≤2s)。
     pub restart_after: Option<u64>,
     // issue #47: 上次 invoke_start 成功时刻 (unix sec)。None=从未成功 start。
-    last_start_ts: Option<u64>,
+    pub(crate) last_start_ts: Option<u64>,
     // issue #47: 连续快速失败计数 — start 成功后 FAST_FAIL_WINDOW_SEC 内又探活不可达。
     fast_fail_streak: u32,
     // issue #47: 快速失败熔断告警 latch (达阈值告警一次, 恢复 Healthy 复位, 不刷屏)
@@ -163,6 +168,13 @@ pub struct ServiceRunner {
     // issue #79: 探活连续失败计数 — 达 RESTART_FAIL_STREAK 才进重启流。
     // 任一次成功探活即复位 (抖动不升级)。pub 供集成测试预置。
     pub fail_streak: u32,
+    // issue #90: 启动失败连续计数 — 启动失败重试流按 escalated 退避,
+    // 达 START_FAIL_CAP 标 Failed。start 成功 / Healthy / down 复位。
+    pub(crate) start_fail_streak: u32,
+    // issue #90: 是否处于 "up 路径启动失败重试" 流。只有 mark_start_failed
+    // 置位; 不能用 last_start_ts 判断 — 手工拉起的服务该值也是 None,
+    // 其崩溃应走正常 crash 恢复而非启动重试封顶。
+    pub(crate) start_retry: bool,
     // issue #86: 操作员 start.sh 竞态告警 latch — 首次跳过自动重启时 WARN
     // 一次 (含行内 env 丢失提示), 持续跳过期间静默; 恢复 Healthy 复位。
     operator_race_notified: bool,
@@ -191,6 +203,8 @@ impl ServiceRunner {
             fast_fail_alerted: false,
             config_fail_streak: 0,
             fail_streak: 0,
+            start_fail_streak: 0,
+            start_retry: false,
             probe_fn: Box::new(probe_fn),
             start_fn: Box::new(start_fn),
         }
@@ -250,6 +264,9 @@ impl ServiceRunner {
                     self.fast_fail_streak = 0;
                     self.fast_fail_alerted = false;
                     self.config_fail_streak = 0;
+                    // issue #90: 启动失败重试计数随恢复复位
+                    self.start_fail_streak = 0;
+                    self.start_retry = false;
                     // issue #86: 恢复复位操作员竞态告警 latch
                     self.operator_race_notified = false;
                 }
@@ -343,10 +360,15 @@ impl ServiceRunner {
                 // crash 记账语义与旧版一致: 每次实际重启尝试记 1 次。
                 match self.restart_after {
                     None => {
-                        // issue #47: 熔断生效时退避走 10→60→300 序列,
-                        // 不走普通 crash 的 1→2→4 快速序列 (空烧进程启动)。
+                        // issue #90: 启动失败重试流走 escalated 退避 (10→60→300),
+                        // policy 的 1→2→4 序列会在 ~31s 烧完 5 次 crash 名额
+                        // (依赖未就绪时纯浪费)。
                         let delay = if self.config_fail_streak > 0 {
+                            // issue #47: 熔断生效时退避走 10→60→300 序列,
+                            // 不走普通 crash 的 1→2→4 快速序列 (空烧进程启动)。
                             escalated_delay(self.config_fail_streak)
+                        } else if self.start_retry {
+                            escalated_delay(self.start_fail_streak.max(1))
                         } else if self.fast_fail_streak >= FAST_FAIL_STREAK {
                             escalated_delay(self.fast_fail_streak)
                         } else {
@@ -379,19 +401,51 @@ impl ServiceRunner {
                             return;
                         }
                         self.restart_after = None;
-                        let capped = self.policy.record_crash(now_ts);
-                        if capped {
-                            tracing::error!(svc = %self.def.name, "crash-window 封顶, 标 Failed 停重启");
-                            self.state = State::Failed;
-                            let _ = alerter
-                                .alert(Alert {
-                                    service: self.def.name.clone(),
-                                    kind: AlertKind::RestartCapHit,
-                                    detail: format!("cap {} hit", self.policy.crash_count()),
-                                    ts: now_ts,
-                                })
-                                .await;
-                            return;
+                        // issue #47: exit-78 配置致命重试中 — 不占 crash-window 与
+                        // start-fail 名额, 由下方 invoke_start 失败分支续记
+                        // config_fail_streak
+                        if self.config_fail_streak > 0 {
+                            // no-op: 名额记账交给下方失败分支
+                        } else if self.start_retry {
+                            // issue #90: 启动失败重试流不占 crash-window 名额
+                            // (它不是 crash-loop, 是在等依赖), 走 start_fail_streak
+                            // 独立封顶 — 开机依赖竞态的典型恢复窗口可达数十分钟。
+                            self.start_fail_streak += 1;
+                            if self.start_fail_streak >= START_FAIL_CAP {
+                                tracing::error!(
+                                    svc = %self.def.name,
+                                    streak = self.start_fail_streak,
+                                    "启动失败重试封顶, 标 Failed 停重启 (查依赖/配置)"
+                                );
+                                self.state = State::Failed;
+                                let _ = alerter
+                                    .alert(Alert {
+                                        service: self.def.name.clone(),
+                                        kind: AlertKind::RestartCapHit,
+                                        detail: format!(
+                                            "start-fail cap {} hit",
+                                            self.start_fail_streak
+                                        ),
+                                        ts: now_ts,
+                                    })
+                                    .await;
+                                return;
+                            }
+                        } else {
+                            let capped = self.policy.record_crash(now_ts);
+                            if capped {
+                                tracing::error!(svc = %self.def.name, "crash-window 封顶, 标 Failed 停重启");
+                                self.state = State::Failed;
+                                let _ = alerter
+                                    .alert(Alert {
+                                        service: self.def.name.clone(),
+                                        kind: AlertKind::RestartCapHit,
+                                        detail: format!("cap {} hit", self.policy.crash_count()),
+                                        ts: now_ts,
+                                    })
+                                    .await;
+                                return;
+                            }
                         }
                         // issue #47: 快速失败断路 — 上次 start 成功后窗口内又探活不可达。
                         // 连续达阈值 → 熔断告警 (latch, 恢复复位), 后续退避升级 10→60→300。
@@ -463,6 +517,10 @@ impl ServiceRunner {
                             }
                             Ok(()) => {
                                 self.last_start_ts = Some(now_ts);
+                                // issue #90: 启动脚本成功即退出启动重试流 —
+                                // 后续失败回归 crash / 快速失败语义, 复位计数
+                                self.start_fail_streak = 0;
+                                self.start_retry = false;
                                 self.state = State::Restarting;
                             }
                         }
@@ -481,6 +539,41 @@ impl ServiceRunner {
                 );
             }
         }
+    }
+
+    // issue #90: up 路径启动失败登记。非 exit-78 的启动失败多为环境未就绪
+    // (开机时依赖尚未监听等), 进退避重试流 (state=Unhealthy + restart_after)
+    // 而非终态 Failed — 后续由 tick 的 crash 恢复路径按 escalated 退避重试。
+    // exit-78 = 配置致命, 重试无救, 维持 Failed (issue #47 语义)。
+    // 返回 true 表示已排期重试。
+    pub(crate) fn mark_start_failed(&mut self, err_msg: &str, now_ts: u64) -> bool {
+        if exit_code_of(err_msg) == Some(EXIT_CONFIG) {
+            tracing::error!(svc = %self.def.name, "启动 exit 78 配置致命, 标 Failed (重试无救)");
+            self.state = State::Failed;
+            return false;
+        }
+        self.state = State::Unhealthy;
+        // 直接置满失败 streak, 下一 tick 即进入排程分支
+        self.fail_streak = RESTART_FAIL_STREAK;
+        self.start_retry = true;
+        let delay = escalated_delay(self.start_fail_streak.max(1));
+        self.restart_after = Some(now_ts + delay);
+        tracing::warn!(
+            svc = %self.def.name,
+            delay,
+            err = %err_msg,
+            "启动失败, 排期重试 (依赖未就绪常见; 达 cap 标 Failed)"
+        );
+        true
+    }
+
+    // issue #90: 手动停止清掉待执行的重试排期与启动失败计数,
+    // 否则 down 后残留 restart_after 会在下次 up 前的空窗里触发陈旧重启。
+    pub(crate) fn mark_stopped(&mut self) {
+        self.state = State::Stopped;
+        self.restart_after = None;
+        self.start_fail_streak = 0;
+        self.start_retry = false;
     }
 
     pub(crate) fn invoke_start(&self) -> Result<()> {

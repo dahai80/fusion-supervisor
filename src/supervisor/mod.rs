@@ -37,6 +37,15 @@ pub struct BootEntry {
     pub port: u16,
 }
 
+// issue #90: 当前 unix 秒 — up 路径没有 tick 的注入时钟, 重试排期只需
+// 真实时刻 (测试对状态机断言走 tick 的 now_ts 注入, 不受影响)。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct SupervisorCore {
     pub runners: Vec<runner::ServiceRunner>,
     // issue #37: Arc 化 — Alerter 的事件落库 sink 需要持有 store 的克隆
@@ -253,7 +262,8 @@ impl SupervisorCore {
                 // 不靠 layer 隐式顺序; 显式校验, gate 未就绪跳过启动 (不标 Failed, 依赖问题非服务崩溃)。
                 if !self.dep_gate_ok(&d.name).await {
                     if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == d.name) {
-                        r.state = runner::State::Stopped;
+                        // issue #90: 清残留重试排期 (避免旧 restart_after 触发陈旧重启)
+                        r.mark_stopped();
                     }
                     continue;
                 }
@@ -263,14 +273,16 @@ impl SupervisorCore {
                 let timeout = self.cfg.start_timeout_sec;
                 let env_file = self.cfg.compose.env_file.clone();
                 let compose_on = self.compose_enabled();
-                // 返回 (服务名, 是否跳过=已健康, 启动结果), join 后据其写 runner.state
+                // 返回 (服务名, 是否跳过=已健康, 启动结果, 是否可重试)
+                // 可重试 = 真执行失败/超时 (依赖可能后到); env fail-closed 属配置
+                // 问题, 重试无救, 仍标终态 Failed (issue #90)
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // 先探活: 已健康跳过 (R11: 用注入 probe_fn, 非真 probe)
                     let spec = ProbeSpec::tcp(d.port);
                     if matches!((probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                         tracing::info!(svc = %d.name, "skip start (already up)");
-                        return (d.name, true, Ok(()));
+                        return (d.name, true, Ok(()), false);
                     }
                     // env 注入两类, 均解析失败 fail-closed 拒绝启动 (均不 gate 在
                     // compose 开关上):
@@ -283,7 +295,7 @@ impl SupervisorCore {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
                                 tracing::error!(svc = %d.name, err = %e, "shell env 解析失败, fail-closed 拒绝启动");
-                                return (d.name, false, Err(e));
+                                return (d.name, false, Err(e), false);
                             }
                         }
                     }
@@ -292,28 +304,28 @@ impl SupervisorCore {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
                                 tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
-                                return (d.name, false, Err(e));
+                                return (d.name, false, Err(e), false);
                             }
                         }
                     }
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start");
                     let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
                     match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
-                        Ok(Ok(())) => (d.name, false, Ok(())),
+                        Ok(Ok(())) => (d.name, false, Ok(()), false),
                         Ok(Err(e)) => {
                             tracing::warn!(svc = %d.name, err = %e, "start fail");
-                            (d.name, false, Err(e))
+                            (d.name, false, Err(e), true)
                         }
                         Err(_) => {
                             let e = anyhow::anyhow!("start timeout {timeout}s");
                             tracing::warn!(svc = %d.name, "start timeout {timeout}s");
-                            (d.name, false, Err(e))
+                            (d.name, false, Err(e), true)
                         }
                     }
                 }));
             }
             for h in handles {
-                if let Ok((name, skipped_healthy, start_res)) = h.await
+                if let Ok((name, skipped_healthy, start_res, retryable)) = h.await
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
                     if skipped_healthy {
@@ -321,14 +333,26 @@ impl SupervisorCore {
                     } else if start_res.is_ok() {
                         r.state = runner::State::Starting;
                     } else {
-                        // fail-closed (env 注入失败) 或 start.sh 失败 → 标 Failed。
-                        // 下一 tick 的 handle_unhealthy/探活会补告警; 此处仅记 ERROR。
                         let detail = start_res
                             .err()
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "start failed".into());
-                        tracing::error!(svc = %name, %detail, "up_native: 服务未启动 (fail-closed 或 start 失败)");
-                        r.state = runner::State::Failed;
+                        if retryable {
+                            // issue #90: 启动失败进 tick 退避重试流 (依赖未就绪常见),
+                            // 不再直接标终态 Failed — 此前开机 PG 未起时 gateway/
+                            // identity 死等人工。exit-78 配置致命仍在 mark_start_failed
+                            // 内部标 Failed (重试无救)。
+                            tracing::error!(svc = %name, %detail, "up_native: 启动失败, 排期重试");
+                            let now_ts = now_unix();
+                            let retry = r.mark_start_failed(&detail, now_ts);
+                            if retry {
+                                tracing::info!(svc = %name, "已排期启动失败重试");
+                            }
+                        } else {
+                            // env fail-closed = 配置问题, 重试不会自愈, 保持终态 Failed
+                            tracing::error!(svc = %name, %detail, "up_native: env 解析失败, 标 Failed (配置问题)");
+                            r.state = runner::State::Failed;
+                        }
                     }
                 }
             }
@@ -393,7 +417,8 @@ impl SupervisorCore {
                 if let Ok(name) = h.await
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
-                    r.state = runner::State::Stopped;
+                    // issue #90: 手动停止清掉待执行的重试排期
+                    r.mark_stopped();
                 }
             }
         }
@@ -413,7 +438,7 @@ impl SupervisorCore {
         if !self.dep_gate_ok(&d.name).await {
             // 与 up_native 一致: 依赖问题非崩溃, 标 Stopped 跳过
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
-                r.state = runner::State::Stopped;
+                r.mark_stopped();
             }
             anyhow::bail!("dep gate 未就绪, 跳过启动: {}", d.name);
         }
@@ -462,13 +487,14 @@ impl SupervisorCore {
             }
             Ok(Err(e)) => {
                 tracing::warn!(svc = %d.name, err = %e, "start fail");
-                r.state = runner::State::Failed;
+                // issue #90: 同 up_native — 排期退避重试而非终态 Failed
+                r.mark_start_failed(&e.to_string(), now_unix());
                 Err(e)
             }
             Err(_) => {
                 let e = anyhow::anyhow!("start timeout {timeout}s");
                 tracing::warn!(svc = %d.name, "start timeout {timeout}s");
-                r.state = runner::State::Failed;
+                r.mark_start_failed(&e.to_string(), now_unix());
                 Err(e)
             }
         }
@@ -486,7 +512,8 @@ impl SupervisorCore {
             tracing::warn!(svc = %d.name, err = %e, "stop fail");
         }
         if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
-            r.state = runner::State::Stopped;
+            // issue #90: 手动 down 清掉待执行的启动重试排期
+            r.mark_stopped();
         }
         Ok(())
     }
@@ -547,6 +574,8 @@ impl SupervisorCore {
         let mut stopped = 0u32;
         let mut failed = 0u32;
         let mut skipped = 0u32;
+        // issue #90: 启动失败已排期重试 (不再直接 Failed)
+        let mut retrying = 0u32;
         for r in self.runners.iter() {
             if !keep(&r.def) {
                 continue;
@@ -557,6 +586,7 @@ impl SupervisorCore {
                 S::Healthy | S::Draining => already_up += 1,
                 S::Stopped if action == "down" => stopped += 1,
                 S::Stopped if action == "up" => skipped += 1, // dep-gate 跳过等
+                S::Unhealthy => retrying += 1,
                 S::Failed => failed += 1,
                 _ => skipped += 1,
             }
@@ -569,6 +599,7 @@ impl SupervisorCore {
             stopped,
             failed,
             skipped,
+            retrying,
             "boot group done"
         );
         Ok(serde_json::json!({
@@ -579,6 +610,7 @@ impl SupervisorCore {
             "stopped": stopped,
             "failed": failed,
             "skipped": skipped,
+            "retrying": retrying,
         }))
     }
 
@@ -2391,6 +2423,105 @@ mod tests {
         );
     }
 
+    // ---- issue #90: 启动失败退避重试 ----
+
+    // start 失败 (非 exit-78) 应排期重试而非标终态 Failed, 且不占 crash-window 名额
+    #[tokio::test]
+    async fn test_issue90_start_fail_schedules_retry() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Err(anyhow::anyhow!("script not found")),
+        );
+        core.up_all().await.unwrap();
+        let r = &core.runners[0];
+        assert!(
+            matches!(r.state, runner::State::Unhealthy),
+            "启动失败应 Unhealthy 等重试, 非终态 Failed"
+        );
+        assert!(r.restart_after.is_some(), "应排期重试");
+        assert!(r.last_start_ts.is_none(), "从未成功启动");
+        assert_eq!(r.policy.crash_count(), 0, "不占 crash-window 名额");
+    }
+
+    // exit-78 配置致命: 重试无救, 直接 Failed
+    #[tokio::test]
+    async fn test_issue90_start_fail_exit78_terminal() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Err(anyhow::anyhow!("exit code=78: config fatal")),
+        );
+        core.up_all().await.unwrap();
+        let r = &core.runners[0];
+        assert!(
+            matches!(r.state, runner::State::Failed),
+            "exit 78 应终态 Failed"
+        );
+        assert!(r.restart_after.is_none(), "配置致命不排期重试");
+    }
+
+    // 重试封顶: start_fail_streak 达 START_FAIL_CAP → Failed + RestartCapHit 告警
+    #[tokio::test]
+    async fn test_issue90_start_fail_cap_marks_failed() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Err(anyhow::anyhow!("still down")),
+        );
+        {
+            let r = &mut core.runners[0];
+            r.state = runner::State::Unhealthy;
+            r.fail_streak = runner::RESTART_FAIL_STREAK;
+            r.start_retry = true;
+            r.start_fail_streak = runner::START_FAIL_CAP - 1;
+            r.restart_after = Some(1000);
+        }
+        core.tick_all(1001).await;
+        let r = &core.runners[0];
+        assert!(matches!(r.state, runner::State::Failed), "达 cap 应 Failed");
+        assert_eq!(r.start_fail_streak, runner::START_FAIL_CAP);
+        let ev = core.store.recent_events("fusion-mlx", 10).unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.kind == "RestartCapHit" && e.detail.contains("start-fail cap")),
+            "应记 start-fail cap 事件"
+        );
+    }
+
+    // 手动 down 应清掉待执行重试排期与计数
+    #[tokio::test]
+    async fn test_issue90_down_clears_retry_schedule() {
+        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_, _, _| Err(anyhow::anyhow!("script not found")),
+        );
+        core.up_all().await.unwrap();
+        assert!(core.runners[0].restart_after.is_some());
+        core.down_one("fusion-mlx").await.unwrap();
+        let r = &core.runners[0];
+        assert!(matches!(r.state, runner::State::Stopped));
+        assert!(r.restart_after.is_none(), "down 应清排期");
+        assert_eq!(r.start_fail_streak, 0, "down 应清计数");
+    }
+
     // ---- issue #9: drain / drain_all / rollout ----
 
     // drain 单服务: Healthy → Draining
@@ -2574,10 +2705,8 @@ mod tests {
         );
         let res = core.boot_group("T1", "up").await.unwrap();
         assert_eq!(res["started"], 1, "rag 起了");
-        assert_eq!(
-            res["failed"], 1,
-            "cowork start 失败 (fake start_fn 返回 Err, up_one 排进 Failed)"
-        );
+        assert_eq!(res["failed"], 0, "issue #90: 启动失败不再直接 Failed");
+        assert_eq!(res["retrying"], 1, "cowork start 失败应排期重试");
         assert_eq!(res["group"], "T1");
         assert_eq!(res["action"], "up");
     }
