@@ -1,12 +1,8 @@
-// C2: Method::Restart RPC — reset policy + set Stopped + invoke_start → Starting,
-// returns "ok". Unknown service → -32602. Empty/missing service → -32602.
-// Top/Shutdown: Top 是客户端命令 (-32601 带说明), Shutdown 已实现 (issue #20)。
-//
-// 偏差说明: brief 期望断言 "start_fn was called", 但 new_with_fns 把 runner 的
-// start_fn 硬编码为 no-op (|_: &str| Ok(())), 注入的 start_fn 只供 up/down 用,
-// invoke_start 走的是 runner.start_fn (no-op)。故改用更强的行为断言: restart
-// 成功后 runner.state==Starting (仅在 invoke_start Ok 分支发生) + policy 重置,
-// 同样证明 Restart arm 完整执行。意图保留。
+// C2: Method::Restart RPC — issue #96 起为真实 stop(验证端口释放)+start 流程
+// (restart_one): 成功返回 {"ok":true,"old_pid":..,"new_pid":..}, state →
+// Starting, policy 复位。Unknown service → -32602. Empty/missing → -32602。
+// 探活注入序列 Healthy→Unhealthy: 停前探活不必 (restart 不探活跳过), stop
+// 验证需要一次非 Healthy 才放行。
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::probe::ProbeResult;
 use fusion_supervisor::rpc::client::RpcClient;
@@ -48,10 +44,29 @@ async fn restart_call(client: &mut RpcClient, params: Value, id: i64) -> RpcResp
 
 #[tokio::test]
 async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
+    // issue #96: 探活序列 Healthy(停前)→Unhealthy(stop 验证通过) — 恒 Healthy
+    // 会因旧进程未死而 bail (见 stop_and_verify)
+    let q: Arc<std::sync::Mutex<std::collections::VecDeque<ProbeResult>>> =
+        Arc::new(std::sync::Mutex::new(
+            [
+                ProbeResult::Healthy { latency_ms: 1 },
+                ProbeResult::Unhealthy {
+                    reason: fusion_supervisor::probe::UnhealthyReason::ConnectionRefused,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        ));
+    let qc = q.clone();
     let core = SupervisorCore::new_with_fns(
         vec![def("fusion-rag", 11436)],
         cfg(),
-        |_| ProbeResult::Healthy { latency_ms: 1 },
+        move |_: &fusion_supervisor::probe::ProbeSpec| {
+            qc.lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ProbeResult::Healthy { latency_ms: 1 })
+        },
         |_, _, _| Ok(()),
     );
     // 预置: Unhealthy + crash_count=2, restart 应复位 policy 并起重启
@@ -73,9 +88,14 @@ async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let mut client = RpcClient::connect(&sock).await.unwrap();
     let resp = restart_call(&mut client, json!({"service": "fusion-rag"}), 1).await;
-    assert_eq!(resp.result, Some(json!("ok")), "restart 应返回 ok");
+    // issue #96: 结果携带 pid 替换证据 (测试环境无 pidfile → null)
+    assert_eq!(
+        resp.result,
+        Some(json!({"ok": true, "old_pid": null, "new_pid": null})),
+        "restart 应返回 ok + pid 字段"
+    );
     assert!(resp.error.is_none(), "不应有 error");
-    // 验证状态机: restart arm 应把 state 置 Stopped → invoke_start Ok → Starting
+    // 验证状态机: restart 应 stop → 验证端口释放 → invoke_start Ok → Starting
     // 并复位 policy (crash_count 归 0)
     {
         let c = core_arc.lock().await;

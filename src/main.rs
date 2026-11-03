@@ -25,7 +25,10 @@ enum Commands {
     Down {
         service: Option<String>,
     },
-    Status,
+    Status {
+        /// Optional service name filter (issue #96: `status <svc>` 此前被拒)
+        service: Option<String>,
+    },
     Restart {
         service: String,
     },
@@ -60,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load()?;
     match cli.command {
         None | Some(Commands::Daemon) => run_daemon(cfg).await,
-        Some(Commands::Status) => cli_status(cfg).await,
+        Some(Commands::Status { service }) => cli_status(cfg, service).await,
         Some(Commands::Top) => cli_top(cfg).await,
         // issue #41: [SERVICE] 参数必须路由到单服务 RPC (up_one/down_one),
         // 此前 `{ .. }` 丢弃参数致 `down <svc>` 全停。经 cli::up_down_target 路由 (可测)。
@@ -222,7 +225,7 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cli_status(cfg: Config) -> anyhow::Result<()> {
+async fn cli_status(cfg: Config, service: Option<String>) -> anyhow::Result<()> {
     let mut client = connect_client(&cfg).await?;
     let req = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -235,8 +238,16 @@ async fn cli_status(cfg: Config) -> anyhow::Result<()> {
         cli::print_error(&err.message);
         std::process::exit(1);
     }
-    let entries: Vec<supervisor::StatusEntry> =
+    let mut entries: Vec<supervisor::StatusEntry> =
         serde_json::from_value(resp.result.unwrap_or(Value::Array(vec![]))).unwrap_or_default();
+    // issue #96: `status <svc>` 客户端过滤 (RPC 仍是全量 status 面)
+    if let Some(f) = &service {
+        entries.retain(|e| &e.name == f);
+        if entries.is_empty() {
+            cli::print_error(&format!("no matching service: {f}"));
+            std::process::exit(1);
+        }
+    }
     cli::print_status(&entries);
     Ok(())
 }
@@ -245,7 +256,7 @@ async fn cli_top(cfg: Config) -> anyhow::Result<()> {
     loop {
         // M6: 先清屏再打印, 避免首帧滞留 1s 再空白
         print!("\x1b[2J\x1b[H");
-        if let Err(e) = cli_status(cfg.clone()).await {
+        if let Err(e) = cli_status(cfg.clone(), None).await {
             cli::print_error(&e.to_string());
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

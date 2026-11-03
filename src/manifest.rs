@@ -205,6 +205,22 @@ fn is_domain(name: &str) -> bool {
 
 pub struct ServiceManifest;
 
+// issue #96: 服务名→注册端口快照 (daemon 启动时 new() 灌入)。daemon_stop_cmd
+// 的端口锚定孤儿兜底 (lsof kill) 需要 port, 而 exec 路径 (free fn) 拿不到
+// ServiceDef — 走 dep_map/probe_map 同款 OnceLock 全局表模式。
+static PORT_MAP: std::sync::OnceLock<std::collections::HashMap<String, u16>> =
+    std::sync::OnceLock::new();
+
+pub fn register_ports(defs: &[ServiceDef]) {
+    let m: std::collections::HashMap<String, u16> =
+        defs.iter().map(|d| (d.name.clone(), d.port)).collect();
+    let _ = PORT_MAP.set(m);
+}
+
+pub fn registered_port(svc: &str) -> Option<u16> {
+    PORT_MAP.get().and_then(|m| m.get(svc).copied())
+}
+
 impl ServiceManifest {
     pub fn load(path: &Path) -> Result<Vec<ServiceDef>> {
         let text = std::fs::read_to_string(path)

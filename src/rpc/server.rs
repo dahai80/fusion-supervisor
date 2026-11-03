@@ -187,24 +187,23 @@ async fn dispatch(
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => return make_error(-32602, "invalid params: service required", req.id),
             };
+            // issue #96: restart 必须 stop 旧进程并验证端口释放后再 start —
+            // 此前只 invoke_start, 旧监听器存活、新进程撞口死掉, 探活命中旧进程
+            // 返回 "ok" 但代码从未被替换。结果携带 pidfile 新旧 PID 替换证据。
             let mut c = core.lock().await;
-            let runner = match c.runners.iter_mut().find(|r| r.def.name == svc) {
-                Some(r) => r,
-                None => return make_error(-32602, &format!("unknown service: {svc}"), req.id),
-            };
-            runner.policy.reset();
-            // issue #90: 人工 restart 复位启动失败重试计数 (重试封顶后人工介入)
-            runner.start_fail_streak = 0;
-            runner.start_retry = false;
-            runner.state = crate::supervisor::runner::State::Stopped;
-            match runner.invoke_start() {
-                Ok(()) => {
-                    runner.state = crate::supervisor::runner::State::Starting;
-                    tracing::info!(svc = %svc, "manual restart ok");
-                    make_result(json!("ok"), req.id)
+            if !c.runners.iter().any(|r| r.def.name == svc) {
+                return make_error(-32602, &format!("unknown service: {svc}"), req.id);
+            }
+            match c.restart_one(&svc).await {
+                Ok((old_pid, new_pid)) => {
+                    tracing::info!(svc = %svc, old_pid, new_pid, "manual restart ok");
+                    make_result(
+                        json!({"ok": true, "old_pid": old_pid, "new_pid": new_pid}),
+                        req.id,
+                    )
                 }
                 Err(e) => {
-                    tracing::warn!(svc = %svc, err = %e, "manual restart start.sh fail");
+                    tracing::warn!(svc = %svc, err = %e, "manual restart fail");
                     make_error(-32000, &format!("restart fail: {e}"), req.id)
                 }
             }

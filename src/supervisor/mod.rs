@@ -78,6 +78,8 @@ impl SupervisorCore {
             .with_event_sink(make_event_sink(store.clone()));
         let env_file = cfg.compose.env_file.clone();
         let compose_on = cfg.compose.enabled;
+        // issue #96: 端口快照供 daemon_stop_cmd 孤儿兜底查询
+        crate::manifest::register_ports(&defs);
         let runners: Vec<_> = defs
             .into_iter()
             .filter(|d| d.managed)
@@ -179,11 +181,16 @@ impl SupervisorCore {
             .filter(|d| d.managed)
             .map(|d| {
                 let pf = probe_fn.clone();
+                // issue #96: runner 内部 start 闭包接注入 start_fn (verb 转发) —
+                // invoke_start 在测试中可观测 (此前 no-op, restart/rollout 的
+                // start 半段测试不可见)
+                let sf = start_fn.clone();
+                let name = d.name.clone();
                 runner::ServiceRunner::new(
                     d,
                     "restart",
                     move || pf(&ProbeSpec::tcp(0)),
-                    |_: &str| Ok(()),
+                    move |verb: &str| sf(&name, verb, &[]),
                     policy::RestartPolicy::new(
                         cfg.restart_window_sec,
                         cfg.restart_max,
@@ -516,6 +523,67 @@ impl SupervisorCore {
             r.mark_stopped();
         }
         Ok(())
+    }
+
+    // ===== issue #96: restart/rollout 必须真正替换进程 =====
+    // 此前 RPC restart 与 rollout 都只 invoke_start (从不 stop): 旧监听器存活,
+    // 新进程撞注册端口死掉, 探活命中旧进程 → "ok"/Healthy 但代码从未被替换。
+
+    // stop 命令 + 端口探活验证 — 旧进程未死则 bail (调用方不得返回 ok)。
+    // stop 命令失败不 bail (pidfile 缺失等 no-op 场景), 由探活验证兜底;
+    // daemon spec 的孤儿监听由 daemon_stop_cmd 的 port 锚定 lsof 补杀处理。
+    async fn stop_and_verify(&mut self, name: &str) -> Result<()> {
+        if let Err(e) = (self.start_fn)(name, "stop", &[]) {
+            tracing::warn!(svc = %name, err = %e, "stop 命令失败 (由探活验证兜底)");
+        }
+        let port = self
+            .runners
+            .iter()
+            .find(|r| r.def.name == name)
+            .map(|r| r.def.port)
+            .unwrap_or(0);
+        let spec = ProbeSpec::tcp(port);
+        // 20×250ms — daemon_stop_cmd 已在 shell 内等进程退出, 此处是脚本型
+        // stop 异步退出 / 孤儿兜底生效的最后确认
+        for i in 0..20 {
+            if !matches!((self.probe_fn)(&spec), ProbeResult::Healthy { .. }) {
+                if i > 0 {
+                    tracing::info!(svc = %name, waits = i, "stop 确认: 端口已释放");
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        anyhow::bail!("stop 后端口仍被占用 (旧进程未被替换): {name}")
+    }
+
+    // 人工 restart: stop 旧进程 (验证端口释放) → start 新进程。返回 pidfile
+    // 记录的旧→新 PID (None = pidfile 缺失/非法)。复位熔断与启动失败重试
+    // (原 RPC restart 内联语义, 移入此处与真实 stop+start 流程绑定)。
+    pub async fn restart_one(&mut self, name: &str) -> Result<(Option<u32>, Option<u32>)> {
+        if !self.runners.iter().any(|r| r.def.name == name) {
+            anyhow::bail!("unknown service: {name}");
+        }
+        let old_pid = read_pidfile_pid(name);
+        if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+            r.policy.reset();
+            r.start_fail_streak = 0;
+            r.start_retry = false;
+            r.state = runner::State::Stopped;
+        }
+        tracing::info!(svc = %name, old_pid, "restart: 停旧进程");
+        self.stop_and_verify(name).await?;
+        tracing::info!(svc = %name, "restart: 旧进程已停, 拉起新进程");
+        let r = self
+            .runners
+            .iter_mut()
+            .find(|r| r.def.name == name)
+            .expect("前面已确认存在");
+        r.invoke_start()?;
+        r.state = runner::State::Starting;
+        let new_pid = read_pidfile_pid(name);
+        tracing::info!(svc = %name, old_pid, new_pid, "restart: start 已发起 (pid 替换)");
+        Ok((old_pid, new_pid))
     }
 
     // ===== PRD app-tiering (issue #62): boot 分级启动 API =====
@@ -940,19 +1008,31 @@ impl SupervisorCore {
         grace: u64,
         prewarm_timeout: u64,
     ) -> Result<()> {
+        {
+            let r = self
+                .runners
+                .iter_mut()
+                .find(|r| r.def.name == service)
+                .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
+            // 1. drain (标 Draining + 宽限)
+            r.begin_drain(grace, now_ts)?;
+            tracing::info!(svc = %service, grace, "rollout: drain 开始");
+            // 2. 等宽限期过 (drain 完成) — 实际生产由 tick 推进 Stopped, 此处直接标 Stopped 走 start
+            r.state = runner::State::Stopped;
+            r.drain_grace_until = None;
+        }
+        tracing::info!(svc = %service, "rollout: drain 完成, 停服务");
+        // 2.5 issue #96: 真正停掉旧进程并验证端口释放 — 此前 rollout 从不 stop,
+        // 新进程撞注册端口死掉, prewarm 探活命中旧监听 → "ok" 但代码从未被替换
+        let old_pid = read_pidfile_pid(service);
+        self.stop_and_verify(service).await?;
+        tracing::info!(svc = %service, old_pid, "rollout: 旧进程已停, 拉起新进程");
+        // 3. start (复用 runner.invoke_start, 1-arg start.sh 读自身 .env)
         let r = self
             .runners
             .iter_mut()
             .find(|r| r.def.name == service)
             .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
-        // 1. drain (标 Draining + 宽限)
-        r.begin_drain(grace, now_ts)?;
-        tracing::info!(svc = %service, grace, "rollout: drain 开始");
-        // 2. 等宽限期过 (drain 完成) — 实际生产由 tick 推进 Stopped, 此处直接标 Stopped 走 start
-        r.state = runner::State::Stopped;
-        r.drain_grace_until = None;
-        tracing::info!(svc = %service, "rollout: drain 完成, 停服务");
-        // 3. start (复用 runner.invoke_start, 1-arg start.sh 读自身 .env)
         if let Err(e) = r.invoke_start() {
             tracing::error!(svc = %service, err = %e, "rollout: start 失败");
             let _ = self
@@ -1119,6 +1199,13 @@ fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
 // 真启动调用 (生产)。svc=服务名: start_map 有覆盖 (issue #29) 走覆盖命令,
 // 否则默认 bash {repo}/start.sh {cmd}。stderr → 每服务日志。
 // env_overrides: 注入 env (issue #8 sidecar 连接 + issue #29 shell 注册)。
+// issue #96: 读服务 pidfile 记录的 PID (缺失/非法 → None) — restart/rollout
+// 输出旧→新 PID 替换证据。
+fn read_pidfile_pid(svc: &str) -> Option<u32> {
+    let s = std::fs::read_to_string(crate::start_map::pid_path(svc)).ok()?;
+    s.trim().parse::<u32>().ok()
+}
+
 fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> Result<()> {
     match crate::start_map::start_spec_for(svc) {
         Some(spec) => exec_start_spec(svc, &spec, cmd, env_overrides),
@@ -1218,7 +1305,9 @@ fn exec_start_spec(
             let shell_cmd = match cmd {
                 "start" => crate::start_map::daemon_start_cmd(spec, svc)
                     .ok_or_else(|| anyhow::anyhow!("daemon spec 缺 start 命令: {svc}"))?,
-                "stop" => crate::start_map::daemon_stop_cmd(svc),
+                "stop" => {
+                    crate::start_map::daemon_stop_cmd(svc, crate::manifest::registered_port(svc))
+                }
                 other => {
                     anyhow::bail!("daemon spec 不支持 {other} (restart 应为 stop+start): {svc}");
                 }
@@ -2596,16 +2685,37 @@ mod tests {
     }
 
     // rollout 全周期: drain→stop→start→prewarm(Healthy)→Healthy
+    // issue #96: 探活序列 = Healthy(停前) → Unhealthy(stop 验证通过) →
+    // Healthy(prewarm); start_fn 收到 stop+start 两个动词
     #[tokio::test]
     async fn test_rollout_full_cycle() {
-        let probe_cell: Arc<Mutex<ProbeResult>> =
-            Arc::new(Mutex::new(ProbeResult::Healthy { latency_ms: 2 }));
-        let pc = probe_cell.clone();
+        let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
+            [
+                ProbeResult::Healthy { latency_ms: 2 },
+                ProbeResult::Unhealthy {
+                    reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                },
+                ProbeResult::Healthy { latency_ms: 3 },
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let pq = probe_q.clone();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cp = calls.clone();
         let mut core = SupervisorCore::new_with_fns(
             vec![def("fusion-mlx", Layer::Core, 11434)],
             fake_cfg(),
-            move |_: &ProbeSpec| pc.lock().unwrap().clone(),
-            |_, _, _| Ok(()),
+            move |_: &ProbeSpec| {
+                pq.lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ProbeResult::Healthy { latency_ms: 3 })
+            },
+            move |svc, cmd, _env| {
+                cp.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
         );
         core.runners[0].state = runner::State::Healthy;
         // rollout: grace=5, prewarm_timeout=10
@@ -2615,6 +2725,13 @@ mod tests {
             "rollout 成功后应 Healthy"
         );
         assert!(core.runners[0].drain_grace_until.is_none());
+        // issue #96: rollout 必须先 stop 旧进程再 start
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-mlx/stop", "fusion-mlx/restart"],
+            "rollout 应真正 stop + invoke_start"
+        );
     }
 
     // rollout prewarm 失败: 探活恒不健康 → 超时 → Err + 留 Stopped + 告警
@@ -2636,6 +2753,90 @@ mod tests {
             matches!(core.runners[0].state, runner::State::Stopped),
             "prewarm 失败应留 Stopped (不回滚)"
         );
+    }
+
+    // ===== issue #96: restart/rollout 必须真正替换进程 =====
+
+    // restart_one: stop → 端口释放 (探活转不健康) → start, 动词顺序 stop+start
+    #[tokio::test]
+    async fn test_issue96_restart_stops_then_starts() {
+        let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
+            [
+                ProbeResult::Healthy { latency_ms: 1 },
+                ProbeResult::Unhealthy {
+                    reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let pq = probe_q.clone();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cp = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            move |_: &ProbeSpec| {
+                pq.lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ProbeResult::Healthy { latency_ms: 1 })
+            },
+            move |svc, cmd, _env| {
+                cp.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        core.runners[0].state = runner::State::Healthy;
+        let (old_pid, new_pid) = core.restart_one("fusion-mlx").await.unwrap();
+        assert_eq!(old_pid, None, "测试环境无 pidfile");
+        assert_eq!(new_pid, None);
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-mlx/stop", "fusion-mlx/restart"],
+            "restart 应真正 stop + invoke_start"
+        );
+        assert!(matches!(core.runners[0].state, runner::State::Starting));
+    }
+
+    // restart_one: stop 无效 (端口恒 Healthy) → bail, 绝不 start、绝不返回 ok
+    #[tokio::test]
+    async fn test_issue96_restart_bails_when_stop_ineffective() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cp = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            move |svc, cmd, _env| {
+                cp.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        core.runners[0].state = runner::State::Healthy;
+        let res = core.restart_one("fusion-mlx").await;
+        assert!(res.is_err(), "stop 无效应 bail");
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-mlx/stop"],
+            "旧进程未死不得 start (防双启/防假替换)"
+        );
+        assert!(matches!(core.runners[0].state, runner::State::Stopped));
+    }
+
+    // restart_one: 未知服务 bail
+    #[tokio::test]
+    async fn test_issue96_restart_unknown_service() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_, _, _| Ok(()),
+        );
+        let res = core.restart_one("no-such-svc").await;
+        assert!(res.is_err());
     }
 
     // ===== PRD app-tiering (issue #62) boot API 单测 =====

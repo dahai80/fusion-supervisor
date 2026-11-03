@@ -461,9 +461,13 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
 // 部分前台化服务 (如 fusion-k12-teacher) 忽略 SIGTERM (优雅关闭卡死), 只 TERM
 // 会出现 down 返回 ok / pidfile 已删 / 进程仍存活的假停止 — 必须 -9 兜底。
 // 宽限 5s (25×0.2s), 正常进程 <1s 退出即提前跳出; 死循环等价 5s 阻塞, 逐服务串行可接受。
-pub fn daemon_stop_cmd(svc: &str) -> String {
+// issue #96: port 锚定兜底 — pidfile 失联 (换 PID/丢失) 的孤儿监听器用
+// lsof -sTCP:LISTEN 按注册端口补杀, 否则 restart/rollout 新进程撞口死掉、
+// 探活命中旧监听 → "ok" 但代码从未被替换。仅 Daemon spec 服务走此路径
+// (supervisor 全权托管该端口), start.sh 服务不受影响。
+pub fn daemon_stop_cmd(svc: &str, port: Option<u16>) -> String {
     let pid = pid_path(svc);
-    format!(
+    let mut cmd = format!(
         "p=$(cat '{pid}' 2>/dev/null || true); \
          if [ -n \"$p\" ]; then \
            kill \"$p\" 2>/dev/null || true; \
@@ -472,7 +476,19 @@ pub fn daemon_stop_cmd(svc: &str) -> String {
          fi; \
          rm -f '{pid}'",
         pid = pid.display()
-    )
+    );
+    if let Some(port) = port {
+        cmd.push_str(&format!(
+            "; \
+             p2=$(lsof -ti tcp:{port} -sTCP:LISTEN 2>/dev/null || true); \
+             if [ -n \"$p2\" ]; then \
+               kill $p2 2>/dev/null || true; \
+               i=0; while kill -0 $p2 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
+               kill -0 $p2 2>/dev/null && kill -9 $p2 2>/dev/null || true; \
+             fi"
+        ));
+    }
+    cmd
 }
 
 #[cfg(test)]
@@ -907,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_daemon_stop_cmd_kills_pidfile() {
-        let cmd = daemon_stop_cmd("fusion-cowork-web");
+        let cmd = daemon_stop_cmd("fusion-cowork-web", Some(11461));
         assert!(cmd.contains("kill"), "stop 应 kill: {cmd}");
         assert!(
             cmd.contains("fusion-cowork-web.pid"),
@@ -920,10 +936,26 @@ mod tests {
     // 忽略 SIGTERM 的服务必须被升级击杀 (生产 bug: k12 down 后进程仍存活)
     #[test]
     fn test_daemon_stop_cmd_sigterm_escalation() {
-        let cmd = daemon_stop_cmd("fusion-k12-teacher");
+        let cmd = daemon_stop_cmd("fusion-k12-teacher", None);
         assert!(cmd.contains("kill -0 \"$p\""), "应轮询进程存活: {cmd}");
         assert!(cmd.contains("kill -9 \"$p\""), "TERM 后仍存活应 -9: {cmd}");
         assert!(cmd.contains("rm -f"), "击杀后清 pidfile: {cmd}");
+    }
+
+    // issue #96: port 锚定孤儿监听兜底 — 有 port 时附 lsof LISTEN 补杀段
+    #[test]
+    fn test_daemon_stop_cmd_port_fallback() {
+        let cmd = daemon_stop_cmd("fusion-cowork-web", Some(11461));
+        assert!(
+            cmd.contains("lsof -ti tcp:11461 -sTCP:LISTEN"),
+            "应有 port 锚定补杀: {cmd}"
+        );
+        assert!(cmd.contains("kill -9 $p2"), "孤儿监听也应 -9 兜底: {cmd}");
+        let no_port = daemon_stop_cmd("fusion-cowork-web", None);
+        assert!(
+            !no_port.contains("lsof"),
+            "无 port 不得带 lsof 段: {no_port}"
+        );
     }
 
     // issue #49: k12 daemonize 前必须 source 项目自身 .env (唯一真源, 覆盖 daemon
