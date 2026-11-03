@@ -124,6 +124,9 @@ pub fn name_to_dir(name: &str) -> &str {
         // registry key 无 fusion- 前缀, repo 落在 business/ 子目录
         ("ai-assistant-agent", "business/ai-assistant-agent"),
         ("ai-lead-qualifier", "business/ai-lead-qualifier"),
+        // issue #94: 同 #88 类 — registry key 无前缀, repo 在 business/ 子目录,
+        // 默认映射 ~/fusion/<key> 不存在, start fail-closed "脚本不存在"
+        ("ai-booking-agent", "business/ai-booking-agent"),
     ];
     for (key, dir) in EXCEPTIONS {
         if name == *key {
@@ -426,6 +429,8 @@ external_tools: []
             name_to_dir("ai-lead-qualifier"),
             "business/ai-lead-qualifier"
         );
+        // issue #94: booking agent 同类 (默认映射 start fail-closed "脚本不存在")
+        assert_eq!(name_to_dir("ai-booking-agent"), "business/ai-booking-agent");
     }
 
     // osagent issue#6: fusion-osagent-metrics 子服务 key 落真实 repo 目录

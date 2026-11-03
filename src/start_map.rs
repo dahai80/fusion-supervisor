@@ -327,6 +327,25 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
+        // issue #94: 同 #88 类 — start.sh `start` case 前台 exec uvicorn,
+        // 默认脚本路径会挂住 exec; Daemon 接管, 端口钉 registry 11516
+        "ai-booking-agent" => Some(StartSpec::Daemon {
+            bin: ".venv/bin/python".into(),
+            args: vec![
+                "-m".into(),
+                "uvicorn".into(),
+                "booking_agent.main:app".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "11516".into(),
+                "--app-dir".into(),
+                "backend".into(),
+            ],
+            cwd: Some("business/ai-booking-agent".into()),
+            env: Vec::new(),
+            env_file: None,
+        }),
         "ai-lead-qualifier" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![

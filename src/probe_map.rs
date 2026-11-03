@@ -101,6 +101,8 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     // issue #88: fleet 审计收编的两条 business 条目 — assistant /health
     // (api/system.py), lead-qualifier /api/v1/system/health (app.py)
     m.insert("ai-assistant-agent", ProbeSpec::http(11511, "/health"));
+    // issue #94: booking_agent/main.py:233 GET /health
+    m.insert("ai-booking-agent", ProbeSpec::http(11516, "/health"));
     m.insert(
         "ai-lead-qualifier",
         ProbeSpec::http(11552, "/api/v1/system/health"),
