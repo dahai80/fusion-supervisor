@@ -2,6 +2,20 @@
 // goes through the vite proxy (9100), embedded through the gateway
 // /shell/fusion-supervisor/ proxy. Mutations need the supervisor token
 // (FUSION_SV_TOKEN): VITE_SV_TOKEN wires it in dev builds only.
+
+// issue #93: embedded 模式 API 路径必须带模块前缀。SPA 以绝对根路径
+// fetch("/api/v1/...") 在 shell 里会打到 gateway 自身的 /api 鉴权层
+// (401), 而不是 /shell/fusion-supervisor/ 代理命名空间。运行时从
+// location.pathname 推导前缀: 独立部署 (根路径 / vite 代理) 无前缀,
+// 嵌入 shell 时自动带上 /shell/fusion-supervisor。
+const API_BASE: string = (() => {
+    if (typeof window === "undefined") return "";
+    const m = window.location.pathname.match(
+        /^(.*\/shell\/fusion-supervisor)\/?/,
+    );
+    return m ? m[1] : "";
+})();
+
 const TOKEN: string | undefined = import.meta.env.VITE_SV_TOKEN;
 
 export interface ServiceStatus {
@@ -32,7 +46,7 @@ function authHeaders(): Record<string, string> {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-    const resp = await fetch(path, { headers: authHeaders() });
+    const resp = await fetch(`${API_BASE}${path}`, { headers: authHeaders() });
     if (!resp.ok) {
         throw new Error(`GET ${path} failed: ${resp.status}`);
     }
@@ -77,7 +91,7 @@ export async function mutate(
     method: MutationMethod,
     service?: string,
 ): Promise<void> {
-    const resp = await fetch(`/api/v1/${method}`, {
+    const resp = await fetch(`${API_BASE}/api/v1/${method}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(service ? { service } : {}),
