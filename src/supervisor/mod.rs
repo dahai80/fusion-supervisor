@@ -1049,11 +1049,17 @@ impl SupervisorCore {
         r.state = runner::State::Starting;
         tracing::info!(svc = %service, "rollout: start 完成, prewarm 等健康");
         // 4. prewarm: 探活循环, 达 Healthy 即成功
-        let deadline = now_ts + prewarm_timeout;
+        // issue #96 伴生缺陷: 此前循环以 t+=1 模拟时间推进且无 sleep — 60 次
+        // 探活微秒级耗尽 "60s" 预算, start 未完成即误判超时 (旧实现靠探活
+        // 立即命中旧监听掩盖)。改真 sleep 1s/轮, 预算=墙钟秒数 (Instant 计时,
+        // 不与注入 now_ts 混用 — 测试的 now_ts 是模拟值)。
+        let prewarm_start = std::time::Instant::now();
         let mut t = now_ts + 1;
         loop {
-            if t > deadline {
-                tracing::error!(svc = %service, deadline, "rollout: prewarm 超时未达 Healthy");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            t = now_unix();
+            if prewarm_start.elapsed() >= std::time::Duration::from_secs(prewarm_timeout) {
+                tracing::error!(svc = %service, prewarm_timeout, "rollout: prewarm 超时未达 Healthy");
                 r.state = runner::State::Stopped;
                 let _ = self
                     .alerter
