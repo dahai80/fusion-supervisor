@@ -1,6 +1,7 @@
 import {
     DataTable,
     type DataTableColumn,
+    EmptyState,
     ErrorState,
     SkeletonLines,
     StatusBadge,
@@ -9,6 +10,7 @@ import {
 import { formatRelativeTime } from "@fusion/web-ui/format";
 import { useCallback, useEffect, useState } from "react";
 import { type EventRow, fetchEvents } from "../api";
+import { useLang, useT } from "../i18n";
 
 // issue #25: global event stream (/api/v1/events) — crash/restart/drain/
 // rollout/backup events across services, time-ascending from the store.
@@ -30,6 +32,8 @@ function kindToBadgeKind(kind: string): StatusKind {
 }
 
 export function AlertsPage() {
+    const t = useT();
+    const lang = useLang();
     const [events, setEvents] = useState<EventRow[] | null>(null);
     const [error, setError] = useState<string | null>(null);
 
@@ -50,7 +54,13 @@ export function AlertsPage() {
     }, [load]);
 
     if (error && !events) {
-        return <ErrorState message={error} retryLabel="Retry" />;
+        return (
+            <ErrorState
+                message={error}
+                retryLabel={t("重试", "Retry")}
+                onRetry={() => void load()}
+            />
+        );
     }
     if (!events) {
         return <SkeletonLines rows={6} />;
@@ -59,16 +69,20 @@ export function AlertsPage() {
     const columns: DataTableColumn<EventRow>[] = [
         {
             key: "ts",
-            header: "Time",
+            header: t("时间", "Time"),
             render: (r) => (
                 <span className="text-xs text-text-muted">
-                    {formatRelativeTime(r.ts * 1000)}
+                    {formatRelativeTime(
+                        r.ts * 1000,
+                        Date.now(),
+                        lang === "en" ? "en-US" : "zh-CN",
+                    )}
                 </span>
             ),
         },
         {
             key: "service",
-            header: "Service",
+            header: t("服务", "Service"),
             render: (r) => (
                 <span className="font-mono text-sm text-text-primary">
                     {r.service}
@@ -77,14 +91,14 @@ export function AlertsPage() {
         },
         {
             key: "kind",
-            header: "Event",
+            header: t("事件", "Event"),
             render: (r) => (
                 <StatusBadge status={kindToBadgeKind(r.kind)} label={r.kind} />
             ),
         },
         {
             key: "detail",
-            header: "Detail",
+            header: t("详情", "Detail"),
             render: (r) => (
                 <span className="text-xs text-text-secondary">{r.detail}</span>
             ),
@@ -94,9 +108,14 @@ export function AlertsPage() {
     return (
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
-                <h1 className="text-base text-text-primary">Alerts</h1>
+                <h1 className="text-base text-text-primary">
+                    {t("告警", "Alerts")}
+                </h1>
                 <span className="text-xs text-text-muted">
-                    last {events.length} events · 10s poll
+                    {t(
+                        `最近 ${events.length} 条事件 · 10s 轮询`,
+                        `last ${events.length} events · 10s poll`,
+                    )}
                 </span>
             </div>
             <DataTable
@@ -105,9 +124,13 @@ export function AlertsPage() {
                 rowKey={(r) => `${r.ts}-${r.service}-${r.kind}`}
                 pageSize={20}
                 emptyState={
-                    <div className="py-8 text-center text-xs text-text-muted">
-                        No events recorded.
-                    </div>
+                    <EmptyState
+                        title={t("暂无事件记录", "No events recorded")}
+                        description={t(
+                            "服务崩溃/恢复/drain/发布/备份事件会出现在这里。",
+                            "Crash / recovery / drain / rollout / backup events appear here.",
+                        )}
+                    />
                 }
             />
         </div>

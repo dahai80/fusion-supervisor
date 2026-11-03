@@ -6,9 +6,24 @@ const RELATIVE_UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
     ['day', 24 * 60 * 60 * 1000],
 ];
 
-const rtf = new Intl.RelativeTimeFormat('zh-CN', { numeric: 'auto' });
+// issue #95 (supervisor): locale 可选参数 — 共享库默认 zh-CN (shell 默认语言),
+// en 模块传 'en-US'。上游共享库缺口已报 fusion-web-shell issue。
+const rtfCache = new Map<string, Intl.RelativeTimeFormat>();
+function rtfFor(locale: string): Intl.RelativeTimeFormat {
+    let rtf = rtfCache.get(locale);
+    if (!rtf) {
+        rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+        rtfCache.set(locale, rtf);
+    }
+    return rtf;
+}
 
-export function formatRelativeTime(ts: number | Date, now: number = Date.now()): string {
+export function formatRelativeTime(
+    ts: number | Date,
+    now: number = Date.now(),
+    locale: string = 'zh-CN',
+): string {
+    const rtf = rtfFor(locale);
     const t = ts instanceof Date ? ts.getTime() : ts;
     const diff = t - now;
     const abs = Math.abs(diff);

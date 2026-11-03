@@ -50,6 +50,15 @@ web_dir = "/Users/<user>/fusion/fusion-supervisor/web/dist"
 Then `http://127.0.0.1:9100/` serves the console (hash routes, SPA fallback
 to `index.html` semantics via relative asset base).
 
+## Bilingual copy + shell theme (issue #95)
+
+Console copy follows the shell language via the vendored SDK `i18n` channel
+(`t(zh, en)` inline call-site pairs, `useLang()`/`useT()` hooks in
+`web/src/i18n.ts` — same pattern as the fusion-cowork web GUI). Relative-time
+formatting takes a per-lang locale. Theme follows `sdk.theme` (embedded) or
+`localStorage["fusion.shell.theme"]` / `prefers-color-scheme` (standalone);
+dark is the default.
+
 ## Gateway wiring (embedded mode)
 
 The `/shell/fusion-supervisor/` proxy is static gateway configuration:

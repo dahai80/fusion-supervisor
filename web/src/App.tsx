@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useT } from "./i18n";
 import { AlertsPage } from "./pages/AlertsPage";
 import { HealthPage } from "./pages/HealthPage";
 import { ServicesPage } from "./pages/ServicesPage";
@@ -44,16 +45,18 @@ export function App() {
     );
 }
 
-const NAV_ITEMS: Array<{ id: Route; label: string }> = [
-    { id: "services", label: "Services" },
-    { id: "health", label: "Health" },
-    { id: "alerts", label: "Alerts" },
+// issue #95: 双语导航 (zh 优先 — shell 默认语言)。
+const NAV_ITEMS: Array<{ id: Route; zh: string; en: string }> = [
+    { id: "services", zh: "服务", en: "Services" },
+    { id: "health", zh: "健康", en: "Health" },
+    { id: "alerts", zh: "告警", en: "Alerts" },
 ];
 
 function EmbeddedTabs({
     route,
     onChange,
 }: { route: Route; onChange: (r: Route) => void }) {
+    const t = useT();
     return (
         <nav className="flex shrink-0 border-b border-border bg-bg-elevated">
             {NAV_ITEMS.map((it) => (
@@ -67,7 +70,7 @@ function EmbeddedTabs({
                             : "text-text-secondary"
                     }`}
                 >
-                    {it.label}
+                    {t(it.zh, it.en)}
                 </button>
             ))}
         </nav>
@@ -78,6 +81,7 @@ function BottomNav({
     route,
     onChange,
 }: { route: Route; onChange: (r: Route) => void }) {
+    const t = useT();
     return (
         <nav className="fixed inset-x-0 bottom-0 z-10 flex border-t border-border bg-bg-elevated">
             {NAV_ITEMS.map((it) => (
@@ -89,7 +93,7 @@ function BottomNav({
                         route === it.id ? "text-brand" : "text-text-secondary"
                     }`}
                 >
-                    {it.label}
+                    {t(it.zh, it.en)}
                 </button>
             ))}
         </nav>

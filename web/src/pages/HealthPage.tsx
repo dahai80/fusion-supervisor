@@ -2,14 +2,18 @@ import {
     ErrorState,
     MetricChart,
     type MetricPoint,
+    MetricTile,
+    SelectInput,
     SkeletonLines,
 } from "@fusion/web-ui";
 import { useCallback, useEffect, useState } from "react";
 import { type HealthRow, fetchHistory, fetchStatus } from "../api";
+import { useT } from "../i18n";
 
 // issue #25: per-service health history — latency line chart from
 // /api/v1/history (store recent_health).
 export function HealthPage() {
+    const t = useT();
     const [names, setNames] = useState<string[]>([]);
     const [selected, setSelected] = useState<string>("");
     const [rows, setRows] = useState<HealthRow[] | null>(null);
@@ -54,58 +58,56 @@ export function HealthPage() {
     const downCount = (rows ?? []).filter((r) => r.status !== "Healthy").length;
 
     if (error && !rows) {
-        return <ErrorState message={error} retryLabel="Retry" />;
+        return (
+            <ErrorState
+                message={error}
+                retryLabel={t("重试", "Retry")}
+                onRetry={() => void load(selected)}
+            />
+        );
     }
 
     return (
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
-                <h1 className="text-base text-text-primary">Health</h1>
-                <select
+                <h1 className="text-base text-text-primary">
+                    {t("健康", "Health")}
+                </h1>
+                <SelectInput
                     value={selected}
-                    onChange={(e) => setSelected(e.target.value)}
-                    className="rounded-md border border-border bg-bg px-2 py-1 text-sm text-text-primary"
-                >
-                    {names.map((n) => (
-                        <option key={n} value={n}>
-                            {n}
-                        </option>
-                    ))}
-                </select>
+                    onChange={setSelected}
+                    options={names.map((n) => ({ value: n, label: n }))}
+                />
             </div>
             {!rows ? (
                 <SkeletonLines rows={4} />
             ) : (
                 <div className="flex flex-col gap-3">
                     <MetricChart
-                        series={[{ label: `${selected} latency (ms)`, points }]}
+                        series={[
+                            {
+                                label: t(
+                                    `${selected} 延迟 (ms)`,
+                                    `${selected} latency (ms)`,
+                                ),
+                                points,
+                            },
+                        ]}
                         unit="ms"
                     />
-                    <div className="grid grid-cols-3 gap-2 text-xs text-text-secondary">
-                        <div className="rounded-card border border-border bg-bg-elevated p-2">
-                            <div className="text-text-muted">Samples</div>
-                            <div className="font-mono tabular-nums text-text-primary">
-                                {rows.length}
-                            </div>
-                        </div>
-                        <div className="rounded-card border border-border bg-bg-elevated p-2">
-                            <div className="text-text-muted">Last status</div>
-                            <div className="font-mono text-text-primary">
-                                {latest?.status ?? "-"}
-                            </div>
-                        </div>
-                        <div className="rounded-card border border-border bg-bg-elevated p-2">
-                            <div className="text-text-muted">Non-healthy</div>
-                            <div
-                                className={`font-mono tabular-nums ${
-                                    downCount > 0
-                                        ? "text-error"
-                                        : "text-success"
-                                }`}
-                            >
-                                {downCount}
-                            </div>
-                        </div>
+                    <div className="grid grid-cols-3 gap-2">
+                        <MetricTile
+                            label={t("样本数", "Samples")}
+                            value={rows.length}
+                        />
+                        <MetricTile
+                            label={t("最新状态", "Last status")}
+                            value={latest?.status ?? "-"}
+                        />
+                        <MetricTile
+                            label={t("非健康样本", "Non-healthy")}
+                            value={downCount}
+                        />
                     </div>
                 </div>
             )}

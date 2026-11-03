@@ -14,6 +14,7 @@ import {
     fetchStatus,
     mutate,
 } from "../api";
+import { useT } from "../i18n";
 
 // state string from render_status_json → StatusBadge kind (spec §3.1).
 function stateToKind(state: string): StatusKind {
@@ -47,7 +48,18 @@ interface PendingOp {
     service?: string;
 }
 
+// issue #95: 操作名双语映射 (确认弹窗文案用)。
+const OP_NAMES: Record<MutationMethod, { zh: string; en: string }> = {
+    up: { zh: "启动", en: "up" },
+    down: { zh: "停止", en: "down" },
+    restart: { zh: "重启", en: "restart" },
+    drain: { zh: "排水", en: "drain" },
+    rollout: { zh: "滚动发布", en: "rollout" },
+    backup: { zh: "备份", en: "backup" },
+};
+
 export function ServicesPage() {
+    const t = useT();
     const [services, setServices] = useState<ServiceStatus[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [pending, setPending] = useState<PendingOp | null>(null);
@@ -84,7 +96,13 @@ export function ServicesPage() {
     };
 
     if (error && !services) {
-        return <ErrorState message={error} retryLabel="Retry" />;
+        return (
+            <ErrorState
+                message={error}
+                retryLabel={t("重试", "Retry")}
+                onRetry={() => void load()}
+            />
+        );
     }
     if (!services) {
         return <SkeletonLines rows={6} />;
@@ -93,7 +111,7 @@ export function ServicesPage() {
     const columns: DataTableColumn<ServiceStatus>[] = [
         {
             key: "name",
-            header: "Service",
+            header: t("服务", "Service"),
             render: (r) => (
                 <span className="font-mono text-sm text-text-primary">
                     {r.name}
@@ -102,39 +120,44 @@ export function ServicesPage() {
         },
         {
             key: "state",
-            header: "State",
+            header: t("状态", "State"),
             render: (r) => (
                 <StatusBadge status={stateToKind(r.state)} label={r.state} />
             ),
         },
-        { key: "port", header: "Port", sortable: true, align: "right" },
-        { key: "plane", header: "Plane" },
+        {
+            key: "port",
+            header: t("端口", "Port"),
+            sortable: true,
+            align: "right",
+        },
+        { key: "plane", header: t("平面", "Plane") },
         {
             key: "actions",
-            header: "Actions",
+            header: t("操作", "Actions"),
             render: (r) => (
                 <div className="flex gap-1">
                     <ActionBtn
-                        label="Up"
+                        label={t("启动", "Up")}
                         disabled={busy}
                         onClick={() => setPending({ method: "up" })}
                     />
                     <ActionBtn
-                        label="Restart"
+                        label={t("重启", "Restart")}
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "restart", service: r.name })
                         }
                     />
                     <ActionBtn
-                        label="Drain"
+                        label={t("排水", "Drain")}
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "drain", service: r.name })
                         }
                     />
                     <ActionBtn
-                        label="Rollout"
+                        label={t("发布", "Rollout")}
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "rollout", service: r.name })
@@ -148,18 +171,23 @@ export function ServicesPage() {
     return (
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
-                <h1 className="text-base text-text-primary">Services</h1>
+                <h1 className="text-base text-text-primary">
+                    {t("服务", "Services")}
+                </h1>
                 <div className="flex items-center gap-2">
                     <span className="text-xs text-text-muted">
-                        {services.length} services · 5s poll
+                        {t(
+                            `${services.length} 个服务 · 5s 轮询`,
+                            `${services.length} services · 5s poll`,
+                        )}
                     </span>
                     <ActionBtn
-                        label="Up all"
+                        label={t("全部启动", "Up all")}
                         disabled={busy}
                         onClick={() => setPending({ method: "up" })}
                     />
                     <ActionBtn
-                        label="Down all"
+                        label={t("全部停止", "Down all")}
                         danger
                         disabled={busy}
                         onClick={() => setPending({ method: "down" })}
@@ -182,12 +210,18 @@ export function ServicesPage() {
                 danger={pending ? DANGER_OPS.has(pending.method) : false}
                 title={
                     pending
-                        ? `${pending.method}${pending.service ? ` ${pending.service}` : " all"}?`
+                        ? t(
+                              `确认${OP_NAMES[pending.method].zh}${pending.service ? ` ${pending.service}` : "全部服务"}？`,
+                              `Confirm ${pending.method} ${pending.service ?? "all services"}?`,
+                          )
                         : ""
                 }
-                description="The supervisor executes this through the same RPC path as the fusion-sv CLI."
-                confirmLabel="Confirm"
-                cancelLabel="Cancel"
+                description={t(
+                    "supervisor 经与 fusion-sv CLI 相同的 RPC 路径执行此操作。",
+                    "The supervisor executes this through the same RPC path as the fusion-sv CLI.",
+                )}
+                confirmLabel={t("确认", "Confirm")}
+                cancelLabel={t("取消", "Cancel")}
                 onConfirm={() => pending && runOp(pending)}
                 onCancel={() => setPending(null)}
             />
