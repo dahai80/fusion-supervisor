@@ -59,10 +59,22 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         "fusion-office-api" => Some(StartSpec::Script(
             fusion_root().join("fusion-office/services/office-api/start.sh"),
         )),
-        "fusion-cowork-web" => Some(daemon(
-            "fusion-cowork",
-            &["web", "serve", "--port", "11461"],
-        )),
+        // issue #100: cowork-web 需读根 .env 的 FUSION_COWORK_WEBHOOK_SECRET
+        // (decision webhook 签名验证, unset 时每笔回调 503)。daemon env 快照
+        // 拿不到它 (改 plist 要全量 daemon reload) — env_file 在 start 前 set -a
+        // source 注入, restart 单服务即生效。缺 key 不 fail (端点自带 503 自描述)。
+        "fusion-cowork-web" => Some(StartSpec::Daemon {
+            bin: "fusion-cowork".into(),
+            args: vec![
+                "web".into(),
+                "serve".into(),
+                "--port".into(),
+                "11461".into(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            env_file: Some(".env".into()),
+        }),
         "fusion-plugins-ecosystem-console" => {
             Some(daemon("fusion-plugin-console", &["--port", "8795"]))
         }
@@ -560,6 +572,35 @@ mod tests {
                 assert_eq!(args, &vec!["serve".to_string()]);
             }
             _ => panic!("fusion-k12-teacher 应为 Daemon spec"),
+        }
+
+        // issue #100: cowork-web must carry env_file pointing at root .env so a
+        // plain `restart fusion-cowork-web` delivers FUSION_COWORK_WEBHOOK_SECRET
+        let spec = start_spec_for("fusion-cowork-web").unwrap();
+        match &spec {
+            StartSpec::Daemon {
+                bin,
+                args,
+                env_file,
+                ..
+            } => {
+                assert_eq!(bin, "fusion-cowork");
+                assert_eq!(
+                    args,
+                    &vec![
+                        "web".to_string(),
+                        "serve".to_string(),
+                        "--port".to_string(),
+                        "11461".to_string()
+                    ]
+                );
+                assert_eq!(
+                    env_file.as_deref(),
+                    Some(".env"),
+                    "issue #100: env_file must point at root .env"
+                );
+            }
+            _ => panic!("fusion-cowork-web should be a Daemon spec"),
         }
 
         let spec = start_spec_for("fusion-code-modenization").unwrap();

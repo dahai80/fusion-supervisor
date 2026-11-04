@@ -1054,7 +1054,7 @@ impl SupervisorCore {
         // 立即命中旧监听掩盖)。改真 sleep 1s/轮, 预算=墙钟秒数 (Instant 计时,
         // 不与注入 now_ts 混用 — 测试的 now_ts 是模拟值)。
         let prewarm_start = std::time::Instant::now();
-        let mut t = now_ts + 1;
+        let mut t;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             t = now_unix();
@@ -1080,7 +1080,6 @@ impl SupervisorCore {
                 tracing::info!(svc = %service, "rollout: prewarm 达 Healthy, 换版完成");
                 return Ok(());
             }
-            t += 1;
         }
     }
 
