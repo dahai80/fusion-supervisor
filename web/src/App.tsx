@@ -2,17 +2,19 @@ import { useEffect, useState } from "react";
 import { useT } from "./i18n";
 import { AlertsPage } from "./pages/AlertsPage";
 import { HealthPage } from "./pages/HealthPage";
+import { OpsPage } from "./pages/OpsPage";
 import { ServicesPage } from "./pages/ServicesPage";
 import { embeddedParam, isEmbedded } from "./sdk";
 
 // Hash router (no router dep). Standalone shows a bottom tab bar; embedded
 // (?embedded=1 or iframe) the shell owns the chrome.
-type Route = "services" | "health" | "alerts";
+type Route = "services" | "health" | "alerts" | "ops";
 
 const ROUTES: ReadonlySet<string> = new Set<Route>([
     "services",
     "health",
     "alerts",
+    "ops",
 ]);
 
 function parseHash(): Route {
@@ -39,6 +41,7 @@ export function App() {
                 {route === "services" && <ServicesPage />}
                 {route === "health" && <HealthPage />}
                 {route === "alerts" && <AlertsPage />}
+                {route === "ops" && <OpsPage />}
             </main>
             {!embedded && <BottomNav route={route} onChange={setRoute} />}
         </div>
@@ -50,6 +53,7 @@ const NAV_ITEMS: Array<{ id: Route; zh: string; en: string }> = [
     { id: "services", zh: "服务", en: "Services" },
     { id: "health", zh: "健康", en: "Health" },
     { id: "alerts", zh: "告警", en: "Alerts" },
+    { id: "ops", zh: "运维", en: "Ops" },
 ];
 
 function EmbeddedTabs({

@@ -140,7 +140,9 @@ export function ServicesPage() {
                     <ActionBtn
                         label={t("启动", "Up")}
                         disabled={busy}
-                        onClick={() => setPending({ method: "up" })}
+                        onClick={() =>
+                            setPending({ method: "up", service: r.name })
+                        }
                     />
                     <ActionBtn
                         label={t("重启", "Restart")}
