@@ -134,7 +134,12 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
             }
         }
         Err(e) => {
-            tracing::warn!(url = %url, err = %e, "http probe fail");
+            // issue #104: routine probe failures must not WARN per poll cycle —
+            // an absent/never-started service fails here every tick and a
+            // minimal machine (~90 absent services) flooded the boot log.
+            // Failure signal is carried by the runner state machine
+            // (transition-gated alerts, #49); keep this at debug.
+            tracing::debug!(url = %url, err = %e, "http probe fail");
             if e.is_connect() {
                 ProbeResult::Unhealthy {
                     reason: UnhealthyReason::ConnectionRefused,
@@ -162,7 +167,8 @@ async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
     let mut stream = match conn {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::warn!(sock = %sock, err = %e, "uds connect fail");
+            // issue #104: same per-poll spam concern as the http arm — debug.
+            tracing::debug!(sock = %sock, err = %e, "uds connect fail");
             return ProbeResult::Unhealthy {
                 reason: UnhealthyReason::UdsConnectFailed,
             };

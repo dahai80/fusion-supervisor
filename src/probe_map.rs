@@ -127,13 +127,28 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
 
 static TABLE: OnceLock<HashMap<&'static str, ProbeSpec>> = OnceLock::new();
 
+// issue #104: degradation is static configuration info — log once per service,
+// never per poll cycle (a minimal machine has ~90 unconfirmed services; the
+// old per-call WARN flooded the boot log every tick).
+static DEGRADED_SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
 pub fn probe_spec_for(name: &str, port: u16) -> ProbeSpec {
     let table = TABLE.get_or_init(build_table);
     if let Some(spec) = table.get(name) {
         return spec.clone();
     }
-    // 兜底: TCP 端口通 (最弱探活, 路径未确)
-    tracing::warn!(svc = name, port, "probe_map 未确路径, 退化 TCP 探活");
+    // 兜底: TCP 端口通 (最弱探活, 路径未确) — 首次 info 一条, 之后静默
+    let seen =
+        DEGRADED_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.insert(name.to_string()) {
+        tracing::info!(
+            svc = name,
+            port,
+            "probe_map path unconfirmed, degraded to TCP probe (add an entry in probe_map.rs to confirm)"
+        );
+    }
     ProbeSpec::tcp(port)
 }
 

@@ -268,11 +268,19 @@ fn tcp_reachable(port: u16, what: &str) -> bool {
 //   (bridge 自身要求此 key, 缺了起不来, 早失败早告警)
 // 非 shell 模块服务 → 空 map。
 pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, String>> {
+    // issue #101: fusion-health audit-key persistence, injected additively
+    // before the shell_vars gate (fusion-health is excluded from FUSION_CLIENT_KEY
+    // injection per #85/#88 but must still receive its audit key). Non-fatal.
+    let mut out = HashMap::new();
+    if svc == "fusion-health"
+        && let Some(v) = health_audit_key()
+    {
+        out.insert("FUSION_HEALTH_AUDIT_HMAC_KEY".to_string(), v);
+    }
     let keys = shell_vars(svc);
     if keys.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(out);
     }
-    let mut out = HashMap::new();
     for k in &keys {
         match *k {
             "FUSION_SHELL_GATEWAY_URL" => {
@@ -327,6 +335,55 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
     }
     tracing::info!(svc, keys = ?keys, "shell 注册 env 解析完成");
     Ok(out)
+}
+
+// issue #101: fusion-health signs its tamper-evident audit log with
+// FUSION_HEALTH_AUDIT_HMAC_KEY (fallback FUSION_HEALTH_API_KEY), resolved per
+// request — a key change mid-log makes every pre-change line unverifiable
+// (`tampered`). The key's persisted home is ~/.fusion-health/env (upstream
+// v1.2.6; FUSION_HEALTH_ENV_FILE overrides), which upstream start.sh sources —
+// but the supervisor must not depend on that: its daemon env snapshot may
+// carry a stale-era key or none. Inject the persisted key into the child env
+// (same value start.sh would set; file absent -> no injection, the empty-key
+// fallback then stays self-consistent). Never log the value.
+pub fn health_audit_key() -> Option<String> {
+    let path = match std::env::var("FUSION_HEALTH_ENV_FILE") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".fusion-health/env")
+        }
+    };
+    let text = std::fs::read_to_string(&path).ok()?;
+    let key = parse_health_env_key(&text);
+    if key.is_some() {
+        tracing::info!(
+            path = %path.display(),
+            "fusion-health audit key injected from persisted env file"
+        );
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            "fusion-health env file present but no FUSION_HEALTH_AUDIT_HMAC_KEY — audit key not injected"
+        );
+    }
+    key
+}
+
+fn parse_health_env_key(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == "FUSION_HEALTH_AUDIT_HMAC_KEY"
+            && !v.trim().is_empty()
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
 }
 
 // 只读 fusion-gateway config.yaml 的 web_shell.admin_key。
@@ -410,6 +467,26 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use tempfile::NamedTempFile;
+
+    // issue #101: audit-key parser — key line wins, comments/blank/foreign
+    // vars ignored, empty value treated as absent.
+    #[test]
+    fn test_parse_health_env_key() {
+        assert_eq!(
+            parse_health_env_key("FUSION_HEALTH_AUDIT_HMAC_KEY=abc123\n"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            parse_health_env_key("# comment\nOTHER=1\nFUSION_HEALTH_AUDIT_HMAC_KEY=k2\n"),
+            Some("k2".to_string())
+        );
+        assert_eq!(
+            parse_health_env_key("FUSION_HEALTH_AUDIT_HMAC_KEY=\n"),
+            None
+        );
+        assert_eq!(parse_health_env_key("FUSION_HEALTH_API_KEY=x\n"), None);
+        assert_eq!(parse_health_env_key(""), None);
+    }
 
     // 进程 env 是全局共享的, 测试并行会互相污染。此锁强制 env_map 测试串行。
     // pub(crate): supervisor/mod.rs env 测试共用此锁, 避免双锁竞态 (#8 rebased onto #7)。

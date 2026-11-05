@@ -62,6 +62,8 @@ pub struct SupervisorCore {
     compose_tracker: crate::compose_tracker::ComposeTracker,
     // issue #10: 上次备份时间戳 (调度判定用)。0=从未备份 → 首次 tick 即到期。
     last_backup_ts: u64,
+    // issue #103: 备份目标从未配置的一次性 WARN 锁存 (调度路径静默, 不逐 tick 刷)。
+    backup_disabled_notified: bool,
     // issue #37: 上次 retention sweep 时间戳 (调度判定用, 语义同 last_backup_ts)。
     last_prune_ts: u64,
     // issue #37: 累计清除的 history.db 行数 (/metrics fusion_sv_events_pruned_total)
@@ -140,6 +142,7 @@ impl SupervisorCore {
             compose,
             compose_tracker,
             last_backup_ts: 0,
+            backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
@@ -213,6 +216,7 @@ impl SupervisorCore {
             compose,
             compose_tracker,
             last_backup_ts: 0,
+            backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
@@ -1101,6 +1105,21 @@ impl SupervisorCore {
     // 在 daemon tick 循环内调用。返回是否触发了备份。
     pub async fn check_backup_schedule(&mut self, now_ts: u64) -> bool {
         if !crate::backup::backup_due(now_ts, self.last_backup_ts, self.cfg.backup_schedule_sec) {
+            return false;
+        }
+        // issue #103: FUSION_BACKUP_TARGET never configured = unconfigured
+        // optional feature, not a failure. One WARN (latched), then silence —
+        // no per-cycle ERROR spam, no BackupFailed alert (nothing attempted).
+        // Manual `fusion-sv backup` / RPC backup with no target still fails
+        // loudly inside run_backup (operator explicitly asked for it).
+        if crate::backup::resolve_target().is_none() {
+            if !self.backup_disabled_notified {
+                tracing::warn!(
+                    "backups disabled: FUSION_BACKUP_TARGET not set (see .env.example) — set it to enable scheduled backups"
+                );
+                self.backup_disabled_notified = true;
+            }
+            self.last_backup_ts = now_ts;
             return false;
         }
         tracing::info!(

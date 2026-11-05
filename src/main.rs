@@ -118,8 +118,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             );
         }
     }
-    let defs = manifest::ServiceManifest::load(&cfg.registry_path)?;
-    tracing::info!(services = defs.len(), "registry loaded");
+    // issue #102: absent registry degrades to an empty managed set (one WARN
+    // inside load_or_empty) — never blocks boot on the minimal-download profile.
+    let defs = manifest::load_or_empty(&cfg.registry_path);
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
     let core = Arc::new(tokio::sync::Mutex::new(core));
     let token = std::env::var("FUSION_SV_TOKEN").ok();

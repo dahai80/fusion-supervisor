@@ -263,6 +263,28 @@ impl ServiceManifest {
     }
 }
 
+// issue #102: absent registry must degrade, never block boot (core-profile
+// contract, fusion-gateway#498). Minimal-download machines clone only the five
+// core repos — no architecture/ — and still need a live daemon for status/up
+// against whatever runs. One WARN with remediation hint, then an empty managed
+// set: managed start/stop is simply unavailable, nothing is spawned.
+pub fn load_or_empty(path: &Path) -> Vec<ServiceDef> {
+    match ServiceManifest::load(path) {
+        Ok(d) => {
+            tracing::info!(services = d.len(), "registry loaded");
+            d
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                err = %e,
+                "registry not found — fleet management disabled (start/stop unavailable); clone the monorepo root or point registry_path at a valid port-registry.yaml to enable"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +332,19 @@ external_tools: []
         let rag = defs.iter().find(|d| d.name == "fusion-rag").unwrap();
         assert_eq!(rag.port, 11436);
         assert!(!rag.fixed);
+    }
+
+    // issue #102: absent registry degrades to an empty managed set (never
+    // blocks daemon boot); a valid registry loads through the same entrypoint.
+    #[test]
+    fn test_load_or_empty_degrades_on_missing_registry() {
+        let missing =
+            std::env::temp_dir().join(format!("no-such-registry-{}.yaml", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_or_empty(&missing).is_empty());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), FAKE_REGISTRY).unwrap();
+        assert_eq!(load_or_empty(tmp.path()).len(), 6);
     }
 
     // issue #31: supervise 标记 — 默认 true, 显式 false 豁免
