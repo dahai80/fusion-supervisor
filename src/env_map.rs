@@ -61,7 +61,14 @@ fn shell_vars(svc: &str) -> Vec<&'static str> {
         // FUSION_SHELL_GATEWAY_URL + FUSION_ADMIN_KEY (URL 尚未迁 BASE_URL,
         // 迁移期保留旧名); plugins console v0.4.7 (fusion-plugins-ecosystem#39)
         // 读 FUSION_GATEWAY_BASE_URL + FUSION_ADMIN_KEY, 不再认旧名。
-        "fusion-cowork-web" => vars.extend(["FUSION_SHELL_GATEWAY_URL", "FUSION_ADMIN_KEY"]),
+        // issue #105: 加 FUSION_COWORK_WORKSPACE_ROOT — web_api.py 的
+        // /api/workspaces/system-dirs 用它限定目录选择器 browsable 根,
+        // 缺省回退 Path.home() 会暴露整个家目录树给终端用户。
+        "fusion-cowork-web" => vars.extend([
+            "FUSION_SHELL_GATEWAY_URL",
+            "FUSION_ADMIN_KEY",
+            "FUSION_COWORK_WORKSPACE_ROOT",
+        ]),
         "fusion-plugins-ecosystem-console" => {
             vars.extend(["FUSION_GATEWAY_BASE_URL", "FUSION_ADMIN_KEY"])
         }
@@ -329,6 +336,14 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
                     })?,
                 };
                 out.insert(k.to_string(), v);
+            }
+            // issue #105: workspace 根是可选的收敛配置, 非启动依赖 — env/env_file
+            // 均缺时不注入 (上游 web_api.py 回退 Path.home(), 与未修复前行为一致),
+            // 不 fail-closed, 遵守 boot contract (缺省项不得阻塞启动)。
+            "FUSION_COWORK_WORKSPACE_ROOT" => {
+                if let Some(v) = resolve(k, env_file) {
+                    out.insert(k.to_string(), v);
+                }
             }
             other => bail!("env_map: 未知 shell 注册 key {other} for {svc}"),
         }
@@ -700,6 +715,25 @@ pub(crate) mod tests {
             "http://127.0.0.1:11432",
             "console URL 未配置应兜底本地网关"
         );
+    }
+
+    // issue #105: workspace 根从 env_file 注入; 缺失时不注入也不 fail (可选收敛)
+    #[test]
+    fn test_shell_env_workspace_root_optional() {
+        let _g = env_lock().lock().unwrap();
+        let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-105");
+        let _ak = EnvGuard::set("FUSION_ADMIN_KEY", "ak-105");
+        let _wr = EnvGuard::set("FUSION_COWORK_WORKSPACE_ROOT", "");
+        let f = env_file("FUSION_COWORK_WORKSPACE_ROOT=/srv/cowork-workspaces\n");
+        let env = shell_env_for("fusion-cowork-web", f.path()).unwrap();
+        assert_eq!(
+            env.get("FUSION_COWORK_WORKSPACE_ROOT").unwrap(),
+            "/srv/cowork-workspaces"
+        );
+        // 进程 env 与 env_file 均缺 → 不注入, 不报错 (上游回退 Path.home())
+        let f2 = env_file("");
+        let env2 = shell_env_for("fusion-cowork-web", f2.path()).unwrap();
+        assert!(!env2.contains_key("FUSION_COWORK_WORKSPACE_ROOT"));
     }
 
     // admin key 全缺 + gateway config 不可读 (指到不存在路径) → fail-closed Err
