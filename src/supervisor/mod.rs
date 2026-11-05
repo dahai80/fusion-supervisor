@@ -629,6 +629,11 @@ impl SupervisorCore {
             // T2 = 按需层 (注册表无 boot 字段的缺省 tier), tray "APP · 按需" 面板
             // 一键启动/停止走这里 — 此前缺该 arm, tray 发 T2 直接 bail。
             "T2" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T2),
+            // issue #106: app = T1 ∪ T2 联合组 — tray APP 面板一键启停走这里。
+            // #91 把 shell 常驻后端迁到 T1 后, 用户感知的 "app fleet" 是 T1∪T2;
+            // 只发 T2 会把 8 个 T1 (cowork/agent-studio/plugins 等) 留在运行态,
+            // 操作员观感即 "一键停止没反应"。T0 永不参与。
+            "app" => Box::new(|d: &ServiceDef| d.boot_tier != BootTier::T0),
             "pinned" => {
                 // 克隆 pin 快照进闭包 — 不借 self
                 let pins: Vec<String> = self.boot_pins.keys().cloned().collect();
@@ -3017,6 +3022,37 @@ mod tests {
             "T0 不动"
         );
         assert_eq!(res["group"], "T2");
+        assert_eq!(res["action"], "down");
+    }
+
+    // issue #106: app 联合组 (T1∪T2) — down 停两层, 不碰 T0
+    #[tokio::test]
+    async fn test_boot_group_app_down_covers_t1_and_t2() {
+        let defs = vec![
+            def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0),
+            def_tier("fusion-cowork", Layer::App, 11460, BootTier::T1),
+            def_tier("fusion-health", Layer::Domain, 11471, BootTier::T2),
+        ];
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_p = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            move |svc, cmd, _env| {
+                calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        let res = core.boot_group("app", "down").await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert!(calls.contains(&"fusion-cowork/stop".to_string()), "T1 停");
+        assert!(calls.contains(&"fusion-health/stop".to_string()), "T2 停");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fusion-mlx/")),
+            "T0 不动"
+        );
+        assert_eq!(res["group"], "app");
         assert_eq!(res["action"], "down");
     }
 

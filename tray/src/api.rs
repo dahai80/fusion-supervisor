@@ -39,12 +39,15 @@ impl PinMode {
     }
 }
 
-// /api/v1/boot/group 的 group 参数: supervisor 侧接受 T0/T1/T2。
+// /api/v1/boot/group 的 group 参数: supervisor 侧接受 T0/T1/T2/app。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TierKey {
     T0,
     T1,
     T2,
+    // issue #106: T1∪T2 联合组 — APP 面板一键启停语义 (#91 迁层后 T1 也是
+    // 用户感知的 app fleet, 只发 T2 会留下 shell 常驻后端继续跑)
+    App,
 }
 
 impl TierKey {
@@ -53,6 +56,7 @@ impl TierKey {
             TierKey::T0 => "T0",
             TierKey::T1 => "T1",
             TierKey::T2 => "T2",
+            TierKey::App => "app",
         }
     }
 }

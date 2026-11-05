@@ -912,7 +912,9 @@ impl TrayApp {
                             let g = match tier {
                                 Tier::Core => api::TierKey::T0,
                                 Tier::Platform => api::TierKey::T1,
-                                Tier::App => api::TierKey::T2,
+                                // issue #106: APP 面板一键 = T1∪T2 联合组 (app),
+                                // 只发 T2 会留下 T1 shell 常驻后端继续跑
+                                Tier::App => api::TierKey::App,
                             };
                             if ui.button("一键启动").clicked() {
                                 self.enqueue(api::Cmd::Group {
