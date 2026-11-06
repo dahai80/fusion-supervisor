@@ -804,6 +804,37 @@ impl SupervisorCore {
         self.tick_compose(now_ts).await;
     }
 
+    // issue #107 D2: daemon 冷启动状态对账。launchd 崩溃重启 (如系统睡眠中
+    // 进程死亡) 后, 托管服务的 nohup 进程往往还活着, 但 runner 全部初始为
+    // Stopped — 首个 tick 前的 status 会谎报 Stopped, 操作员据此手动 restart
+    // 会杀掉健康进程 (实测事故 2026-11-06: 杀死 in-flight workflow)。
+    // 启动时先探活一轮: probe 通过 → 直接采纳为 Healthy (复位计数/排期),
+    // status 从第一个请求起就与真实探活一致; probe 失败 → 维持 Stopped
+    // (真死的服务交由 auto_up / 手动 up 正常拉起)。返回采纳数 (供日志)。
+    pub async fn reconcile_on_boot(&mut self) -> usize {
+        use runner::State as S;
+        let mut adopted = 0usize;
+        for r in &mut self.runners {
+            if !matches!(r.probe_once(), crate::probe::ProbeResult::Healthy { .. }) {
+                continue;
+            }
+            if !matches!(r.state, S::Healthy) {
+                tracing::info!(svc = %r.def.name, "boot reconcile: live process adopted as Healthy");
+                adopted += 1;
+            }
+            r.state = S::Healthy;
+            r.fail_streak = 0;
+            r.restart_after = None;
+            r.start_retry = false;
+            r.start_fail_streak = 0;
+            r.policy.reset();
+        }
+        if adopted > 0 {
+            tracing::info!(adopted, "boot reconciliation done");
+        }
+        adopted
+    }
+
     // compose 容器监督: 探活每个容器, 宕机告警 (经 compose_tracker 节流, issue #6)。
     // tracker 纯逻辑给决策, 此处据决策发告警。容器不被 supervisor 重启 (Docker 管)。
     async fn tick_compose(&mut self, now_ts: u64) {
@@ -3054,6 +3085,41 @@ mod tests {
         );
         assert_eq!(res["group"], "app");
         assert_eq!(res["action"], "down");
+    }
+
+    // issue #107 D2: 冷启动对账 — 探活通过的幸存进程采纳为 Healthy (复位计数),
+    // 探活失败的维持 Stopped; 幂等, 第二轮无新增
+    #[tokio::test]
+    async fn test_reconcile_on_boot_adopts_live_services() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let defs = vec![
+            def("fusion-cowork-web", Layer::App, 11461),
+            def("fusion-health", Layer::Domain, 11471),
+        ];
+        let n = Arc::new(AtomicUsize::new(0));
+        let n_p = n.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            move |_spec: &crate::probe::ProbeSpec| {
+                // 第 1 个 runner (cowork-web) 探活通过, 第 2 个 (health) 拒连
+                if n_p.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ProbeResult::Healthy { latency_ms: 1 }
+                } else {
+                    ProbeResult::Unhealthy {
+                        reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                    }
+                }
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        let adopted = core.reconcile_on_boot().await;
+        assert_eq!(adopted, 1, "仅探活通过的服务被采纳");
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+        assert!(matches!(core.runners[1].state, runner::State::Stopped));
+        // 幂等: 已 Healthy 的服务第二轮不计入
+        let adopted2 = core.reconcile_on_boot().await;
+        assert_eq!(adopted2, 0);
     }
 
     // 非法 group/action 直接 bail, 不动任何服务

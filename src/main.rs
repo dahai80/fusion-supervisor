@@ -122,6 +122,11 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // inside load_or_empty) — never blocks boot on the minimal-download profile.
     let defs = manifest::load_or_empty(&cfg.registry_path);
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
+    let mut core = core;
+    // issue #107 D2: 先对账再开 RPC — 幸存进程 (launchd 崩溃重启后) 不再被
+    // status 谎报 Stopped。探活一轮即可, 阻塞远小于首个 tick 的等待窗口。
+    let adopted = core.reconcile_on_boot().await;
+    tracing::info!(adopted, "boot reconcile complete");
     let core = Arc::new(tokio::sync::Mutex::new(core));
     let token = std::env::var("FUSION_SV_TOKEN").ok();
     let core_rpc = core.clone();
@@ -144,6 +149,12 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 绝不持锁跨 sleep (否则阻塞 RPC status/up/down)。
     let core_tick = core.clone();
     let tick_handle = tokio::spawn(async move {
+        // issue #107 D1: 睡眠/挂起诊断 — 两轮 tick 间隔远超 poll_interval 即视为
+        // 系统睡眠唤醒 (daemon 若在睡眠中死亡, 此日志缺席可佐证 SIGKILL 类硬杀)。
+        let mut last_tick_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         loop {
             let interval = {
                 let c = core_tick.lock().await;
@@ -154,6 +165,15 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let gap = now.saturating_sub(last_tick_ts);
+            if gap > interval * 6 + 60 {
+                tracing::warn!(
+                    gap_sec = gap,
+                    expected_sec = interval,
+                    "time jump detected — system sleep/suspend suspected"
+                );
+            }
+            last_tick_ts = now;
             // tick 单轮 panic 隔离: panic 会杀掉整个 tick task — RPC/HTTP 仍活
             // 但监督静默停摆 (探活/自愈/告警全停), 常驻组件不可接受。inner spawn
             // 隔离 (JoinError 捕获 panic), 崩了记 ERROR 下一 tick 续跑。
@@ -211,9 +231,16 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         });
     }
     // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
+    // issue #107 D1: SIGTERM (launchd bootout) 也走优雅退出并留痕 — 睡眠中
+    // 的静默死亡若非信号所致, 日志里缺 shutdown 行即可排除正常终止路径。
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("SIGTERM handler install fail: {e}"))?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("daemon shutdown (ctrl-c)");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("daemon shutdown (SIGTERM)");
         }
         _ = &mut shutdown_rx => {
             tracing::info!("daemon shutdown (rpc)");
