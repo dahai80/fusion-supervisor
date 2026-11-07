@@ -1,3 +1,19 @@
+---
+doc_id: fusion-supervisor/readme
+product: fusion-supervisor
+class: core
+entry: service
+doc_type: readme
+title: { zh: "fusion-supervisor — 本地服务编排与守护", en: "fusion-supervisor — local service supervision" }
+audience: engineer
+status: draft
+version: 0.1.46
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README.md
+---
+
 # fusion-supervisor
 
 Local-first fusion service supervisor and monitor. Long-lived Rust daemon `fusion-sv` supervises all 53 fusion services registered in `architecture/port-registry.yaml`: start/stop/restart, health probing, crash auto-recovery (crash-window + exponential backoff), health history in SQLite, and alerting.
