@@ -1,3 +1,19 @@
+---
+doc_id: fusion-supervisor/readme/web-cn
+product: fusion-supervisor
+class: core
+entry: service
+doc_type: readme
+title: { zh: "Fusion Supervisor Web 控制台", en: "Fusion Supervisor web console" }
+audience: engineer
+status: draft
+version: 0.1.46
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - web/README_CN.md
+---
+
 # Fusion Supervisor Web 控制台
 
 `fusion-sv` 的 Web 控制台 (issue #25)。三个页面, 数据来自 supervisor 的 HTTP 面

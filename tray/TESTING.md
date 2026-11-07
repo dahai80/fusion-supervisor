@@ -1,3 +1,19 @@
+---
+doc_id: fusion-supervisor/guide/tray-testing
+product: fusion-supervisor
+class: core
+entry: service
+doc_type: guide
+title: { zh: "fusion-tray 手动测试清单", en: "fusion-tray manual test checklist" }
+audience: engineer
+status: draft
+version: 0.1.46
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - tray/TESTING.md
+---
+
 # Tray Manual Test Checklist
 
 Manual acceptance checklist for the fusion-tray floating supervisor UI

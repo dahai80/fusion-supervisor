@@ -1,3 +1,19 @@
+---
+doc_id: fusion-supervisor/readme/web
+product: fusion-supervisor
+class: core
+entry: service
+doc_type: readme
+title: { zh: "Fusion Supervisor Web 控制台", en: "Fusion Supervisor web console" }
+audience: engineer
+status: draft
+version: 0.1.46
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - web/README.md
+---
+
 # Fusion Supervisor Web Console
 
 Web console for `fusion-sv` (issue #25). Four pages over the supervisor HTTP
