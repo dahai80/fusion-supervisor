@@ -4,7 +4,7 @@ members = [".", "tray"]
 
 [package]
 name = "fusion-supervisor"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2024"
 license = "Apache-2.0"
 description = "Local-first fusion service supervisor and monitor"
@@ -28,7 +28,7 @@ reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tabled = "0.17"
+tabled = "0.22"
 toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 # issue #10: 备份 gzip 压缩 pg_dumpall 输出

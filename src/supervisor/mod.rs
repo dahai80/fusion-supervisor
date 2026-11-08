@@ -3122,6 +3122,41 @@ mod tests {
         assert_eq!(adopted2, 0);
     }
 
+    // issue #110 验收: 管理的子进程被外部击杀后 daemon 重启 — 对账必须
+    // adopt-or-retire 而不双启。探活拒连 (进程已死) → 保持 Stopped、不复位
+    // 不排期重启 (tick 对 Stopped 不重启), 不会出现旧实例 + 新实例并存。
+    #[tokio::test]
+    async fn test_issue110_reconcile_dead_service_retired_no_double_start() {
+        let defs = vec![
+            def("fusion-cowork-web", Layer::App, 11461),
+            def("fusion-health", Layer::Domain, 11471),
+        ];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |spec: &crate::probe::ProbeSpec| {
+                // 两个目标都已死 (外部 kill): 全部拒连
+                let _ = spec;
+                ProbeResult::Unhealthy {
+                    reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                }
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        let adopted = core.reconcile_on_boot().await;
+        assert_eq!(adopted, 0, "死服务不得被采纳");
+        for r in &core.runners {
+            assert!(matches!(r.state, runner::State::Stopped));
+            assert!(r.restart_after.is_none(), "不得排期重启 (会双启)");
+            assert!(!r.start_retry);
+            assert_eq!(r.fail_streak, 0);
+        }
+        // 复核: reconcile 不触发任何 start 调用 (start_fn 未被记录到崩溃窗口)
+        for r in &core.runners {
+            assert_eq!(r.policy.crash_count(), 0, "对账不算 crash");
+        }
+    }
+
     // 非法 group/action 直接 bail, 不动任何服务
     #[tokio::test]
     async fn test_boot_group_invalid_args() {

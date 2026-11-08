@@ -461,8 +461,11 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     for (k, v) in env {
         pre.push_str(&format!("export {k}='{v}'; "));
     }
+    // issue #110: set -m (job control) 让后台化的服务进程自成一组
+    // (pgid == 自身 pid, 已实证 macOS bash) — stop 侧才能按进程组整树击杀,
+    // uvicorn worker 等子孙不落单。nohup 已防 HUP, set -m 不改变该保护。
     Some(format!(
-        "{pre}nohup '{bin}' {args} >> '{log}' 2>&1 & echo $! > '{pid}'",
+        "{pre}set -m; nohup '{bin}' {args} >> '{log}' 2>&1 & echo $! > '{pid}'",
         args = args.join(" "),
         log = log.display(),
         pid = pid.display(),
@@ -477,14 +480,30 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
 // lsof -sTCP:LISTEN 按注册端口补杀, 否则 restart/rollout 新进程撞口死掉、
 // 探活命中旧监听 → "ok" 但代码从未被替换。仅 Daemon spec 服务走此路径
 // (supervisor 全权托管该端口), start.sh 服务不受影响。
+// issue #110 (t3code kill-safety): 两条击杀纪律 —
+// 1) pidfile 分支先查 pgid, pgid == pid (start 侧 set -m 保证) 时按进程组
+//    `kill -TERM -<pid>` 整树击杀 (子孙 worker 不落单); 查不到/不等 (旧版
+//    存量进程) 回落单 pid 击杀, 行为与旧版一致。ESRCH 由 kill -0 轮询兜底。
+// 2) port 兜底补杀前必验归属: lsof 读候选 pid 的 cwd + ps 读 cmdline,
+//    仅命中本服务 repo 目录名才击杀; 无关监听器跳过留痕, 绝不按端口盲杀
+//    (t3code 教训: 按 argv/端口模式匹配会误伤无关进程)。
+//    本仓库无 pkill/grep 模式击杀路径 — pgrep 仅用于只读检测 (runner.rs)。
 pub fn daemon_stop_cmd(svc: &str, port: Option<u16>) -> String {
     let pid = pid_path(svc);
+    let repo_dir = crate::manifest::name_to_dir(svc);
     let mut cmd = format!(
         "p=$(cat '{pid}' 2>/dev/null || true); \
          if [ -n \"$p\" ]; then \
-           kill \"$p\" 2>/dev/null || true; \
-           i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
-           kill -0 \"$p\" 2>/dev/null && kill -9 \"$p\" 2>/dev/null || true; \
+           g=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' ' || true); \
+           if [ -n \"$g\" ] && [ \"$g\" = \"$p\" ]; then \
+             kill -TERM -\"$p\" 2>/dev/null || true; \
+             i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
+             kill -0 \"$p\" 2>/dev/null && kill -9 -\"$p\" 2>/dev/null || true; \
+           else \
+             kill \"$p\" 2>/dev/null || true; \
+             i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
+             kill -0 \"$p\" 2>/dev/null && kill -9 \"$p\" 2>/dev/null || true; \
+           fi; \
          fi; \
          rm -f '{pid}'",
         pid = pid.display()
@@ -494,10 +513,23 @@ pub fn daemon_stop_cmd(svc: &str, port: Option<u16>) -> String {
             "; \
              p2=$(lsof -ti tcp:{port} -sTCP:LISTEN 2>/dev/null || true); \
              if [ -n \"$p2\" ]; then \
-               kill $p2 2>/dev/null || true; \
-               i=0; while kill -0 $p2 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
-               kill -0 $p2 2>/dev/null && kill -9 $p2 2>/dev/null || true; \
-             fi"
+               for q in $p2; do \
+                 cw=$(lsof -a -p \"$q\" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); \
+                 cl=$(ps -o command= -p \"$q\" 2>/dev/null || true); \
+                 case \"$cw|$cl\" in \
+                   *'{repo}'*) \
+                     kill \"$q\" 2>/dev/null || true; \
+                     i=0; while kill -0 \"$q\" 2>/dev/null && [ $i -lt 25 ]; do sleep 0.2; i=$((i+1)); done; \
+                     kill -0 \"$q\" 2>/dev/null && kill -9 \"$q\" 2>/dev/null || true; \
+                     ;; \
+                   *) \
+                     echo \"skip port {port} listener $q: not owned by {repo}\" >&2; \
+                     ;; \
+                 esac; \
+               done; \
+             fi",
+            port = port,
+            repo = repo_dir
         ));
     }
     cmd
@@ -984,6 +1016,7 @@ mod tests {
     }
 
     // issue #96: port 锚定孤儿监听兜底 — 有 port 时附 lsof LISTEN 补杀段
+    // issue #110: 补杀前必须验归属 (cwd/cmdline 命中 repo 目录名), 不再盲杀
     #[test]
     fn test_daemon_stop_cmd_port_fallback() {
         let cmd = daemon_stop_cmd("fusion-cowork-web", Some(11461));
@@ -991,11 +1024,50 @@ mod tests {
             cmd.contains("lsof -ti tcp:11461 -sTCP:LISTEN"),
             "应有 port 锚定补杀: {cmd}"
         );
-        assert!(cmd.contains("kill -9 $p2"), "孤儿监听也应 -9 兜底: {cmd}");
+        assert!(
+            cmd.contains("*'fusion-cowork'*"),
+            "归属校验应匹配 repo 目录名: {cmd}"
+        );
+        assert!(
+            cmd.contains("not owned by fusion-cowork"),
+            "无关监听器应跳过留痕: {cmd}"
+        );
+        assert!(cmd.contains("kill -9 \"$q\""), "命中归属仍 -9 兜底: {cmd}");
         let no_port = daemon_stop_cmd("fusion-cowork-web", None);
         assert!(
             !no_port.contains("lsof"),
             "无 port 不得带 lsof 段: {no_port}"
+        );
+    }
+
+    // issue #110: start 命令带 set -m — 服务进程 pgid == 自身 pid, stop 侧才能组杀
+    #[test]
+    fn test_daemon_start_cmd_sets_process_group() {
+        let spec = start_spec_for("fusion-cowork-web").unwrap();
+        let cmd = daemon_start_cmd(&spec, "fusion-cowork-web").unwrap();
+        assert!(
+            cmd.contains("set -m; nohup"),
+            "start 命令应带 set -m 使后台进程自成组: {cmd}"
+        );
+    }
+
+    // issue #110: pidfile 分支先查 pgid, pgid==pid 时整树组杀 (TERM → 轮询 → -9);
+    // pgid 不等 (旧版存量) 回落单 pid 击杀
+    #[test]
+    fn test_daemon_stop_cmd_group_kill() {
+        let cmd = daemon_stop_cmd("fusion-cowork-web", None);
+        assert!(
+            cmd.contains("g=$(ps -o pgid= -p \"$p\""),
+            "应先查进程组: {cmd}"
+        );
+        assert!(
+            cmd.contains("kill -TERM -\"$p\""),
+            "pgid==pid 时应组杀 TERM: {cmd}"
+        );
+        assert!(cmd.contains("kill -9 -\"$p\""), "组杀也应升级 -9: {cmd}");
+        assert!(
+            cmd.contains("kill \"$p\" 2>/dev/null || true"),
+            "pgid 不等回落单 pid 击杀: {cmd}"
         );
     }
 
