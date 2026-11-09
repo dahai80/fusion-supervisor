@@ -2005,6 +2005,7 @@ mod tests {
     // issue #111: 探活通过但 pidfile 进程已死 (陈旧监听器占口) — Daemon spec
     // 服务须转 Unhealthy (走重启流清掉陈旧监听); 活 pid / 无 pidfile 不误判
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_issue111_probe_pass_dead_pid_detected() {
         use crate::env_map::tests::env_lock;
         struct HomeGuard {

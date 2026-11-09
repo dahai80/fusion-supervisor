@@ -11,7 +11,6 @@ use crate::store::HistoryStore;
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,7 +20,51 @@ pub type ExecFn = Arc<dyn Fn(&str, &[&str]) -> Result<Vec<u8>> + Send + Sync>;
 
 // issue #77: 注入的 native exec 函数。签名: (bin, args) -> stdout bytes。
 // 生产=直接 spawn 本机二进制 (pg_dumpall / docker); 测试=fake。
+// 注意: 只用于小输出 (docker ps / tar 元数据)。大输出 (dump 流) 走 DumpFn 流式, 见 #115。
 pub type NativeExecFn = Arc<dyn Fn(&str, &[&str]) -> Result<Vec<u8>> + Send + Sync>;
+
+// issue #115: dump 流式执行函数。签名: (bin, args, out_path) -> gzip 压缩字节数。
+// 子进程 stdout 直接流过 GzEncoder 写文件 — 不经内存缓冲 (旧实现整包 Vec<u8>
+// 缓冲, 2.2GB dump 驻留 daemon RSS, 生产实证 2026-11-09)。生产=真 spawn;
+// 测试=fake 直接写 gzip。
+pub type DumpFn = Arc<dyn Fn(&str, &[&str], &Path) -> Result<u64> + Send + Sync>;
+
+// 生产 dump 流式执行: spawn bin, stdout 逐块 gzip → out_path, stderr 收满尾。
+// FUSION_PG_PASSWORD 设置时注入 PGPASSWORD (与 real_native_exec 同语义)。
+// 失败语义: spawn 失败 / 退出码非 0 → bail (fail-closed 由 run() 告警)。
+pub fn real_dump_fn() -> DumpFn {
+    Arc::new(|bin: &str, args: &[&str], out_path: &Path| {
+        tracing::info!(bin, args = ?args, out = %out_path.display(), "exec dump (stream)");
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args)
+            .stdout(std::process::Stdio::piped())
+            // stderr 走 inherit (daemon 日志面) — pipe 不读会满阻塞子进程
+            .stderr(std::process::Stdio::inherit());
+        if let Ok(pw) = std::env::var("FUSION_PG_PASSWORD")
+            && !pw.is_empty()
+        {
+            cmd.env("PGPASSWORD", pw);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {bin}: {e}"))?;
+        let Some(stdout) = child.stdout.take() else {
+            bail!("{bin} stdout 不可读");
+        };
+        let f = std::fs::File::create(out_path)
+            .with_context(|| format!("create backup file {}", out_path.display()))?;
+        let mut enc = GzEncoder::new(f, Compression::default());
+        let mut rdr = std::io::BufReader::new(stdout);
+        let n =
+            std::io::copy(&mut rdr, &mut enc).with_context(|| format!("stream {bin} → gzip"))?;
+        enc.finish().with_context(|| format!("gzip finish {bin}"))?;
+        let out = child.wait().with_context(|| format!("wait {bin}"))?;
+        if !out.success() {
+            bail!("{bin} 失败: exit {:?}", out.code());
+        }
+        Ok(n)
+    })
+}
 
 // 生产 native exec: 直接 spawn 二进制。FUSION_PG_PASSWORD 设置时注入 PGPASSWORD
 // (brew trust auth 下通常不需要, 留作远程/密码认证场景)。
@@ -106,6 +149,11 @@ pub struct BackupRunner {
     exec: ExecFn,
     // issue #77: native 平面 exec (直接 spawn 本机二进制)
     native_exec: NativeExecFn,
+    // issue #115: dump 流式执行 (pg_dumpall stdout → gzip 文件, 零内存缓冲)
+    dump_fn: DumpFn,
+    // issue #115: compose 平面 dump 的完整 docker 参数 (env-file/-f 前缀与
+    // real_exec 同构, new() 预构; 测试构造为 None → fail-closed)
+    compose_dump_args: Option<Vec<String>>,
     // issue #77: true = native 平面 (compose.enabled=false), 走本机 brew PG
     plane_native: bool,
     // issue #77: native pg_dumpall 解析结果 (配置覆盖或 PATH)
@@ -128,6 +176,22 @@ impl BackupRunner {
             &cfg.compose.business_file,
             &cfg.compose.env_file,
         );
+        // issue #115: compose dump 完整参数 (与 real_exec 命令列表同构)
+        let compose_dump_args = Some(vec![
+            "compose".to_string(),
+            "--env-file".to_string(),
+            cfg.compose.env_file.to_string_lossy().into_owned(),
+            "-f".to_string(),
+            cfg.compose.sidecar_file.to_string_lossy().into_owned(),
+            "-f".to_string(),
+            cfg.compose.business_file.to_string_lossy().into_owned(),
+            "exec".to_string(),
+            "-T".to_string(),
+            "postgres".to_string(),
+            "pg_dumpall".to_string(),
+            "-U".to_string(),
+            "fusion".to_string(),
+        ]);
         let plane_native = !cfg.compose.enabled;
         let pg_dump_bin = resolve_pg_dump_bin(&cfg.pg_dump_bin);
         let pg_user = std::env::var("FUSION_PG_USER")
@@ -140,6 +204,8 @@ impl BackupRunner {
         Self {
             exec,
             native_exec: real_native_exec(),
+            dump_fn: real_dump_fn(),
+            compose_dump_args,
             plane_native,
             pg_dump_bin,
             pg_host: cfg.native_pg_host.clone(),
@@ -157,6 +223,10 @@ impl BackupRunner {
             native_exec: Arc::new(|_bin: &str, _args: &[&str]| {
                 bail!("native exec 不应在 compose 平面测试中被调用")
             }),
+            dump_fn: Arc::new(|_bin: &str, _args: &[&str], _out: &Path| {
+                bail!("dump_fn 不应在未注入时被调用 (测试须 with_dump_fn)")
+            }),
+            compose_dump_args: Some(vec![]),
             plane_native: false,
             pg_dump_bin: "pg_dumpall".to_string(),
             pg_host: "127.0.0.1".to_string(),
@@ -178,6 +248,10 @@ impl BackupRunner {
                 bail!("compose exec 不应在 native 平面测试中被调用")
             }),
             native_exec,
+            dump_fn: Arc::new(|_bin: &str, _args: &[&str], _out: &Path| {
+                bail!("dump_fn 不应在未注入时被调用 (测试须 with_dump_fn)")
+            }),
+            compose_dump_args: None,
             plane_native: true,
             pg_dump_bin: "pg_dumpall".to_string(),
             pg_host: "127.0.0.1".to_string(),
@@ -186,6 +260,13 @@ impl BackupRunner {
             target,
             retention,
         }
+    }
+
+    // issue #115: 注入 fake dump_fn (builder, 测试用) — fake 直接 gzip 写固定 bytes。
+    #[cfg(test)]
+    fn with_dump_fn(mut self, dump: DumpFn) -> Self {
+        self.dump_fn = dump;
+        self
     }
 
     // fail-closed: target 未设 → 拒绝 + 告警。
@@ -221,13 +302,21 @@ impl BackupRunner {
         };
         // 1. Postgres: pg_dumpall → gzip
         let pg_path = target.join(format!("fusion-pg-{date}.sql.gz"));
-        let pg_started = now_ts;
+        let pg_started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(now_ts);
         let pg_res = if self.plane_native {
             self.pg_dump_native(&pg_path)
         } else {
             self.pg_dump(&pg_path)
         };
-        let pg_dur = now_ts.saturating_sub(pg_started);
+        // issue #115: dur 用真实时钟 (旧实现拿注入 now_ts 相减恒 0, 事件假象)
+        let pg_dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(now_ts)
+            .saturating_sub(pg_started);
         let pg_size = pg_path.metadata().map(|m| m.len()).unwrap_or(0);
         record_outcome(
             store, alerter, "postgres", plane, &pg_res, pg_size, pg_dur, &pg_path, now_ts,
@@ -265,20 +354,23 @@ impl BackupRunner {
         Ok(())
     }
 
-    // pg_dumpall via docker compose exec postgres, stdout → gzip 文件
+    // pg_dumpall via docker compose exec postgres — issue #115: stdout 流式 → gzip
+    // 文件 (旧实现整包 Vec<u8> 缓冲, 大库 2.2GB 驻留 daemon RSS)。
     fn pg_dump(&self, out_path: &Path) -> Result<()> {
-        let dump = (self.exec)("postgres", &["pg_dumpall", "-U", "fusion"])?;
-        let f = std::fs::File::create(out_path)
-            .with_context(|| format!("create backup file {}", out_path.display()))?;
-        let mut enc = GzEncoder::new(f, Compression::default());
-        enc.write_all(&dump).context("gzip write pg_dumpall")?;
-        enc.finish().context("gzip finish pg_dumpall")?;
-        tracing::info!(path = %out_path.display(), bytes = dump.len(), "pg_dumpall 已压缩写入");
+        // issue #115: compose 前缀 (env-file/-f) 与 real_exec 同构 — new() 预构,
+        // 缺失 (测试构造) fail-closed
+        let Some(prefix) = &self.compose_dump_args else {
+            bail!("compose dump args 未配置 (仅测试构造缺省)");
+        };
+        let argv: Vec<&str> = prefix.iter().map(String::as_str).collect();
+        let n = (self.dump_fn)("docker", &argv, out_path)?;
+        tracing::info!(path = %out_path.display(), bytes = n, "pg_dumpall 已流式压缩写入");
         Ok(())
     }
 
     // issue #77: native 平面 pg_dump — 本机 pg_dumpall 直连 brew PG (127.0.0.1:5432)。
     // pg_user=None 时省略 -U (pg_dumpall 默认 OS 用户, brew trust auth 下即安装用户)。
+    // issue #115: stdout 流式 → gzip 文件 (旧实现整包缓冲, 2.2GB 驻留 daemon RSS)。
     fn pg_dump_native(&self, out_path: &Path) -> Result<()> {
         let port = self.pg_port.to_string();
         let mut args: Vec<&str> = vec!["-h", &self.pg_host, "-p", &port];
@@ -286,18 +378,12 @@ impl BackupRunner {
             args.push("-U");
             args.push(u);
         }
-        let dump = (self.native_exec)(&self.pg_dump_bin, &args)?;
-        let f = std::fs::File::create(out_path)
-            .with_context(|| format!("create backup file {}", out_path.display()))?;
-        let mut enc = GzEncoder::new(f, Compression::default());
-        enc.write_all(&dump)
-            .context("gzip write pg_dumpall (native)")?;
-        enc.finish().context("gzip finish pg_dumpall (native)")?;
+        let n = (self.dump_fn)(&self.pg_dump_bin, &args, out_path)?;
         tracing::info!(
             path = %out_path.display(),
-            bytes = dump.len(),
+            bytes = n,
             bin = %self.pg_dump_bin,
-            "native pg_dumpall 已压缩写入"
+            "native pg_dumpall 已流式压缩写入"
         );
         Ok(())
     }
@@ -530,6 +616,7 @@ mod tests {
     use super::*;
     use crate::alert::Alerter;
     use crate::store::HistoryStore;
+    use std::io::Write as _;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -548,6 +635,22 @@ mod tests {
     fn fake_exec(dump: Vec<u8>) -> ExecFn {
         let dump = Arc::new(dump);
         Arc::new(move |_svc: &str, _args: &[&str]| Ok((*dump).clone()))
+    }
+
+    // issue #115: fake dump_fn — 直接 gzip 写固定 bytes 到 out_path (零 spawn)。
+    // 返回字节数与真实流式语义一致 (压缩后大小不重要, 断言只看文件非空)。
+    fn fake_dump(content: &'static [u8]) -> DumpFn {
+        Arc::new(move |_bin: &str, _args: &[&str], out: &Path| {
+            let f = std::fs::File::create(out)?;
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(content)?;
+            enc.finish()?;
+            Ok(content.len() as u64)
+        })
+    }
+
+    fn fake_dump_err(msg: &'static str) -> DumpFn {
+        Arc::new(move |_bin: &str, _args: &[&str], _out: &Path| bail!("{}", msg))
     }
 
     struct EnvGuard {
@@ -592,7 +695,8 @@ mod tests {
             fake_exec(b"-- pg dump content --".to_vec()),
             Some(target.clone()),
             7,
-        );
+        )
+        .with_dump_fn(fake_dump(b"-- pg dump content --"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
         // pg 文件存在且非空
         let pg_file = target.join("fusion-pg-20260903.sql.gz");
@@ -650,7 +754,8 @@ mod tests {
         let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
         let mut runner =
-            BackupRunner::new_with_exec(fake_exec(b"dump".to_vec()), Some(target.clone()), 7);
+            BackupRunner::new_with_exec(fake_exec(b"dump".to_vec()), Some(target.clone()), 7)
+                .with_dump_fn(fake_dump(b"dump"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
         // 旧 8 份 + 新 1 份 = 9, retention 7 → 应删 2 份最旧
         let pg_files: Vec<_> = std::fs::read_dir(&target)
@@ -683,15 +788,11 @@ mod tests {
         let target = tmp.path().to_path_buf();
         let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
-        // native exec: pg_dumpall → dump; docker → Err (本机无 docker)
-        let native: NativeExecFn = Arc::new(|bin: &str, _args: &[&str]| {
-            if bin == "pg_dumpall" {
-                Ok(b"-- native pg dump --".to_vec())
-            } else {
-                bail!("docker not installed")
-            }
-        });
-        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7);
+        // native exec: docker → Err (本机无 docker); dump 流式走 fake dump_fn
+        let native: NativeExecFn =
+            Arc::new(|_bin: &str, _args: &[&str]| bail!("docker not installed"));
+        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
+            .with_dump_fn(fake_dump(b"-- native pg dump --"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
         let pg_file = target.join("fusion-pg-20260930.sql.gz");
         assert!(
@@ -731,7 +832,8 @@ mod tests {
         let mut alerter = Alerter::new(0, String::new());
         let native: NativeExecFn =
             Arc::new(|_bin: &str, _args: &[&str]| bail!("pg_dumpall: command not found"));
-        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7);
+        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
+            .with_dump_fn(fake_dump_err("spawn pg_dumpall: No such file or directory"));
         let res = runner.run(1000, &store, &mut alerter).await;
         assert!(res.is_err(), "pg_dumpall 缺失应 fail-closed 拒绝");
         let msg = res.unwrap_err().to_string();
@@ -762,7 +864,8 @@ mod tests {
                 Ok(b"tar-bytes".to_vec())
             }
         });
-        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7);
+        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
+            .with_dump_fn(fake_dump(b"dump"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
         let tar = target.join("fusion-qdrant-20260930/storage.tar");
         assert!(tar.exists(), "qdrant storage.tar 应存在: {}", tar.display());
