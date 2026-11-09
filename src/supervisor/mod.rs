@@ -1256,13 +1256,30 @@ fn spawn_backup_task(
     alert_url: String,
     now_ts: u64,
 ) {
-    tokio::spawn(async move {
-        let mut alerter = crate::alert::Alerter::new(alert_dedup_sec, alert_url)
-            .with_event_sink(make_event_sink(store.clone()));
-        match runner.run(now_ts, &store, &mut alerter).await {
-            Ok(()) => tracing::info!("backup 完成 (detached)"),
-            Err(e) => tracing::error!(err = %e, "backup 失败 (fail-closed 已告警)"),
-        }
+    // #116: dump/qdrant/prune 全是同步阻塞 (std::process + std::io::copy 流过
+    // 2.2GB, 分钟级) — 直接 tokio::spawn 跑在 worker 线程会把 worker 钉死,
+    // runtime 饿死 → RPC 全黑 (2026-11-09 实证 curl 000 全程)。落 blocking
+    // 池线程 + 内嵌 current_thread runtime 跑 async 段 (alert webhook reqwest /
+    // store await), tokio worker 零阻塞。
+    tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(err = %e, "backup 内嵌 runtime 构建失败 (备份未运行)");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let mut alerter = crate::alert::Alerter::new(alert_dedup_sec, alert_url)
+                .with_event_sink(make_event_sink(store.clone()));
+            match runner.run(now_ts, &store, &mut alerter).await {
+                Ok(()) => tracing::info!("backup 完成 (detached)"),
+                Err(e) => tracing::error!(err = %e, "backup 失败 (fail-closed 已告警)"),
+            }
+        });
     });
 }
 
