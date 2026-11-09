@@ -908,12 +908,12 @@ pub(crate) mod tests {
     }
 
     // env guard (RAII 恢复进程 env), 与 config.rs EnvGuard 同构
-    struct EnvGuard {
+    pub(crate) struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
     }
     impl EnvGuard {
-        fn set(key: &'static str, val: &str) -> Self {
+        pub(crate) fn set(key: &'static str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             unsafe { std::env::set_var(key, val) };
             Self { key, prev }
