@@ -25,6 +25,10 @@ pub struct StatusEntry {
     pub state: String, // State 的字符串形式, 兼容容器平面 (Failed/Healthy/...)
     pub port: u16,
     pub plane: String, // "native" | "compose"
+    // issue #112: 最近一次 restart 类事件 ("kind detail"), 审计 "谁拉起的"。
+    // None = 无记录 (从没重启过/手工事件缺), 序列化时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_restart: Option<String>,
 }
 
 // PRD app-tiering: /api/v1/boot 行。pinned=None 表示无个人覆盖 (走注册表 boot 字段)。
@@ -770,6 +774,7 @@ impl SupervisorCore {
                 state: format!("{:?}", r.state),
                 port: r.def.port,
                 plane: "native".into(),
+                last_restart: None,
             })
             .collect();
         if let Some(cb) = &self.compose {
@@ -781,6 +786,7 @@ impl SupervisorCore {
                             state: c.supervisor_state().to_string(),
                             port: c.port(),
                             plane: "compose".into(),
+                            last_restart: None,
                         });
                     }
                 }
@@ -788,6 +794,12 @@ impl SupervisorCore {
                     tracing::warn!(err = %e, "compose ps 失败 (状态表缺容器行)");
                 }
             }
+        }
+        // issue #112: status 附带最近一次 restart 类事件 — 事后可答
+        // "这服务最近 24h 谁拉起的" (AutoRestart/ManualStart/ManualStop)。
+        let restarts = self.store.last_restart_map();
+        for e in &mut out {
+            e.last_restart = restarts.get(&e.name).cloned();
         }
         out
     }
@@ -814,8 +826,21 @@ impl SupervisorCore {
     pub async fn reconcile_on_boot(&mut self) -> usize {
         use runner::State as S;
         let mut adopted = 0usize;
+        // issue #111: 常驻档 (T0/T1) 服务在对账时发现死亡 → 落审计事件。
+        // 这类服务预期一直在跑, daemon 缺席窗口 (睡眠/崩溃) 内的死因对
+        // 事后追溯不可见 — 不记就是 #111 那种 "事件表直接跳行" 的空洞。
+        // T2 按需服务不记 (不运行是常态)。记录不改状态 (仍 Stopped,
+        // auto_up 只拉 boot 集合 — 与 #107 语义一致)。
+        let mut dead_resident: Vec<String> = Vec::new();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         for r in &mut self.runners {
             if !matches!(r.probe_once(), crate::probe::ProbeResult::Healthy { .. }) {
+                if r.def.boot_tier != crate::manifest::BootTier::T2 {
+                    dead_resident.push(r.def.name.clone());
+                }
                 continue;
             }
             if !matches!(r.state, S::Healthy) {
@@ -828,6 +853,17 @@ impl SupervisorCore {
             r.start_retry = false;
             r.start_fail_streak = 0;
             r.policy.reset();
+        }
+        for name in &dead_resident {
+            let _ = self
+                .alerter
+                .alert(crate::alert::Alert {
+                    service: name.clone(),
+                    kind: crate::alert::AlertKind::ServiceDown,
+                    detail: "boot reconcile: found dead at daemon start, left Stopped (resident tier, not auto-started)".into(),
+                    ts: now_ts,
+                })
+                .await;
         }
         if adopted > 0 {
             tracing::info!(adopted, "boot reconciliation done");
@@ -1920,6 +1956,176 @@ mod tests {
             matches!(core.runners[0].state, runner::State::Healthy),
             "探活恢复后 tick_all 应 Healthy"
         );
+    }
+
+    // issue #112: 自动恢复拉起成功后必须落 AutoRestart 审计事件 (带 old/new pid),
+    // 且 status_all 的 last_restart 列能查到它 — 事后可答 "这服务谁拉起的"
+    #[tokio::test]
+    async fn test_issue112_autorestart_event_and_status_last_restart() {
+        let probe_cell: Arc<Mutex<ProbeResult>> = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+            reason: crate::probe::UnhealthyReason::ConnectionRefused,
+        }));
+        let pc = probe_cell.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-rag", Layer::App, 11436)],
+            fake_cfg(),
+            move |_: &ProbeSpec| pc.lock().unwrap().clone(),
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Unhealthy;
+        core.runners[0].fail_streak = 2;
+        core.tick_all(1000).await;
+        core.tick_all(1001).await; // 到点重启, invoke_start Ok → AutoRestart 事件
+        // 事件落库: kind=AutoRestart, detail 带 pid 字段 (测试无 pidfile → "?")
+        let (kind, detail): (String, String) = core
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT kind, detail FROM event WHERE kind='AutoRestart' ORDER BY ts DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("AutoRestart 事件应已落库");
+        assert!(detail.contains("old_pid="), "detail 应带 old_pid: {detail}");
+        assert!(detail.contains("new_pid="), "detail 应带 new_pid: {detail}");
+        // 翻探活为健康 → 恢复
+        *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
+        core.tick_all(1001).await;
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+        // status enrichment: last_restart 列 = "AutoRestart ..."
+        let status = core.status_all();
+        let row = status.iter().find(|e| e.name == "fusion-rag").unwrap();
+        let lr = row.last_restart.as_deref().expect("last_restart 应有值");
+        assert!(lr.starts_with("AutoRestart"), "got: {lr}");
+        let _ = kind;
+    }
+
+    // issue #111: 探活通过但 pidfile 进程已死 (陈旧监听器占口) — Daemon spec
+    // 服务须转 Unhealthy (走重启流清掉陈旧监听); 活 pid / 无 pidfile 不误判
+    #[tokio::test]
+    async fn test_issue111_probe_pass_dead_pid_detected() {
+        use crate::env_map::tests::env_lock;
+        struct HomeGuard {
+            prev: Option<String>,
+        }
+        impl HomeGuard {
+            fn set(val: &std::path::Path) -> Self {
+                let prev = std::env::var("HOME").ok();
+                // SAFETY: env_lock 串行化, 此测试期间无并发读 HOME 的被测代码
+                unsafe { std::env::set_var("HOME", val) };
+                Self { prev }
+            }
+        }
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                // SAFETY: 同上
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var("HOME", v) },
+                    None => unsafe { std::env::remove_var("HOME") },
+                }
+            }
+        }
+        let _g0 = env_lock().lock().unwrap();
+        let home = std::env::temp_dir().join(format!("fusion-sv-111-home-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".fusion-sv/pids")).unwrap();
+        let _g1 = HomeGuard::set(&home);
+        let pidfile = home.join(".fusion-sv/pids/fusion-cowork-web.pid");
+
+        // 场景 1: 死 pid — i32::MAX 永不存在 (macOS pid 上限 ~99998), 免
+        // 并行测试杀子进程后 pid 被即时复用的竞态
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-cowork-web", Layer::App, 11461)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        assert!(
+            matches!(core.runners[0].state, runner::State::Unhealthy),
+            "探活通过但 pid 已死应转 Unhealthy"
+        );
+        drop(core);
+
+        // 场景 2: 活 pid → 保持 Healthy
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, live.id().to_string()).unwrap();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-cowork-web", Layer::App, 11461)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+        drop(core);
+
+        // 场景 3: pidfile 缺失 → 不误判, 保持 Healthy
+        let _ = std::fs::remove_file(&pidfile);
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-cowork-web", Layer::App, 11461)],
+            fake_cfg(),
+            |_| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.tick_all(1000).await;
+        assert!(matches!(core.runners[0].state, runner::State::Healthy));
+        live.kill().unwrap();
+        live.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // issue #112: boot 对账发现常驻档 (非 T2) 服务死亡 — 落 ServiceDown 事件
+    // "found dead at daemon start", 事后告警流可见, 不再静默维持 Stopped
+    #[tokio::test]
+    async fn test_issue112_reconcile_dead_resident_event() {
+        let defs = vec![
+            def_tier("fusion-cowork-web", Layer::App, 11461, BootTier::T1),
+            def_tier("fusion-health", Layer::Domain, 11471, BootTier::T2),
+        ];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_: &crate::probe::ProbeSpec| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        let adopted = core.reconcile_on_boot().await;
+        assert_eq!(adopted, 0);
+        // T1 死亡有事件, T2 (非常驻档) 无事件
+        let n: i64 = core
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM event WHERE kind='ServiceDown' AND detail LIKE 'boot reconcile%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "仅常驻档 (T1) 死亡落 reconcile 事件");
+        let svc: String = core
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT service FROM event WHERE kind='ServiceDown' AND detail LIKE 'boot reconcile%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(svc, "fusion-cowork-web");
     }
 
     // C1: poll_interval — 有 down 态返回 poll_unhealthy_sec, 否则 poll_healthy_sec

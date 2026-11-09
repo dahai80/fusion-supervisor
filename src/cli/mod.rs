@@ -7,6 +7,8 @@ struct Row {
     state: String,
     port: u16,
     plane: String,
+    // issue #112: 最近一次 restart 类事件 (AutoRestart/ManualStart/ManualStop)
+    last_restart: String,
 }
 
 pub fn print_status(entries: &[StatusEntry]) {
@@ -17,6 +19,7 @@ pub fn print_status(entries: &[StatusEntry]) {
             state: e.state.clone(),
             port: e.port,
             plane: e.plane.clone(),
+            last_restart: e.last_restart.clone().unwrap_or_default(),
         })
         .collect();
     let table = Table::new(rows);

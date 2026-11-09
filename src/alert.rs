@@ -27,6 +27,9 @@ pub enum AlertKind {
     ServiceConfigFatal,
     // issue #47: 快速失败熔断 (start 成功后秒级又宕, 连续达阈值)
     FastFailLoop,
+    // issue #112: 自动恢复 (crash/start-retry 退避流) 实际拉起成功 — 审计事件,
+    // 不去抖。detail 携带 old/new pid; 触发原因见紧邻的 ServiceDown 行。
+    AutoRestart,
 }
 
 impl AlertKind {
@@ -43,6 +46,7 @@ impl AlertKind {
             AlertKind::BackupFailed => "BackupFailed",
             AlertKind::ServiceConfigFatal => "ServiceConfigFatal",
             AlertKind::FastFailLoop => "FastFailLoop",
+            AlertKind::AutoRestart => "AutoRestart",
         }
     }
 }
@@ -92,7 +96,7 @@ impl Alerter {
             AlertKind::ContainerCrashLoop => "error",
             // issue #47: 配置致命/快速失败熔断均为升级事件
             AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop => "error",
-            AlertKind::ServiceBack | AlertKind::ServiceDrained => "info",
+            AlertKind::ServiceBack | AlertKind::ServiceDrained | AlertKind::AutoRestart => "info",
             _ => "warn",
         }
     }

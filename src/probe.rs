@@ -71,6 +71,10 @@ pub enum UnhealthyReason {
     BadStatus(u16),
     UdsConnectFailed,
     UdsBadReply,
+    // issue #111: pidfile 里的进程已死但探活仍通过 — 端口被陈旧监听器
+    // (孤儿父进程/别的进程撞口) 占着, probe-pass ≠ process-alive。
+    // 按真宕机处理, 走自动重启 (#96 port 兜底 + #110 归属校验会清掉陈旧监听)。
+    ProcessExit,
 }
 
 impl UnhealthyReason {
@@ -78,7 +82,9 @@ impl UnhealthyReason {
     pub fn restart_eligible(&self) -> bool {
         matches!(
             self,
-            UnhealthyReason::ConnectionRefused | UnhealthyReason::Timeout
+            UnhealthyReason::ConnectionRefused
+                | UnhealthyReason::Timeout
+                | UnhealthyReason::ProcessExit
         )
     }
 }

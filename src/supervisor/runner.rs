@@ -62,6 +62,39 @@ fn exit_code_of(err_msg: &str) -> Option<i32> {
     digits.parse().ok()
 }
 
+// issue #111: PID 活性 — `kill -0` 语义 (不杀, 只探)。kill 不可用 → true
+// (pass-open, 回落旧行为, 不因工具缺席误判宕机)。
+fn process_alive(pid: i32) -> bool {
+    match std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+    {
+        Ok(s) => s.success(),
+        Err(e) => {
+            tracing::warn!(pid, err = %e, "kill -0 不可用, 视为进程存活 (pass-open)");
+            true
+        }
+    }
+}
+
+// pidfile 读 pid (缺失/非法 → None)。独立 free fn 便于单测。
+fn read_pidfile(path: &std::path::Path) -> Option<i32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse::<i32>().ok()
+}
+
+// issue #111: pidfile → 死亡判定。缺失/非法/进程仍活 → None;
+// pid 已死 → Some(ProcessExit)。纯函数 (路径注入) 便于单测。
+fn dead_pid_at(path: &std::path::Path) -> Option<crate::probe::UnhealthyReason> {
+    let pid = read_pidfile(path)?;
+    if process_alive(pid) {
+        None
+    } else {
+        Some(crate::probe::UnhealthyReason::ProcessExit)
+    }
+}
+
 // issue #86: 检测操作员是否正在对该服务跑 start.sh (任意子命令)。
 // 端口探活无法区分 "操作员 do_restart 的 stop 窗口" 与 "真宕机" — 两者都
 // ConnectionRefused。supervisor 若在操作员 restart 期间抢跑自动重启:
@@ -255,6 +288,20 @@ impl ServiceRunner {
         }
         match result {
             ProbeResult::Healthy { latency_ms } => {
+                // issue #111: probe-pass ≠ process-alive — Daemon 托管服务 (supervisor
+                // 自有 pidfile) 在探活通过时复核 PID 活性; pidfile pid 已死而端口仍
+                // 应答 = 陈旧监听器占口 (孤儿/撞口), 按真宕机 ProcessExit 走自动
+                // 重启 (#96 port 兜底 + #110 归属校验负责清掉陈旧监听)。
+                if matches!(self.state, State::Healthy)
+                    && let Some(reason) = self.process_exit_if_dead()
+                {
+                    tracing::warn!(
+                        svc = %self.def.name,
+                        "probe passed but pidfile process is dead (stale port holder suspected)"
+                    );
+                    self.handle_unhealthy(reason, now_ts, alerter).await;
+                    return Ok(());
+                }
                 let was_down = matches!(self.state, State::Unhealthy | State::Restarting);
                 self.state = State::Healthy;
                 // issue #79: 任一次成功探活即复位连续失败计数 (抖动不升级)。
@@ -488,6 +535,9 @@ impl ServiceRunner {
                                     .await;
                             }
                         }
+                        // issue #112: 审计 — 自动恢复实际拉起前先抓旧 pid,
+                        // 成功后落 AutoRestart 事件 (old/new pid 可考)。
+                        let old_pid = self.pidfile_pid();
                         match self.invoke_start() {
                             Err(e) => {
                                 let detail = e.to_string();
@@ -530,6 +580,26 @@ impl ServiceRunner {
                             }
                             Ok(()) => {
                                 self.last_start_ts = Some(now_ts);
+                                // issue #112: 自动恢复 (crash / start-retry 退避流)
+                                // 实际拉起成功 → AutoRestart 审计事件 (不去抖, info)。
+                                // 触发原因见紧邻的 ServiceDown 事件行。
+                                let new_pid = self.pidfile_pid();
+                                let _ = alerter
+                                    .alert(Alert {
+                                        service: self.def.name.clone(),
+                                        kind: AlertKind::AutoRestart,
+                                        detail: format!(
+                                            "auto-recovery restart ok old_pid={} new_pid={}",
+                                            old_pid
+                                                .map(|p| p.to_string())
+                                                .unwrap_or_else(|| "?".into()),
+                                            new_pid
+                                                .map(|p| p.to_string())
+                                                .unwrap_or_else(|| "?".into()),
+                                        ),
+                                        ts: now_ts,
+                                    })
+                                    .await;
                                 // issue #90: 启动脚本成功即退出启动重试流 —
                                 // 后续失败回归 crash / 快速失败语义, 复位计数
                                 self.start_fail_streak = 0;
@@ -552,6 +622,22 @@ impl ServiceRunner {
                 );
             }
         }
+    }
+
+    // issue #111: 仅 Daemon spec (supervisor 自有 pidfile) 参与 PID 复核。
+    // pidfile 缺失/不可读/内容非法 → None (不误判); pid 指向的进程仍活 → None
+    // (含 pid 被回收复用的情况 — 复用者非本服务也放行, 不冤枉健康探活)。
+    fn process_exit_if_dead(&self) -> Option<crate::probe::UnhealthyReason> {
+        match crate::start_map::start_spec_for(&self.def.name) {
+            Some(crate::start_map::StartSpec::Daemon { .. }) => {}
+            _ => return None,
+        }
+        dead_pid_at(&crate::start_map::pid_path(&self.def.name))
+    }
+
+    // pidfile 读 pid (缺失/非法 → None)
+    fn pidfile_pid(&self) -> Option<i32> {
+        read_pidfile(&crate::start_map::pid_path(&self.def.name))
     }
 
     // issue #90: up 路径启动失败登记。非 exit-78 的启动失败多为环境未就绪
@@ -644,6 +730,55 @@ mod tests {
     use crate::manifest::Layer;
     use crate::probe::{ProbeResult, UnhealthyReason};
     use std::sync::{Arc, Mutex};
+
+    // issue #111: pidfile 解析 — 缺失/非法/空白/正常
+    #[test]
+    fn test_read_pidfile_variants() {
+        let dir =
+            std::env::temp_dir().join(format!("fusion-sv-runner-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 缺失
+        assert_eq!(read_pidfile(&dir.join("missing.pid")), None);
+        // 非法内容
+        std::fs::write(dir.join("bad.pid"), "not-a-pid\n").unwrap();
+        assert_eq!(read_pidfile(&dir.join("bad.pid")), None);
+        // 空文件
+        std::fs::write(dir.join("empty.pid"), "").unwrap();
+        assert_eq!(read_pidfile(&dir.join("empty.pid")), None);
+        // 正常 (带尾换行 + 空白)
+        std::fs::write(dir.join("ok.pid"), " 4242 \n").unwrap();
+        assert_eq!(read_pidfile(&dir.join("ok.pid")), Some(4242));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // issue #111: dead_pid_at — 活进程 → None, 死进程 → Some(ProcessExit)
+    #[test]
+    fn test_dead_pid_at_liveness() {
+        let dir =
+            std::env::temp_dir().join(format!("fusion-sv-runner-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("svc.pid");
+        // 真实子进程: 活 → None
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        assert_eq!(dead_pid_at(&pidfile), None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // 死 pid 用 i32::MAX — macOS pid 上限 ~99998, 该值永不存在, 免并行
+        // 测试杀子进程后 pid 被即时复用的竞态 (生产语义一致: pid 复用即放行)
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        assert_eq!(
+            dead_pid_at(&pidfile),
+            Some(crate::probe::UnhealthyReason::ProcessExit)
+        );
+        // pidfile 缺失 → None (不误判)
+        let _ = std::fs::remove_file(&pidfile);
+        assert_eq!(dead_pid_at(&pidfile), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // issue #90: 启动重试曲线 — 前两次快速补拉 (5/15s), 之后 60/300 升级
     #[test]

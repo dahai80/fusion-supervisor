@@ -128,6 +128,33 @@ impl HistoryStore {
         Ok(())
     }
 
+    // issue #112: 每服务最近一次 restart 类事件 (AutoRestart/ManualStart/ManualStop)。
+    // status 表 last_restart 列数据源 — 事后可答 "这服务最近谁拉起的/谁停的"。
+    // detail 截 80 字符防表格爆行; 无记录的服务不在 map 里。
+    pub fn last_restart_map(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let conn = self.conn.lock().unwrap();
+        let res = conn.prepare(
+            "SELECT service, kind || ' ' || substr(detail, 1, 80), MAX(ts) FROM event
+             WHERE kind IN ('AutoRestart','ManualStart','ManualStop')
+             GROUP BY service",
+        );
+        let mut stmt = match res {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(err = %e, "last_restart_map query fail, return empty");
+                return out;
+            }
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
     pub fn cleanup_old(&self, now_ts: u64, retain_days: u32) -> Result<usize> {
         let cutoff = now_ts.saturating_sub((retain_days as u64) * 24 * 3600);
         let h = self.conn.lock().unwrap().execute(
@@ -296,6 +323,38 @@ mod tests {
     fn open_mem() -> HistoryStore {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         HistoryStore::open(tmp.path()).unwrap()
+    }
+
+    // issue #112: last_restart_map — 只取 restart 类 kind, 每服务留最新一条,
+    // detail 截断, 其他 kind 不入 map
+    #[test]
+    fn test_last_restart_map() {
+        let s = open_mem();
+        s.record_event("svc-a", "ServiceDown", "down", 100, "native", "warn")
+            .unwrap();
+        s.record_event("svc-a", "AutoRestart", "auto-recovery restart ok old_pid=1 new_pid=2 and some very long detail that should be truncated at eighty characters boundary here!!!!", 200, "native", "info")
+            .unwrap();
+        s.record_event("svc-a", "ManualStop", "http down", 150, "native", "info")
+            .unwrap();
+        s.record_event("svc-b", "ManualStart", "cli up", 300, "native", "info")
+            .unwrap();
+        let m = s.last_restart_map();
+        assert_eq!(m.len(), 2);
+        // svc-a 取 MAX(ts)=200 的 AutoRestart 行, detail 截 80 字符
+        let a = &m["svc-a"];
+        assert!(
+            a.starts_with("AutoRestart auto-recovery restart ok"),
+            "got: {a}"
+        );
+        assert!(
+            a.contains("new_pid=2"),
+            "应是 ts=200 的 AutoRestart 行: {a}"
+        );
+        assert!(a.len() <= 11 + 1 + 80, "detail 应截 80: len={}", a.len());
+        assert_eq!(m["svc-b"], "ManualStart cli up");
+        // 空库 → 空 map
+        let s2 = open_mem();
+        assert!(s2.last_restart_map().is_empty());
     }
 
     #[test]
