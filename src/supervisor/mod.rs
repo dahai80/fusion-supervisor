@@ -1751,6 +1751,12 @@ mod tests {
     // issue #31: up_one/down_one — service 级操作只动目标服务
     #[tokio::test]
     async fn test_up_one_down_one_single_service() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
             def("fusion-rag", Layer::App, 11436),
@@ -1867,6 +1873,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_up_all_starts_unhealthy_in_layer_order() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         // 全不健康 → 按 layer 序起, 记录顺序
         let defs = vec![
             def("fusion-rag", Layer::App, 11436),
@@ -2210,6 +2222,12 @@ mod tests {
     // up_all: compose 启用时顺序 = sidecar → native → business
     #[tokio::test]
     async fn test_up_all_compose_order_sidecar_native_business() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
             def("fusion-rag", Layer::Platform, 11436),
@@ -2409,6 +2427,12 @@ mod tests {
     // dep_gate: compose 启用且依赖容器 Healthy → native 服务正常起
     #[tokio::test]
     async fn test_up_native_gates_on_sidecar_healthy() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
             def("fusion-rag", Layer::Platform, 11436), // 依赖 qdrant
@@ -2488,6 +2512,12 @@ mod tests {
     // dep_gate: compose 未启用 → 无门, 所有 native 正常起
     #[tokio::test]
     async fn test_up_native_no_gate_when_compose_disabled() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
             def("fusion-rag", Layer::Platform, 11436), // 若有门会被拦 (无 qdrant 容器)
@@ -2740,6 +2770,12 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_up_native_injects_env_when_compose_disabled() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let env_f = tempfile::NamedTempFile::new().unwrap();
@@ -3152,6 +3188,12 @@ mod tests {
     // up_boot_set 只拉 T0 + pin=auto — T1/T2 无 pin 不参与
     #[tokio::test]
     async fn test_up_boot_set_only_t0_and_pin_auto() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0),
             def_tier("fusion-gateway", Layer::Core, 11432, BootTier::T0),
@@ -3192,6 +3234,12 @@ mod tests {
     // boot_group T1 up: 部分失败汇总正确
     #[tokio::test]
     async fn test_boot_group_t1_up_partial_summary() {
+        // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
+        // managed service, so the up path resolves it fail-closed. CI runners have
+        // no ~/fusion/fusion-gateway/config.yaml fallback (local dev does), which
+        // made these tests environment-dependent. Same fix as the trainer-bridge
+        // tests in env_map.rs.
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1),
             def_tier("fusion-cowork", Layer::App, 11460, BootTier::T1),

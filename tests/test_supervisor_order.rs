@@ -19,6 +19,13 @@ fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
 
 #[tokio::test]
 async fn test_up_order_core_before_app() {
+    // Pin FUSION_CLIENT_KEY: the up path resolves it fail-closed for every
+    // managed service (issue #85 inversion). CI runners have no gateway config
+    // fallback, so fusion-rag's start would be refused before the start fn is
+    // called. Same fix as the env_map / supervisor unit tests.
+    let prev_key = std::env::var("FUSION_CLIENT_KEY").ok();
+    // SAFETY: single-threaded current_thread tokio test; no concurrent env readers
+    unsafe { std::env::set_var("FUSION_CLIENT_KEY", "ck-order-test") };
     let defs = vec![
         def("fusion-rag", Layer::App, 11436),
         def("fusion-mlx", Layer::Core, 11434),
@@ -45,4 +52,9 @@ async fn test_up_order_core_before_app() {
     let seq = order.lock().unwrap();
     assert_eq!(seq[0], "fusion-mlx");
     assert_eq!(seq[1], "fusion-rag");
+    drop(seq);
+    match prev_key {
+        Some(v) => unsafe { std::env::set_var("FUSION_CLIENT_KEY", v) },
+        None => unsafe { std::env::remove_var("FUSION_CLIENT_KEY") },
+    }
 }
