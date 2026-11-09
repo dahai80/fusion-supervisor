@@ -760,6 +760,13 @@ pub(crate) mod tests {
     fn test_shell_env_bridge_key_fail_closed() {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
+        // issue #85 inverts FUSION_CLIENT_KEY injection onto every managed
+        // service, trainer-bridge included. Without an explicit value the
+        // resolve chain falls through to the gateway config file, which does
+        // not exist on CI runners — the resulting Err names FUSION_CLIENT_KEY,
+        // not the key this test is about. Pin it so the only missing required
+        // var is FUSION_TRAINER_BRIDGE_KEY.
+        let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-bridge-fail-closed");
         let f = env_file("");
         let r = shell_env_for("fusion-trainer-bridge", f.path());
         assert!(r.is_err(), "bridge key 缺失应 fail-closed");
@@ -775,6 +782,11 @@ pub(crate) mod tests {
     fn test_shell_env_bridge_key_from_file() {
         let _g = env_lock().lock().unwrap();
         unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
+        // Same #85 reason as test_shell_env_bridge_key_fail_closed: without a
+        // pinned FUSION_CLIENT_KEY the gateway-config fallback fails first on
+        // CI (no config file) and shell_env_for errs before reaching the
+        // trainer key.
+        let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-bridge-from-file");
         let f = env_file("FUSION_TRAINER_BRIDGE_KEY=bridge-k\n");
         let env = shell_env_for("fusion-trainer-bridge", f.path()).unwrap();
         assert_eq!(env.get("FUSION_TRAINER_BRIDGE_KEY").unwrap(), "bridge-k");
