@@ -327,15 +327,34 @@ impl BackupRunner {
             "compose"
         };
         // 1. Postgres: pg_dumpall → gzip
+        // #117: 先写 .sql.gz.tmp, 成功后原子 rename — daemon 中途被杀 (SIGTERM/
+        // SIGKILL) 只留 tmp 残片, 最终名永远对应完整 gzip (旧实现直接写最终名,
+        // 2026-11-09 daemon 死在 dump 中段留 157MB 无 footer 假备份实证)。
+        // tmp 名不以 .sql.gz 结尾 → prune_old 过滤器天然跳过。
         let pg_path = target.join(format!("fusion-pg-{date}.sql.gz"));
+        let pg_tmp = target.join(format!("fusion-pg-{date}.sql.gz.tmp"));
+        let _ = std::fs::remove_file(&pg_tmp);
         let pg_started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(now_ts);
         let pg_res = if self.plane_native {
-            self.pg_dump_native(&pg_path)
+            self.pg_dump_native(&pg_tmp)
         } else {
-            self.pg_dump(&pg_path)
+            self.pg_dump(&pg_tmp)
+        };
+        let pg_res = match pg_res {
+            Ok(n) => {
+                if let Err(e) = std::fs::rename(&pg_tmp, &pg_path) {
+                    Err(anyhow::anyhow!(e).context("backup tmp rename 失败"))
+                } else {
+                    Ok(n)
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&pg_tmp);
+                Err(e)
+            }
         };
         // issue #115: dur 用真实时钟 (旧实现拿注入 now_ts 相减恒 0, 事件假象)
         let pg_dur = std::time::SystemTime::now()
@@ -799,6 +818,36 @@ mod tests {
         // qdrant 目录存在
         let qd_dir = target.join("fusion-qdrant-20260903");
         assert!(qd_dir.exists(), "qdrant 备份目录应存在");
+    }
+
+    // test_dump_tmp_removed_on_failure: dump 中途死掉 (daemon 被杀同类) →
+    // 最终名不存在 + tmp 残片已清, 无假完整备份 (#117)。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_dump_tmp_removed_on_failure() {
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().to_path_buf();
+        let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
+        let dump_fn: DumpFn = Arc::new(move |_bin: &str, _args: &[&str], out: &Path| {
+            std::fs::write(out, b"partial garbage no gzip footer")?;
+            bail!("killed mid-dump")
+        });
+        let mut runner =
+            BackupRunner::new_with_exec(fake_exec(Vec::new()), Some(target.clone()), 7)
+                .with_dump_fn(dump_fn);
+        let res = runner.run(1000, &store, &mut alerter).await;
+        assert!(res.is_err(), "dump 失败应 bail");
+        assert!(
+            !target.join("fusion-pg-20260903.sql.gz").exists(),
+            "失败后最终名不得存在 (假完整备份)"
+        );
+        assert!(
+            !target.join("fusion-pg-20260903.sql.gz.tmp").exists(),
+            "失败后 tmp 残片应清理"
+        );
     }
 
     // test_backup_fail_closed_no_target: FUSION_BACKUP_TARGET 未设 → 拒绝 + 告警。
