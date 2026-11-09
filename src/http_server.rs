@@ -28,6 +28,13 @@ const MAX_REQUEST_BYTES: usize = 8192;
 
 pub type SharedShutdownTx = Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
 
+// issue #114: bind 提前到 run_daemon 入口 — bind 失败 = fatal, 不再 faceless 空转。
+pub async fn bind_tcp(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(addr, "http server listening (metrics + status + web)");
+    Ok(listener)
+}
+
 pub async fn serve(
     core: Arc<tokio::sync::Mutex<SupervisorCore>>,
     addr: &str,
@@ -35,8 +42,17 @@ pub async fn serve(
     web_dir: Option<String>,
     shutdown_tx: SharedShutdownTx,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(addr, "http server listening (metrics + status + web)");
+    let listener = bind_tcp(addr).await?;
+    serve_on(core, listener, token, web_dir, shutdown_tx).await
+}
+
+pub async fn serve_on(
+    core: Arc<tokio::sync::Mutex<SupervisorCore>>,
+    listener: tokio::net::TcpListener,
+    token: Option<String>,
+    web_dir: Option<String>,
+    shutdown_tx: SharedShutdownTx,
+) -> anyhow::Result<()> {
     let web_dir = web_dir.map(PathBuf::from);
     loop {
         match listener.accept().await {

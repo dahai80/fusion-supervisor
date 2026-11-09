@@ -65,7 +65,8 @@ pub struct SupervisorCore {
     // compose 容器告警节流 (issue #6): 防 flapping 容器每 tick 刷告警。
     compose_tracker: crate::compose_tracker::ComposeTracker,
     // issue #10: 上次备份时间戳 (调度判定用)。0=从未备份 → 首次 tick 即到期。
-    last_backup_ts: u64,
+    // pub: #113 detached 语义的集成测试直接断言 (tests/test_backup_detach.rs)。
+    pub last_backup_ts: u64,
     // issue #103: 备份目标从未配置的一次性 WARN 锁存 (调度路径静默, 不逐 tick 刷)。
     backup_disabled_notified: bool,
     // issue #37: 上次 retention sweep 时间戳 (调度判定用, 语义同 last_backup_ts)。
@@ -136,6 +137,8 @@ impl SupervisorCore {
             cfg.alert_dedup_sec,
             cfg.container_crash_escalation,
         );
+        // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+        let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
         Ok(Self {
             runners,
             store,
@@ -145,7 +148,8 @@ impl SupervisorCore {
             probe_fn: Arc::new(real_probe_spec),
             compose,
             compose_tracker,
-            last_backup_ts: 0,
+            // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+            last_backup_ts,
             backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
@@ -210,6 +214,8 @@ impl SupervisorCore {
             cfg.alert_dedup_sec,
             cfg.container_crash_escalation,
         );
+        // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+        let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
         Self {
             runners,
             store,
@@ -219,7 +225,8 @@ impl SupervisorCore {
             probe_fn,
             compose,
             compose_tracker,
-            last_backup_ts: 0,
+            // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+            last_backup_ts,
             backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
@@ -1160,21 +1167,28 @@ impl SupervisorCore {
     }
 
     // issue #10: 执行一次备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
-    // BackupRunner 借用 self.store / self.alerter (避免 Clone Connection)。
-    // 记录 last_backup_ts 供调度。
-    pub async fn run_backup(&mut self, now_ts: u64) -> Result<()> {
-        tracing::info!("backup 开始 (issue #10)");
-        let mut runner = crate::backup::BackupRunner::new(&self.cfg);
-        // 分裂借用: store/alerter/cfg 独立字段, 可同时 &mut runner + &mut self.store + &mut self.alerter
-        let res = runner.run(now_ts, &self.store, &mut self.alerter).await;
-        if res.is_ok() {
-            self.last_backup_ts = now_ts;
-        }
-        res
+    // issue #113: 改为 detached task — 旧实现持核心 Mutex await 全程
+    // (2GB dump ~15min), 期间 /api/v1/status /metrics /up 全部无响应
+    // (HTTP_STILL_BUSY 实证 2026-11-09)。BackupRunner 在锁内构造 (便宜),
+    // 运行移交 spawn; last_backup_ts 立即推进 + 持久化 (旧语义: 失败也推进,
+    // 防重试风暴), 失败由 BackupFailed 告警兜底。
+    pub fn spawn_backup(&mut self, now_ts: u64) {
+        tracing::info!("backup 开始 (issue #10, detached)");
+        let runner = crate::backup::BackupRunner::new(&self.cfg);
+        spawn_backup_task(
+            runner,
+            self.store.clone(),
+            self.cfg.alert_dedup_sec,
+            self.cfg.alert_url.clone(),
+            now_ts,
+        );
+        self.last_backup_ts = now_ts;
+        self.store.set_meta("last_backup_ts", now_ts);
     }
 
     // issue #10: 调度检查。到期 (now >= last + schedule) → 触发 backup。
     // 在 daemon tick 循环内调用。返回是否触发了备份。
+    // issue #113: 触发改走 spawn_backup (detached, 不持锁)。
     pub async fn check_backup_schedule(&mut self, now_ts: u64) -> bool {
         if !crate::backup::backup_due(now_ts, self.last_backup_ts, self.cfg.backup_schedule_sec) {
             return false;
@@ -1183,7 +1197,7 @@ impl SupervisorCore {
         // optional feature, not a failure. One WARN (latched), then silence —
         // no per-cycle ERROR spam, no BackupFailed alert (nothing attempted).
         // Manual `fusion-sv backup` / RPC backup with no target still fails
-        // loudly inside run_backup (operator explicitly asked for it).
+        // loudly in the spawned task (operator explicitly asked for it).
         if crate::backup::resolve_target().is_none() {
             if !self.backup_disabled_notified {
                 tracing::warn!(
@@ -1199,18 +1213,8 @@ impl SupervisorCore {
             schedule = self.cfg.backup_schedule_sec,
             "backup 调度到期, 触发"
         );
-        match self.run_backup(now_ts).await {
-            Ok(()) => {
-                tracing::info!("调度备份完成");
-                true
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "调度备份失败 (fail-closed 已告警)");
-                // 失败也更新时间戳, 避免下个 tick 立即重试风暴
-                self.last_backup_ts = now_ts;
-                true
-            }
-        }
+        self.spawn_backup(now_ts);
+        true
     }
     // issue #37: history.db retention sweep 调度 (语义同 backup 调度)。
     // 到期执行 cleanup_old (health_check + event 两表按 history_retention_days 裁剪)。
@@ -1240,6 +1244,26 @@ impl SupervisorCore {
         self.last_prune_ts = now_ts;
         true
     }
+}
+
+// issue #113: 备份任务 detached 执行 — 核心锁内只构造 runner (便宜),
+// 运行移交 tokio::spawn; BackupFailed 不去抖 → 独立 Alerter 状态安全。
+// store Arc 共享 (HistoryStore: Sync), 事件落库走同一 sink。
+fn spawn_backup_task(
+    mut runner: crate::backup::BackupRunner,
+    store: Arc<HistoryStore>,
+    alert_dedup_sec: u64,
+    alert_url: String,
+    now_ts: u64,
+) {
+    tokio::spawn(async move {
+        let mut alerter = crate::alert::Alerter::new(alert_dedup_sec, alert_url)
+            .with_event_sink(make_event_sink(store.clone()));
+        match runner.run(now_ts, &store, &mut alerter).await {
+            Ok(()) => tracing::info!("backup 完成 (detached)"),
+            Err(e) => tracing::error!(err = %e, "backup 失败 (fail-closed 已告警)"),
+        }
+    });
 }
 
 // issue #37: Alerter 事件落库 sink — 每次真实发出的告警 (去抖通过) 写 event 表。

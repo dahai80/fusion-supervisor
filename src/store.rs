@@ -83,6 +83,11 @@ impl HistoryStore {
                  service TEXT PRIMARY KEY,
                  mode TEXT NOT NULL
              );
+             -- issue #113: 跨重启持久化调度元数据 (last_backup_ts 等), 防 reload 重触发。
+             CREATE TABLE IF NOT EXISTS meta (
+                 key TEXT PRIMARY KEY,
+                 value INTEGER NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_health_svc ON health_check(service, ts);
              CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
         )?;
@@ -95,6 +100,34 @@ impl HistoryStore {
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
         })
+    }
+
+    // issue #113: meta 读写 — daemon 重启后恢复 last_backup_ts 等调度游标。
+    pub fn get_meta(&self, key: &str) -> Option<u64> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => Some(v.max(0) as u64),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(key, err = %e, "meta read failed");
+                None
+            }
+        }
+    }
+
+    pub fn set_meta(&self, key: &str, value: u64) {
+        let res = self.conn.lock().unwrap().execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value as i64],
+        );
+        if let Err(e) = res {
+            tracing::warn!(key, err = %e, "meta write failed");
+        }
     }
 
     pub fn record_health(
@@ -355,6 +388,25 @@ mod tests {
         // 空库 → 空 map
         let s2 = open_mem();
         assert!(s2.last_restart_map().is_empty());
+    }
+
+    // issue #113: meta 读写 + 重开库持久化 — reload 恢复 last_backup_ts 不重触发备份
+    #[test]
+    fn test_meta_roundtrip_and_persist() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let s = HistoryStore::open(tmp.path()).unwrap();
+        assert_eq!(s.get_meta("last_backup_ts"), None);
+        s.set_meta("last_backup_ts", 123456);
+        assert_eq!(s.get_meta("last_backup_ts"), Some(123456));
+        // 覆盖写
+        s.set_meta("last_backup_ts", 234567);
+        assert_eq!(s.get_meta("last_backup_ts"), Some(234567));
+        // 重开 (同一文件) → 值仍在
+        drop(s);
+        let s2 = HistoryStore::open(tmp.path()).unwrap();
+        assert_eq!(s2.get_meta("last_backup_ts"), Some(234567));
+        // 无关 key 不串
+        assert_eq!(s2.get_meta("other"), None);
     }
 
     #[test]

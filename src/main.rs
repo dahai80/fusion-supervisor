@@ -88,8 +88,54 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+// issue #114: 单实例守卫 — 文件锁持有到进程退出 (flock, 内核在退出时释放,
+// 崩溃无残留)。锁文件路径 ~/.fusion-sv/daemon.lock。
+// 双 daemon 并跑 = 双份 tick/备份/告警 (2026-11-09 实证: 孤儿 daemon 覆写当日备份)。
+fn acquire_daemon_lock() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // FUSION_SV_LOCK_PATH 覆盖锁路径 (测试隔离, 不碰真实 daemon.lock)
+    let path = match std::env::var("FUSION_SV_LOCK_PATH") {
+        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").ok()?;
+            let dir = std::path::Path::new(&home).join(".fusion-sv");
+            if !dir.exists() {
+                std::fs::create_dir_all(&dir).ok();
+            }
+            dir.join("daemon.lock")
+        }
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| {
+            tracing::error!(path = %path.display(), err = %e, "daemon lock file create fail");
+            e
+        })
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "daemon instance lock acquired");
+            Some(file)
+        }
+        Err(e) => {
+            tracing::error!(path = %path.display(), err = %e, "another fusion-sv daemon already holds the instance lock");
+            None
+        }
+    }
+}
+
 async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     tracing::info!("fusion-sv daemon starting");
+    // issue #114: 守卫先于一切 — 拿不到锁直接退出 (launchd KeepAlive 会重试,
+    // 但持有方活着时重试也会持续失败, 静默双跑不可能再发生)。
+    let _daemon_lock = match acquire_daemon_lock() {
+        Some(f) => f,
+        None => anyhow::bail!("fusion-sv daemon already running (instance lock held)"),
+    };
     // issue #80: launchd 默认 PATH 不含 Homebrew bin — node/brew 系 start.sh 在
     // daemon 拉起时 `command -v node` 全挂。启动时把 native_extra_path 中缺失的
     // 项追加到 daemon 自身 PATH 尾部; 所有子进程 (exec_bash_script /
@@ -120,6 +166,19 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     }
     // issue #102: absent registry degrades to an empty managed set (one WARN
     // inside load_or_empty) — never blocks boot on the minimal-download profile.
+    // issue #114: bind 面先行 — UDS/HTTP bind 失败 = fatal (exit 1), 不再
+    // faceless 空转 tick (旧路径 serve task 内 bind 失败只记日志, daemon 假活,
+    // 与持锁 daemon 并跑形成双份监督)。
+    let uds_listener = rpc::server::bind_uds(&cfg.socket_path)
+        .map_err(|e| anyhow::anyhow!("uds bind fail (fatal) {}: {e}", cfg.socket_path))?;
+    let tcp_listener = match &cfg.metrics_addr {
+        Some(addr) => Some(
+            fusion_supervisor::http_server::bind_tcp(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("http bind fail (fatal) {addr}: {e}"))?,
+        ),
+        None => None,
+    };
     let defs = manifest::load_or_empty(&cfg.registry_path);
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
     let mut core = core;
@@ -130,15 +189,16 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let core = Arc::new(tokio::sync::Mutex::new(core));
     let token = std::env::var("FUSION_SV_TOKEN").ok();
     let core_rpc = core.clone();
-    let socket_path = cfg.socket_path.clone();
     // issue #20: shutdown 信号通道 (RPC Shutdown → run_daemon select 退出)。
     // issue #25: 共享 Arc — UDS 与 HTTP 两个面同一信号。
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_shared = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let shutdown_for_rpc = shutdown_shared.clone();
     tokio::spawn(async move {
+        // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
         if let Err(e) =
-            rpc::server::serve_with_shutdown(core_rpc, &socket_path, token, shutdown_for_rpc).await
+            rpc::server::serve_with_shutdown_on(core_rpc, uds_listener, token, shutdown_for_rpc)
+                .await
         {
             tracing::error!(err = %e, "rpc serve exit");
         }
@@ -182,7 +242,7 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             let tick_round = tokio::spawn(async move {
                 let mut c = core_inner.lock().await;
                 c.tick_all(now).await;
-                // issue #10: 备份调度检查 (到期触发 run_backup, fail-closed 已告警)
+                // issue #10/#113: 备份调度检查 (到期触发 spawn_backup, fail-closed 已告警)
                 c.check_backup_schedule(now).await;
                 // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
                 c.check_retention(now);
@@ -194,16 +254,16 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     });
     // issue #22/#26/#25: HTTP 面 (metrics + 只读 status/history/events + web
     // 静态控制台 + token 校验编排操作), 第三个 spawn task, 共享 core.clone()。
-    let http_handle = if let Some(addr) = &cfg.metrics_addr {
+    // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
+    let http_handle = if let Some(listener) = tcp_listener {
         let core_http = core.clone();
-        let addr = addr.clone();
         let token_http = std::env::var("FUSION_SV_TOKEN").ok();
         let web_dir = cfg.web_dir.clone();
         let shutdown_for_http = shutdown_shared.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = fusion_supervisor::http_server::serve(
+            if let Err(e) = fusion_supervisor::http_server::serve_on(
                 core_http,
-                &addr,
+                listener,
                 token_http,
                 web_dir,
                 shutdown_for_http,
@@ -386,5 +446,32 @@ async fn cli_ping(cfg: Config) -> anyhow::Result<()> {
             cli::print_error(&format!("{e}"));
             std::process::exit(1);
         }
+    }
+}
+
+// issue #114: 单实例守卫可测性 — FUSION_SV_LOCK_PATH 指向临时文件,
+// 不碰真实 ~/.fusion-sv/daemon.lock (生产 daemon 可能正持有)。
+#[cfg(test)]
+mod daemon_lock_tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_lock_exclusive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test-daemon.lock");
+        // SAFETY: 测试进程单线程使用该 env, 且本 mod 是 main.rs 唯一 env 测试
+        unsafe { std::env::set_var("FUSION_SV_LOCK_PATH", &lock_path) };
+        let f1 = acquire_daemon_lock().expect("first acquire should succeed");
+        assert!(
+            acquire_daemon_lock().is_none(),
+            "second acquire must fail (lock held)"
+        );
+        drop(f1);
+        // flock 随 fd 释放 → 可再获取
+        assert!(
+            acquire_daemon_lock().is_some(),
+            "release then reacquire should succeed"
+        );
+        unsafe { std::env::remove_var("FUSION_SV_LOCK_PATH") };
     }
 }

@@ -29,6 +29,18 @@ pub type NativeExecFn = Arc<dyn Fn(&str, &[&str]) -> Result<Vec<u8>> + Send + Sy
 // 测试=fake 直接写 gzip。
 pub type DumpFn = Arc<dyn Fn(&str, &[&str], &Path) -> Result<u64> + Send + Sync>;
 
+// dump stderr 文件尾读取 (失败消息携带根因, 最多 lines 行)。
+fn read_file_tail(path: &Path, lines: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let v: Vec<&str> = s.lines().collect();
+            let start = v.len().saturating_sub(lines);
+            v[start..].join(" | ")
+        }
+        Err(_) => "(stderr log unreadable)".to_string(),
+    }
+}
+
 // 生产 dump 流式执行: spawn bin, stdout 逐块 gzip → out_path, stderr 收满尾。
 // FUSION_PG_PASSWORD 设置时注入 PGPASSWORD (与 real_native_exec 同语义)。
 // 失败语义: spawn 失败 / 退出码非 0 → bail (fail-closed 由 run() 告警)。
@@ -36,10 +48,21 @@ pub fn real_dump_fn() -> DumpFn {
     Arc::new(|bin: &str, args: &[&str], out_path: &Path| {
         tracing::info!(bin, args = ?args, out = %out_path.display(), "exec dump (stream)");
         let mut cmd = std::process::Command::new(bin);
+        // stderr 落文件而非 inherit — launchd 下 inherit 的输出不进任何日志,
+        // exit 1 无从定位 (2026-11-09 实证: PG 侧 cancel 后只见 exit Some(1))。
+        // 文件直写无 pipe 满阻塞风险。
+        let err_path = out_path.with_file_name(format!(
+            "{}.stderr.log",
+            out_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let err_file = std::fs::File::create(&err_path)
+            .with_context(|| format!("create dump stderr log {}", err_path.display()))?;
+        let err_for_child = err_file
+            .try_clone()
+            .with_context(|| format!("clone dump stderr handle {}", err_path.display()))?;
         cmd.args(args)
             .stdout(std::process::Stdio::piped())
-            // stderr 走 inherit (daemon 日志面) — pipe 不读会满阻塞子进程
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::from(err_for_child));
         if let Ok(pw) = std::env::var("FUSION_PG_PASSWORD")
             && !pw.is_empty()
         {
@@ -60,7 +83,9 @@ pub fn real_dump_fn() -> DumpFn {
         enc.finish().with_context(|| format!("gzip finish {bin}"))?;
         let out = child.wait().with_context(|| format!("wait {bin}"))?;
         if !out.success() {
-            bail!("{bin} 失败: exit {:?}", out.code());
+            // 失败时把 stderr 尾部带进错误 (告警/event 可见根因)
+            let tail = read_file_tail(&err_path, 20);
+            bail!("{bin} 失败: exit {:?}, stderr tail: {}", out.code(), tail);
         }
         Ok(n)
     })
@@ -294,7 +319,8 @@ impl BackupRunner {
             emit_alert(alerter, format!("backup target mkdir fail: {e}")).await;
             bail!("backup target mkdir fail: {e}");
         }
-        let date = date_stamp();
+        // issue #113: 带时分秒的 run_stamp — 同日多次备份不覆写
+        let date = run_stamp();
         let plane = if self.plane_native {
             "native"
         } else {
@@ -611,6 +637,29 @@ fn date_stamp() -> String {
     format!("d{day}")
 }
 
+// issue #113: 文件名时间戳 — env 覆盖时原样返回 (测试确定性), 生产加 UTC 时分秒后缀,
+// 同日多次备份不再原地覆写 (d20766 被孤儿 daemon 覆写成 85MB 残缺实证 2026-11-09)。
+fn run_stamp() -> String {
+    let date = date_stamp();
+    if std::env::var("FUSION_BACKUP_DATE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return date;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hhmmss = format!(
+        "{:02}{:02}{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    );
+    format!("{date}-{hhmmss}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +702,51 @@ mod tests {
         Arc::new(move |_bin: &str, _args: &[&str], _out: &Path| bail!("{}", msg))
     }
 
+    // issue #113: env 覆盖 → run_stamp 原样返回 (测试确定性不破)
+    #[test]
+    fn test_run_stamp_env_override_verbatim() {
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
+        assert_eq!(run_stamp(), "20260903");
+    }
+
+    // issue #113: 无覆盖 → date-hhmmss 后缀, 同日多次备份不覆写
+    #[test]
+    fn test_run_stamp_time_suffix_when_no_env() {
+        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _d = EnvGuard::remove("FUSION_BACKUP_DATE");
+        let s = run_stamp();
+        let (date, tail) = s.rsplit_once('-').expect("stamp 应为 date-hhmmss 形态");
+        assert_eq!(date, date_stamp(), "前缀应与 date_stamp 一致: {s}");
+        assert_eq!(tail.len(), 6, "hhmmss 6 位: {s}");
+        assert!(
+            tail.chars().all(|c| c.is_ascii_digit()),
+            "hhmmss 全数字: {s}"
+        );
+    }
+
+    // issue #113: prune 兼容带时分秒的 stamp (词序排序 + qdrant 配对)
+    #[test]
+    fn test_prune_keeps_stamped_names() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        for name in [
+            "fusion-pg-d20766-101500.sql.gz",
+            "fusion-pg-d20766-153000.sql.gz",
+            "fusion-pg-d20765.sql.gz",
+        ] {
+            std::fs::File::create(target.join(name)).unwrap();
+        }
+        let native: NativeExecFn =
+            Arc::new(|_bin: &str, _args: &[&str]| bail!("docker not installed"));
+        let runner = BackupRunner::new_native_with_exec(native, Some(target.to_path_buf()), 1);
+        runner.prune_old(target).unwrap();
+        // 保留最新 1 份 (153000), 其余删除
+        assert!(target.join("fusion-pg-d20766-153000.sql.gz").exists());
+        assert!(!target.join("fusion-pg-d20766-101500.sql.gz").exists());
+        assert!(!target.join("fusion-pg-d20765.sql.gz").exists());
+    }
+
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
@@ -689,8 +783,8 @@ mod tests {
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
-        let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
         let mut runner = BackupRunner::new_with_exec(
             fake_exec(b"-- pg dump content --".to_vec()),
             Some(target.clone()),
@@ -717,8 +811,8 @@ mod tests {
         let _g0 = crate::env_map::tests::env_lock().lock().unwrap();
         let _g1 = EnvGuard::remove("FUSION_BACKUP_TARGET");
         let _g2 = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
-        let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
         let mut runner = BackupRunner::new_with_exec(
             fake_exec(b"dump".to_vec()),
             None, // 无 target
@@ -786,8 +880,8 @@ mod tests {
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
-        let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
         // native exec: docker → Err (本机无 docker); dump 流式走 fake dump_fn
         let native: NativeExecFn =
             Arc::new(|_bin: &str, _args: &[&str]| bail!("docker not installed"));
@@ -828,8 +922,8 @@ mod tests {
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
-        let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
         let native: NativeExecFn =
             Arc::new(|_bin: &str, _args: &[&str]| bail!("pg_dumpall: command not found"));
         let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
@@ -853,8 +947,8 @@ mod tests {
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
-        let store = mem_store();
         let mut alerter = Alerter::new(0, String::new());
+        let store = mem_store();
         let native: NativeExecFn = Arc::new(|bin: &str, args: &[&str]| {
             if bin == "pg_dumpall" {
                 Ok(b"dump".to_vec())

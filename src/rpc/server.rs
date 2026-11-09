@@ -22,19 +22,35 @@ pub async fn serve(
 
 // 带 shutdown tx 的 serve: Shutdown arm 发送信号, run_daemon 监听 rx。
 // issue #25: tx 改为共享 Arc — HTTP 面 (http_server) 与 UDS 面共用同一信号。
-pub async fn serve_with_shutdown(
-    core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
-    socket_path: &str,
-    token: Option<String>,
-    shutdown_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-) -> Result<()> {
+// issue #114: bind 提前到 run_daemon 入口 — bind 失败 = fatal (exit 1,
+// launchd KeepAlive 重试), 不再 faceless 空转 tick (孤儿 daemon 并跑实证)。
+pub fn bind_uds(socket_path: &str) -> Result<UnixListener> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     std::fs::set_permissions(
         socket_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
-    tracing::info!(sock = %socket_path, "rpc server listening (0600)");
+    Ok(listener)
+}
+
+pub async fn serve_with_shutdown(
+    core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
+    socket_path: &str,
+    token: Option<String>,
+    shutdown_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> Result<()> {
+    let listener = bind_uds(socket_path)?;
+    serve_with_shutdown_on(core, listener, token, shutdown_tx).await
+}
+
+pub async fn serve_with_shutdown_on(
+    core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
+    listener: UnixListener,
+    token: Option<String>,
+    shutdown_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> Result<()> {
+    tracing::info!("rpc server listening (0600)");
     loop {
         let (stream, _) = listener.accept().await?;
         let core = core.clone();
@@ -313,22 +329,17 @@ async fn dispatch(
         }
         Some(Method::Backup) => {
             // issue #10: 一次性备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
-            // fail-closed: target 未设 → Err + BackupFailed 告警。
+            // issue #113: 改 fire-and-forget — 旧同步实现持锁 ~15min, RPC 客户端
+            // 超时且全 API 无响应。启动 detached 任务立即返回; 结果走 event 表
+            // + 告警 (BackupFailed), 完成走 INFO 日志。
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let mut c = core.lock().await;
-            match c.run_backup(now_ts).await {
-                Ok(()) => {
-                    tracing::info!("backup ok (rpc)");
-                    make_result(json!("ok"), req.id)
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, "backup fail (rpc, fail-closed 已告警)");
-                    make_error(-32000, &format!("backup fail: {e}"), req.id)
-                }
-            }
+            c.spawn_backup(now_ts);
+            tracing::info!("backup started (rpc, detached)");
+            make_result(json!({"ok": true, "started": true}), req.id)
         }
         // PRD app-tiering (issue #62): boot 分级启动面
         Some(Method::Boot) => {
