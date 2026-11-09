@@ -139,6 +139,8 @@ pub fn render_status_json(core: &SupervisorCore) -> String {
         .map(|e| {
             serde_json::json!({
                 "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
+                // issue #112: 最近一次 restart 类事件 (与 UDS status 镜像一致)
+                "last_restart": e.last_restart,
             })
         })
         .collect();

@@ -93,6 +93,8 @@ async fn dispatch(
                 .map(|e| {
                     json!({
                         "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
+                        // issue #112: 最近一次 restart 类事件 (CLI status 表列)
+                        "last_restart": e.last_restart,
                     })
                 })
                 .collect();
