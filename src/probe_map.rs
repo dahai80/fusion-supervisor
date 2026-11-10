@@ -121,6 +121,12 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     // issue #81: office-api 自带健康口 (上游 start.sh 启动后同 curl 验证,
     // services/office-api, :11492)
     m.insert("fusion-office-api", ProbeSpec::http(11492, "/healthz"));
+    // issue #120: fusion-desigma GUI 桌面应用 — 无 HTTP/TCP 面,
+    // 存活 = start.sh 自管 pidfile (.fusion-desigma.pid) 里的进程还活着
+    m.insert(
+        "fusion-desigma",
+        ProbeSpec::pidfile("fusion-desigma/.fusion-desigma.pid"),
+    );
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -296,6 +302,20 @@ mod tests {
         assert!(matches!(s.kind, ProbeKind::Http), "office-api 应 HTTP 探活");
         assert_eq!(s.path.as_deref(), Some("/healthz"));
         assert_eq!(restart_cmd_for("fusion-office-api"), "stop+start");
+    }
+
+    // issue #120: desigma GUI 应用 PidFile 探活 (无 HTTP/TCP 面)
+    #[test]
+    fn test_issue120_desigma_pidfile_probe() {
+        let s = probe_spec_for("fusion-desigma", 0);
+        assert!(
+            matches!(s.kind, ProbeKind::PidFile),
+            "desigma 应 PidFile 探活"
+        );
+        assert_eq!(
+            s.pidfile.as_deref(),
+            Some("fusion-desigma/.fusion-desigma.pid")
+        );
     }
 
     // issue #34: 探活路径对齐上游实况 — model-hub/health/finance 换真实路径,

@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-// 探活三型: HTTP GET / UDS ping / TCP 端口通。2s 超时 (对齐 fusion-cli)。
+// 探活四型: HTTP GET / UDS ping / TCP 端口通 / PidFile 进程存活。2s 超时 (对齐 fusion-cli)。
 // 防风暴: BadPath(404/405) = 路径错, 不重启; 仅 ConnectionRefused/Timeout 进重启流。
 #[derive(Debug, Clone, Copy)]
 pub enum ProbeKind {
     Http,
     Uds,
     Tcp,
+    PidFile,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,9 @@ pub struct ProbeSpec {
     pub port: u16,
     pub path: Option<String>,
     pub socket: Option<String>,
+    // issue #120: PidFile 探活 — GUI 桌面应用无 HTTP/TCP 面, 存活即进程在。
+    // 相对路径按 FUSION_ROOT 解析 (start.sh 自管 pidfile, supervisor 不持有)。
+    pub pidfile: Option<String>,
     // issue #79: 按服务覆盖探活超时。None=全局默认 2s。
     // GIL 密集型推理服务 (fusion-mlx) 高负载下 /healthz 可能 >2s 才答,
     // 2s 超时会把健康但繁忙的服务误判宕机触发重启 (杀掉 in-flight 流量)。
@@ -28,6 +32,7 @@ impl ProbeSpec {
             port,
             path: Some(path.to_string()),
             socket: None,
+            pidfile: None,
             timeout: None,
         }
     }
@@ -44,6 +49,7 @@ impl ProbeSpec {
             port: 0,
             path: None,
             socket: Some(socket.to_string()),
+            pidfile: None,
             timeout: None,
         }
     }
@@ -53,6 +59,20 @@ impl ProbeSpec {
             port,
             path: None,
             socket: None,
+            pidfile: None,
+            timeout: None,
+        }
+    }
+
+    // issue #120: GUI 桌面应用 (fusion-desigma) — 无 HTTP/TCP 面,
+    // 存活判定 = start.sh 自管 pidfile 里的进程还活着。
+    pub fn pidfile(path: &str) -> Self {
+        Self {
+            kind: ProbeKind::PidFile,
+            port: 0,
+            path: None,
+            socket: None,
+            pidfile: Some(path.to_string()),
             timeout: None,
         }
     }
@@ -112,11 +132,59 @@ pub fn classify_status(status: u16) -> ProbeResult {
     }
 }
 
+// issue #120: PidFile 探活 — 读 pidfile, kill -0 判进程存活。相对路径按
+// FUSION_ROOT 解析 (无则 CWD)。pidfile 缺失/不可读/进程死 → ProcessExit
+// (restart-eligible: GUI 应用崩了自动重拉, 熔断窗口兜底风暴)。
+async fn probe_pidfile(spec: &ProbeSpec) -> ProbeResult {
+    let raw = spec.pidfile.as_deref().unwrap_or_default();
+    let path = if raw.starts_with('/') {
+        std::path::PathBuf::from(raw)
+    } else {
+        match std::env::var("FUSION_ROOT") {
+            Ok(root) if !root.is_empty() => std::path::PathBuf::from(root).join(raw),
+            _ => std::path::PathBuf::from(raw),
+        }
+    };
+    let pid = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            tracing::debug!(pidfile = %path.display(), "pidfile probe: missing or unparseable");
+            return ProbeResult::Unhealthy {
+                reason: UnhealthyReason::ProcessExit,
+            };
+        }
+    };
+    let start = std::time::Instant::now();
+    let alive = tokio::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if alive {
+        ProbeResult::Healthy {
+            latency_ms: start.elapsed().as_millis() as u64,
+        }
+    } else {
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::ProcessExit,
+        }
+    }
+}
+
 pub async fn probe(spec: &ProbeSpec) -> ProbeResult {
     match spec.kind {
         ProbeKind::Http => probe_http(spec).await,
         ProbeKind::Uds => probe_uds(spec).await,
         ProbeKind::Tcp => probe_tcp(spec).await,
+        ProbeKind::PidFile => probe_pidfile(spec).await,
     }
 }
 
@@ -282,5 +350,49 @@ mod tests {
                 reason: UnhealthyReason::BadPath(405)
             }
         ));
+    }
+
+    // issue #120: PidFile 探活三态 — 活进程 Healthy / 死 pid ProcessExit / 无文件 ProcessExit
+    #[tokio::test]
+    async fn test_pidfile_probe_alive_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pf = tmp.path().join("x.pid");
+        std::fs::write(&pf, format!("{}", std::process::id())).unwrap();
+        let spec = ProbeSpec::pidfile(pf.to_str().unwrap());
+        assert!(matches!(probe(&spec).await, ProbeResult::Healthy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pidfile_probe_dead_process() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pf = tmp.path().join("x.pid");
+        // 拉起即退出的子进程拿一个确定已死的 pid
+        let mut child = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait();
+        std::fs::write(&pf, format!("{pid}")).unwrap();
+        let spec = ProbeSpec::pidfile(pf.to_str().unwrap());
+        match probe(&spec).await {
+            ProbeResult::Unhealthy {
+                reason: UnhealthyReason::ProcessExit,
+            } => {}
+            other => panic!("expect ProcessExit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pidfile_probe_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spec = ProbeSpec::pidfile(tmp.path().join("absent.pid").to_str().unwrap());
+        match probe(&spec).await {
+            ProbeResult::Unhealthy {
+                reason: UnhealthyReason::ProcessExit,
+            } => {}
+            other => panic!("expect ProcessExit, got {other:?}"),
+        }
     }
 }
