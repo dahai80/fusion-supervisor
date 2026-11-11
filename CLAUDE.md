@@ -190,10 +190,11 @@ React 18 + Vite 5 + TypeScript + Tailwind SPA (issue #25/#28), served by the dae
 - 4-space indentation, no docstrings, always include logging (`tracing`).
 - Tests inject fakes via `new_with_fns` / `harness` rather than spinning real services — the probe/start functions are `Arc`-ed closures. Deterministic timestamps injected as `u64` unix-sec, never `SystemTime::now()` in `RestartPolicy` logic.
 
-## Lock discipline phase 2 (issue #122/#123, v0.1.57/v0.1.58)
+## Lock discipline phase 2 (issue #122/#123, v0.1.57/v0.1.58/v0.1.59)
 
 Exec 和探活不持核心锁的边界 (2026-11-11):
 
 - **Issue #122 (v0.1.57)**: 单服务 `up_one`/`down_one`/`restart_one` 拆成 StartJob 三段协议 — `prepare_*` (锁内, 只做 dep-gate/探活跳过/env 解析/状态复位, 不 exec) → `StartJob::run()` (锁外, `tokio::time::timeout` 包 exec) → `finish_*` (重新拿锁落状态机)。RPC `up`/`down`/`restart` 单服务臂 (`src/rpc/server.rs`, UDS+HTTP 共用 dispatch) 在 prepare 与 finish 之间丢 guard — start.sh 里 go build 数分钟不再堵 `/api/v1/status`。restart 保持 #96 语义: stop exec 锁外, `stop_and_verify(name, false)` 只验证 (有界 20×250ms 探活, 持锁无长 exec — `run_stop=false` 时不再重复跑 stop 命令; rollout 路径传 `true`), start exec 锁外。**仍持锁 (phase-2 未做)**: `up_all`/`down_all` 内部循环、`rollout`、tick 崩溃恢复的 `invoke_start` (runner 状态机手术风险高, 单独评估)。
 - **Issue #123 (v0.1.58)**: `tick_all` 全程持锁 + 串行探活, 降级 fleet (N 个宕机 × 2s 超时) 把锁扣 N×2s — #122 之后 status 仍 5s+ 无响应的元凶 (睡眠唤醒后 10+ 服务 Timeout 实证)。改 `preflight_probes()`: 每 runner 注入闭包并发 `spawn_blocking`+`JoinSet` 预跑, 结果灌 `runner.cached_probe`, tick 取走 (None 回落现场探); 最坏持锁 N×2s → ~max(2s)。`probe_once` (rollout prewarm) 不吃缓存。`ProbeFn`/`StartFn` 从 Box 改 Arc (并发预跑需 clone)。
+- **Issue #122 phase-2 (v0.1.59)**: tick 崩溃恢复的 exec 也移出锁 — 到点 tick 不再 `invoke_start` 持锁 exec, 改挂 `pending_exec: Option<bool>` (true=restart verb, false=stop+start) + `pending_old_pid` + `exec_in_flight` 闸门 (in-flight 期间后续 tick 整体 stand down, 镜像旧阻塞 tick 语义防双拉)。daemon tick 循环 (`src/main.rs`): lock→`tick_all`→`collect_pending_execs`→**unlock**→`run_pending_execs` (spawn_blocking+JoinSet 并发)→re-lock→`finish_pending_execs`。测试路径 `drive(now_ts)` = tick+collect+run+finish 四步串联, 22 处测试用例从 `tick_all` 改 `drive`。实测 fleet 重启风暴期 `/api/v1/status` 15/15 次 200 (大多 <0.2s)。**仍持锁 (phase-3 候选)**: `up_all`/`down_all` 内部循环、`rollout`、boot 窗口 reconcile (~60s)。
 - 已知测试环境 flake: `tests/test_probe_http.rs` 直连真 socket + 2s 超时, 机器 load avg 80+ (多 Claude 会话并发) 时 accept 线程调度不上即 fail — 隔离跑通过, 与代码无关。
