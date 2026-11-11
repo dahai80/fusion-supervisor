@@ -19,6 +19,35 @@ use tokio::sync::Semaphore;
 pub type ArcStartFn = Arc<dyn Fn(&str, &str, &[(String, String)]) -> Result<()> + Send + Sync>;
 pub type ArcProbeFn = Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>;
 
+// issue #122: 可移交的 exec 作业 — prepare (锁内) 产出, 调用方在核心锁外 run(),
+// 再拿锁 finish。exec (start.sh / go build 等) 可达数分钟, 绝不能持锁等待。
+pub struct StartJob {
+    pub service: String,
+    pub verb: &'static str,
+    pub env: Vec<(String, String)>,
+    pub timeout: u64,
+    pub start_fn: ArcStartFn,
+}
+
+impl StartJob {
+    // 锁外执行 — 与旧内联 exec 同语义 (同步闭包 + 超时包裹)。
+    pub async fn run(&self) -> Result<()> {
+        let start_fn = self.start_fn.clone();
+        let svc = self.service.clone();
+        let verb = self.verb;
+        let env = self.env.clone();
+        let timeout = self.timeout;
+        let cmd = async move { start_fn(&svc, verb, &env) };
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(svc = %self.service, verb, "exec timeout {timeout}s");
+                anyhow::bail!("{verb} timeout {timeout}s")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusEntry {
     pub name: String,
@@ -450,7 +479,22 @@ impl SupervisorCore {
     // issue #31: 单服务 up/down。RPC up/down 的 service 参数此前被忽略 —
     // `fusion-sv down <svc>` 实际跑 down_all 全停, 与 CLI 文档 `down [svc]` 不符且危险。
     // 语义与 up_native/down_native 单条目一致: 探活跳过已健康 / env 注入 fail-closed / 状态机同款。
+    // issue #122: exec 移出核心锁。RPC 单服务 up/down/restart 期间 (start.sh
+    // 里 go build 链接可达数分钟) 曾持锁阻塞全部 RPC/HTTP (2026-11-11 实证)。
+    // 协议: prepare (锁内, 无 exec) → StartJob::run (锁外) → finish (锁内)。
+
     pub async fn up_one(&mut self, name: &str) -> Result<()> {
+        match self.prepare_up_one(name).await? {
+            None => Ok(()),
+            Some(job) => {
+                let res = job.run().await;
+                self.finish_up_one(name, res).await
+            }
+        }
+    }
+
+    // 阶段 1 (锁内): 依赖门 + 探活跳过 + env 解析, 不 exec。None = 已健康跳过。
+    pub async fn prepare_up_one(&mut self, name: &str) -> Result<Option<StartJob>> {
         let d = self
             .runners
             .iter()
@@ -471,7 +515,7 @@ impl SupervisorCore {
                 r.state = runner::State::Healthy;
             }
             tracing::info!(svc = %d.name, "skip start (already up)");
-            return Ok(());
+            return Ok(None);
         }
         // env 注入: shell 注册 + sidecar 连接, 均不 gate 在 compose 开关上
         // (issue #78: 默认 off 时也要注入, 否则 cowork 静默跑 SQLite), 均 fail-closed
@@ -493,29 +537,30 @@ impl SupervisorCore {
             env_overrides.extend(m);
         }
         tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start (single)");
-        let start_fn = self.start_fn.clone();
-        let timeout = self.cfg.start_timeout_sec;
-        let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
-        let res = tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await;
+        Ok(Some(StartJob {
+            service: d.name.clone(),
+            verb: "start",
+            env: env_overrides,
+            timeout: self.cfg.start_timeout_sec,
+            start_fn: self.start_fn.clone(),
+        }))
+    }
+
+    // 阶段 3 (锁内): exec 结果落状态机。
+    pub async fn finish_up_one(&mut self, name: &str, res: Result<()>) -> Result<()> {
         let r = self
             .runners
             .iter_mut()
             .find(|r| r.def.name == name)
-            .expect("前面已确认存在");
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
         match res {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 r.state = runner::State::Starting;
                 Ok(())
             }
-            Ok(Err(e)) => {
-                tracing::warn!(svc = %d.name, err = %e, "start fail");
+            Err(e) => {
+                tracing::warn!(svc = %name, err = %e, "start fail (exec 锁外返回)");
                 // issue #90: 同 up_native — 排期退避重试而非终态 Failed
-                r.mark_start_failed(&e.to_string(), now_unix());
-                Err(e)
-            }
-            Err(_) => {
-                let e = anyhow::anyhow!("start timeout {timeout}s");
-                tracing::warn!(svc = %d.name, "start timeout {timeout}s");
                 r.mark_start_failed(&e.to_string(), now_unix());
                 Err(e)
             }
@@ -523,6 +568,13 @@ impl SupervisorCore {
     }
 
     pub async fn down_one(&mut self, name: &str) -> Result<()> {
+        let job = self.prepare_down_one(name).await?;
+        let res = job.run().await;
+        self.finish_down_one(name, res).await
+    }
+
+    // 阶段 1 (锁内): 校验 + 组 stop 作业 (不 exec)。
+    pub async fn prepare_down_one(&mut self, name: &str) -> Result<StartJob> {
         let d = self
             .runners
             .iter()
@@ -530,8 +582,19 @@ impl SupervisorCore {
             .map(|r| r.def.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
         tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop (single)");
-        if let Err(e) = (self.start_fn)(&d.name, "stop", &[]) {
-            tracing::warn!(svc = %d.name, err = %e, "stop fail");
+        Ok(StartJob {
+            service: d.name.clone(),
+            verb: "stop",
+            env: Vec::new(),
+            timeout: self.cfg.start_timeout_sec,
+            start_fn: self.start_fn.clone(),
+        })
+    }
+
+    // 阶段 3 (锁内): stop 结果落状态机 (stop fail 不拒 — pidfile 缺失等 no-op)。
+    pub async fn finish_down_one(&mut self, name: &str, res: Result<()>) -> Result<()> {
+        if let Err(e) = res.as_ref() {
+            tracing::warn!(svc = %name, err = %e, "stop fail (exec 锁外返回)");
         }
         if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
             // issue #90: 手动 down 清掉待执行的启动重试排期
@@ -547,8 +610,9 @@ impl SupervisorCore {
     // stop 命令 + 端口探活验证 — 旧进程未死则 bail (调用方不得返回 ok)。
     // stop 命令失败不 bail (pidfile 缺失等 no-op 场景), 由探活验证兜底;
     // daemon spec 的孤儿监听由 daemon_stop_cmd 的 port 锚定 lsof 补杀处理。
-    async fn stop_and_verify(&mut self, name: &str) -> Result<()> {
-        if let Err(e) = (self.start_fn)(name, "stop", &[]) {
+    async fn stop_and_verify(&mut self, name: &str, run_stop: bool) -> Result<()> {
+        // issue #122: restart 路径的 stop exec 已在锁外作业执行, 这里只验证
+        if run_stop && let Err(e) = (self.start_fn)(name, "stop", &[]) {
             tracing::warn!(svc = %name, err = %e, "stop 命令失败 (由探活验证兜底)");
         }
         let port = self
@@ -575,7 +639,24 @@ impl SupervisorCore {
     // 人工 restart: stop 旧进程 (验证端口释放) → start 新进程。返回 pidfile
     // 记录的旧→新 PID (None = pidfile 缺失/非法)。复位熔断与启动失败重试
     // (原 RPC restart 内联语义, 移入此处与真实 stop+start 流程绑定)。
+    // issue #122: RPC 路径改走三段 (prepare → 锁外 exec → finish), 此编排器
+    // 仅供内部/测试 — 持锁等价旧语义。
     pub async fn restart_one(&mut self, name: &str) -> Result<(Option<u32>, Option<u32>)> {
+        let (old_pid, stop_job) = self.prepare_restart(name).await?;
+        let stop_res = stop_job.run().await;
+        let jobs = self.restart_after_stop(name, stop_res).await?;
+        let mut res = Ok(());
+        for job in &jobs {
+            if let Err(e) = job.run().await {
+                res = Err(e);
+                break;
+            }
+        }
+        self.finish_restart(name, old_pid, res).await
+    }
+
+    // 阶段 1 (锁内): 复位计数/排期 + 组 stop 作业 (不 exec)。
+    pub async fn prepare_restart(&mut self, name: &str) -> Result<(Option<u32>, StartJob)> {
         if !self.runners.iter().any(|r| r.def.name == name) {
             anyhow::bail!("unknown service: {name}");
         }
@@ -591,14 +672,81 @@ impl SupervisorCore {
             r.state = runner::State::Stopped;
         }
         tracing::info!(svc = %name, old_pid, "restart: 停旧进程");
-        self.stop_and_verify(name).await?;
+        Ok((
+            old_pid,
+            StartJob {
+                service: name.to_string(),
+                verb: "stop",
+                env: Vec::new(),
+                timeout: self.cfg.start_timeout_sec,
+                start_fn: self.start_fn.clone(),
+            },
+        ))
+    }
+
+    // 阶段 2 (锁内): stop 结果核验 (探活确认端口释放, 有界等待无长 exec) +
+    // 组 start 作业。非 restart 型服务 (Daemon spec) 语义 = stop → start 两次 exec。
+    pub async fn restart_after_stop(
+        &mut self,
+        name: &str,
+        stop_res: Result<()>,
+    ) -> Result<Vec<StartJob>> {
+        if let Err(e) = stop_res.as_ref() {
+            tracing::warn!(svc = %name, err = %e, "restart: stop 命令失败 (由探活验证兜底)");
+        }
+        self.stop_and_verify(name, false).await?;
         tracing::info!(svc = %name, "restart: 旧进程已停, 拉起新进程");
+        let r = self
+            .runners
+            .iter()
+            .find(|r| r.def.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
+        // 与 runner invoke_start 闭包同语义: shell 注册 env 解析, 失败仅 ERROR +
+        // 空 env 继续 (restart 型 exec 需要共享 venv / key 注入, #34/#80)
+        let env_file = self.cfg.compose.env_file.clone();
+        let env: Vec<(String, String)> = match crate::env_map::shell_env_for(name, &env_file) {
+            Ok(m) => m.into_iter().collect(),
+            Err(e) => {
+                tracing::error!(svc = %name, err = %e, "shell env 解析失败, restart 以空 env 继续");
+                Vec::new()
+            }
+        };
+        let timeout = self.cfg.start_timeout_sec;
+        let start_fn = self.start_fn.clone();
+        let mut jobs = Vec::new();
+        if r.restart_cmd == "restart" {
+            jobs.push(StartJob {
+                service: name.to_string(),
+                verb: "restart",
+                env,
+                timeout,
+                start_fn,
+            });
+        } else {
+            jobs.push(StartJob {
+                service: name.to_string(),
+                verb: "start",
+                env,
+                timeout,
+                start_fn: start_fn.clone(),
+            });
+        }
+        Ok(jobs)
+    }
+
+    // 阶段 3 (锁内): start 结果落状态机 + pid 替换证据。
+    pub async fn finish_restart(
+        &mut self,
+        name: &str,
+        old_pid: Option<u32>,
+        res: Result<()>,
+    ) -> Result<(Option<u32>, Option<u32>)> {
         let r = self
             .runners
             .iter_mut()
             .find(|r| r.def.name == name)
-            .expect("前面已确认存在");
-        r.invoke_start()?;
+            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
+        res?;
         r.state = runner::State::Starting;
         let new_pid = read_pidfile_pid(name);
         tracing::info!(svc = %name, old_pid, new_pid, "restart: start 已发起 (pid 替换)");
@@ -1112,7 +1260,7 @@ impl SupervisorCore {
         // 2.5 issue #96: 真正停掉旧进程并验证端口释放 — 此前 rollout 从不 stop,
         // 新进程撞注册端口死掉, prewarm 探活命中旧监听 → "ok" 但代码从未被替换
         let old_pid = read_pidfile_pid(service);
-        self.stop_and_verify(service).await?;
+        self.stop_and_verify(service, true).await?;
         tracing::info!(svc = %service, old_pid, "rollout: 旧进程已停, 拉起新进程");
         // 3. start (复用 runner.invoke_start, 1-arg start.sh 读自身 .env)
         let r = self

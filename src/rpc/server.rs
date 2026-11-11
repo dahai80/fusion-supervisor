@@ -126,19 +126,45 @@ async fn dispatch(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut c = core.lock().await;
-            let res = match req.params.get("service").and_then(|v| v.as_str()) {
-                Some(svc) if !svc.is_empty() => {
+            let svc_param = req
+                .params
+                .get("service")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            if let Some(svc) = svc_param {
+                // issue #122: 单服务 exec 锁外 — prepare (锁内) → run (锁外) →
+                // finish (锁内)。旧实现持锁等 start.sh (go build 可达数分钟),
+                // 全部 RPC/HTTP 排队 (2026-11-11 实证)。
+                let job = {
+                    let mut c = core.lock().await;
                     tracing::info!(svc = %svc, origin = %origin, "manual start (operator intent)");
                     if let Err(e) =
                         c.store
-                            .record_event(svc, "ManualStart", &origin, now_ts, "native", "info")
+                            .record_event(&svc, "ManualStart", &origin, now_ts, "native", "info")
                     {
                         tracing::warn!(err = %e, "ManualStart event write fail");
                     }
-                    c.up_one(svc).await
-                }
-                _ => {
+                    match c.prepare_up_one(&svc).await {
+                        Err(e) => return make_error(-32000, &e.to_string(), req.id),
+                        Ok(None) => return make_result(json!("ok"), req.id),
+                        Ok(Some(job)) => job,
+                    }
+                };
+                let res = job.run().await;
+                let finish = {
+                    let mut c = core.lock().await;
+                    c.finish_up_one(&svc, res).await
+                };
+                return match finish {
+                    Ok(()) => make_result(json!("ok"), req.id),
+                    Err(e) => make_error(-32000, &e.to_string(), req.id),
+                };
+            }
+            // 全量 START-ALL (持锁语义不变 — 显式全 fleet 操作, 带 banner)
+            let mut c = core.lock().await;
+            let res = {
+                {
                     // 醒目 banner: 全量启动波与 stop-all 对称, 逐行日志易漏看
                     tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                     tracing::warn!("!! START-ALL requested — entire fleet will be started");
@@ -167,19 +193,42 @@ async fn dispatch(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut c = core.lock().await;
-            let res = match req.params.get("service").and_then(|v| v.as_str()) {
-                Some(svc) if !svc.is_empty() => {
+            let svc_param = req
+                .params
+                .get("service")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            if let Some(svc) = svc_param {
+                // issue #122: 单服务 stop exec 锁外 (同 Up 臂)
+                let job = {
+                    let mut c = core.lock().await;
                     tracing::warn!(svc = %svc, origin = %origin, "manual stop (operator intent)");
                     if let Err(e) =
                         c.store
-                            .record_event(svc, "ManualStop", &origin, now_ts, "native", "warn")
+                            .record_event(&svc, "ManualStop", &origin, now_ts, "native", "warn")
                     {
                         tracing::warn!(err = %e, "ManualStop event write fail");
                     }
-                    c.down_one(svc).await
-                }
-                _ => {
+                    match c.prepare_down_one(&svc).await {
+                        Err(e) => return make_error(-32000, &e.to_string(), req.id),
+                        Ok(job) => job,
+                    }
+                };
+                let res = job.run().await;
+                let finish = {
+                    let mut c = core.lock().await;
+                    c.finish_down_one(&svc, res).await
+                };
+                return match finish {
+                    Ok(()) => make_result(json!("ok"), req.id),
+                    Err(e) => make_error(-32000, &e.to_string(), req.id),
+                };
+            }
+            // 全量 STOP-ALL (持锁语义不变 — 显式全 fleet 操作, 带 banner)
+            let mut c = core.lock().await;
+            let res = {
+                {
                     // 醒目 banner: 全停波普通逐行日志易漏看 (2026-10-30 22:53 事故)
                     tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                     tracing::warn!("!! STOP-ALL requested — entire fleet will be stopped");
@@ -208,11 +257,44 @@ async fn dispatch(
             // issue #96: restart 必须 stop 旧进程并验证端口释放后再 start —
             // 此前只 invoke_start, 旧监听器存活、新进程撞口死掉, 探活命中旧进程
             // 返回 "ok" 但代码从未被替换。结果携带 pidfile 新旧 PID 替换证据。
-            let mut c = core.lock().await;
-            if !c.runners.iter().any(|r| r.def.name == svc) {
-                return make_error(-32602, &format!("unknown service: {svc}"), req.id);
+            // issue #122: stop/start exec 全部锁外, 仅 verify (有界探活) 持锁。
+            let (old_pid, stop_job) = {
+                let mut c = core.lock().await;
+                match c.prepare_restart(&svc).await {
+                    Err(e) => {
+                        let code = if e.to_string().starts_with("unknown service") {
+                            -32602
+                        } else {
+                            -32000
+                        };
+                        return make_error(code, &e.to_string(), req.id);
+                    }
+                    Ok(v) => v,
+                }
+            };
+            let stop_res = stop_job.run().await;
+            let jobs = {
+                let mut c = core.lock().await;
+                match c.restart_after_stop(&svc, stop_res).await {
+                    Err(e) => {
+                        tracing::warn!(svc = %svc, err = %e, "manual restart fail (verify)");
+                        return make_error(-32000, &format!("restart fail: {e}"), req.id);
+                    }
+                    Ok(jobs) => jobs,
+                }
+            };
+            let mut start_res = Ok(());
+            for job in &jobs {
+                if let Err(e) = job.run().await {
+                    start_res = Err(e);
+                    break;
+                }
             }
-            match c.restart_one(&svc).await {
+            let out = {
+                let mut c = core.lock().await;
+                c.finish_restart(&svc, old_pid, start_res).await
+            };
+            match out {
                 Ok((old_pid, new_pid)) => {
                     tracing::info!(svc = %svc, old_pid, new_pid, "manual restart ok");
                     make_result(
