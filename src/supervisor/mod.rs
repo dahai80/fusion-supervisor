@@ -154,6 +154,8 @@ impl SupervisorCore {
                                 tracing::error!(svc = %name, err = %e, "sidecar env 解析失败, 重启以剩余 env 继续");
                             }
                         }
+                        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+                        env.extend(crate::env_map::overlay_env_for(&name));
                         real_start_pair(&name, c, &env)
                     },
                     policy,
@@ -368,6 +370,8 @@ impl SupervisorCore {
                             }
                         }
                     }
+                    // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+                    env_overrides.extend(crate::env_map::overlay_env_for(&d.name));
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start");
                     let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
                     match tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd).await {
@@ -547,6 +551,8 @@ impl SupervisorCore {
             })?;
             env_overrides.extend(m);
         }
+        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+        env_overrides.extend(crate::env_map::overlay_env_for(&d.name));
         tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start (single)");
         Ok(Some(StartJob {
             service: d.name.clone(),
@@ -725,6 +731,9 @@ impl SupervisorCore {
                 Vec::new()
             }
         };
+        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+        let mut env = env;
+        env.extend(crate::env_map::overlay_env_for(name));
         let timeout = self.cfg.start_timeout_sec;
         let start_fn = self.start_fn.clone();
         let mut jobs = Vec::new();
@@ -3133,6 +3142,49 @@ mod tests {
         assert!(
             matches!(core.runners[0].state, runner::State::Starting),
             "注入成功服务应 Starting"
+        );
+    }
+
+    // issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`) 注入 up 路径。
+    // HOME 重定向到临时目录, overlay 文件带 FUSION_LLM_TIMEOUT → start_fn 收到。
+    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_issue125_overlay_env_reaches_start_fn() {
+        let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-ovl-test");
+        let _g = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ovl_dir = home.path().join(".fusion-sv/env");
+        std::fs::create_dir_all(&ovl_dir).unwrap();
+        std::fs::write(
+            ovl_dir.join("fusion-identity.env"),
+            "FUSION_LLM_TIMEOUT=120\n",
+        )
+        .unwrap();
+        let _home = crate::env_map::tests::EnvGuard::set("HOME", home.path().to_str().unwrap());
+        let mut cfg = fake_cfg();
+        cfg.compose.env_file = std::env::temp_dir().join("fusion-sv-no-such-env-file");
+        let defs = vec![def("fusion-identity", Layer::App, 11450)];
+        let received_env: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let re_p = received_env.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            cfg,
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            move |_svc, _cmd, env: &[(String, String)]| {
+                re_p.lock().unwrap().extend(env.iter().cloned());
+                Ok(())
+            },
+        );
+        core.up_all().await.unwrap();
+        let env = received_env.lock().unwrap();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FUSION_LLM_TIMEOUT" && v == "120"),
+            "overlay env 应到达 start_fn, 实际 {:?}",
+            *env
         );
     }
 

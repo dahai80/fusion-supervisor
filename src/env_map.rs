@@ -477,6 +477,54 @@ fn pg_db_for(svc: &str, env_file: &std::path::Path, compose_on: bool) -> String 
     resolve(key, env_file).unwrap_or(fallback)
 }
 
+// issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`)。
+// 操作员改环境变量不必再绕道手工 start.sh (daemon env 快照固定, 既有注入
+// 只覆盖已知名字)。每个 exec 路径 (up / restart / rollout / 崩溃自动恢复)
+// 现场重读该文件, 叠加在 shell/sidecar 注入之后 (同 key 覆盖旧值), 因此
+// auto-recovery 也自动带上操作员变量。优先级: 进程 env → per-service 文件
+// → shell/sidecar 注入 → strip_env_for 剥离 (剥离永远最后, 安全员获胜)。
+// 文件缺失/不可读 → 空向量 (可选增强, 绝不阻断启动); 坏行 WARN 跳过;
+// 值绝不落日志。
+pub fn overlay_env_for(svc: &str) -> Vec<(String, String)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join(".fusion-sv/env");
+    overlay_env_for_in(&dir, svc)
+}
+
+pub fn overlay_env_for_in(dir: &std::path::Path, svc: &str) -> Vec<(String, String)> {
+    let path = dir.join(format!("{svc}.env"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let out = parse_env_overlay(&text);
+    tracing::info!(svc = %svc, path = %path.display(), entries = out.len(), "env overlay applied");
+    out
+}
+
+// 纯解析: KEY=VALUE 行, 忽略空行/# 注释/缺 = 的坏行。KEY 首尾空白 trimmed,
+// VALUE 保留原样 (含内嵌 = 与引号, 不做 shell 展开 — 确定性优先)。
+pub fn parse_env_overlay(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            tracing::warn!(line = %line, "env overlay: malformed line skipped");
+            continue;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            tracing::warn!(line = %line, "env overlay: empty key skipped");
+            continue;
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    out
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -926,5 +974,41 @@ pub(crate) mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    // issue #125: overlay 解析 — KEY=VALUE / 注释 / 空行 / 坏行跳过
+    #[test]
+    fn test_issue125_parse_env_overlay() {
+        let out = parse_env_overlay(
+            "# comment\n\nFUSION_LLM_TIMEOUT=120\nSPACED  KEY = keep-inner=eq\nbad line no eq\nX=\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                ("FUSION_LLM_TIMEOUT".to_string(), "120".to_string()),
+                ("SPACED  KEY".to_string(), " keep-inner=eq".to_string()),
+                ("X".to_string(), String::new()),
+            ]
+        );
+    }
+
+    // issue #125: overlay 文件读取 — 存在读取, 缺失空向量
+    #[test]
+    fn test_issue125_overlay_env_for_in() {
+        let dir = std::env::temp_dir().join(format!("fusion-sv-ovl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = "fusion-test-ovl";
+        // 缺失 → 空
+        assert!(overlay_env_for_in(&dir, svc).is_empty());
+        // 存在 → 解析
+        std::fs::write(dir.join(format!("{svc}.env")), "A=1\n# c\nB=two\n").unwrap();
+        assert_eq!(
+            overlay_env_for_in(&dir, svc),
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "two".to_string())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
