@@ -584,6 +584,10 @@ impl SupervisorCore {
             r.policy.reset();
             r.start_fail_streak = 0;
             r.start_retry = false;
+            // issue #121: 清掉崩溃路径排定的 restart_after — 否则人工 restart 刚
+            // 替换进程, 到期的 tick 又 spawn 一次, 双实例抢端口后败者秒死 (实测
+            // old_pid=40281 → 40s 后 new_pid=42476 的连环重启)。
+            r.restart_after = None;
             r.state = runner::State::Stopped;
         }
         tracing::info!(svc = %name, old_pid, "restart: 停旧进程");
@@ -1402,8 +1406,26 @@ fn spawn_caffeinate(svc: &str, pidfile: &str) {
 // 失败 tail 改为 wait 后从日志文件回读末尾 N 行, 格式契约 "exit code=<n>" 不变。
 const STDERR_TAIL_LINES: usize = 20;
 
-// 子进程 stderr 重定向目标: 服务日志文件 (truncate 打开; 打不开退化为丢弃)。
+// issue #121: 自动重启前把上一轮服务日志换到 <name>.log.1 (保留一代)。
+// 旧实现 truncate 覆盖 — 进程在两次 spawn 之间死掉 (ProcessExit, 外部 TERM/
+// 内部 should_exit) 时死因证据随重启蒸发, 只能盲查。rotate 失败不阻断启动。
+fn rotate_svc_log(log_path: &std::path::Path) {
+    let non_empty = std::fs::metadata(log_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if !non_empty {
+        return;
+    }
+    let mut rotated = log_path.as_os_str().to_os_string();
+    rotated.push(".1");
+    if let Err(e) = std::fs::rename(log_path, std::path::Path::new(&rotated)) {
+        tracing::debug!(log = %log_path.display(), err = %e, "svc log rotate fail");
+    }
+}
+
+// 子进程 stderr 重定向目标: 服务日志文件 (换代后 truncate 打开; 打不开退化为丢弃)。
 fn open_svc_stderr(svc: &str, log_path: &std::path::Path) -> std::process::Stdio {
+    rotate_svc_log(log_path);
     match std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -1638,6 +1660,30 @@ mod tests {
         assert!(log_content.contains("yaml: unmarshal errors: bad config"));
         // 清理测试过程文件
         let _ = std::fs::remove_file(&log);
+    }
+
+    // issue #121: 服务日志换代 — 自动重启前保留上一轮 stderr 到 .log.1,
+    // ProcessExit (外部 TERM / 内部 should_exit) 死因证据不再随重启蒸发。
+    #[test]
+    fn test_issue121_rotate_svc_log_keeps_previous_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("ut-svc.log");
+        std::fs::write(&log, "old run: Shutting down\n").unwrap();
+        rotate_svc_log(&log);
+        assert!(!log.exists(), "rotate 后主文件让位给新一轮");
+        let rotated = tmp.path().join("ut-svc.log.1");
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "old run: Shutting down\n"
+        );
+        // 新一轮结束后再 rotate: .1 覆盖为最近一代
+        std::fs::write(&log, "new run\n").unwrap();
+        rotate_svc_log(&log);
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "new run\n");
+        // 空文件不换代 (省无谓 rename)
+        std::fs::write(&log, "").unwrap();
+        rotate_svc_log(&log);
+        assert!(log.exists(), "空文件不 rotate");
     }
 
     // issue #51 回归: start.sh 后台化的孙进程继承 stderr 不关闭 — exec 不得等它。
@@ -3142,6 +3188,43 @@ mod tests {
             "restart 应真正 stop + invoke_start"
         );
         assert!(matches!(core.runners[0].state, runner::State::Starting));
+    }
+
+    // issue #121: 人工 restart 必须清掉崩溃路径排定的 restart_after (单飞不变量) —
+    // 否则到期 tick 再 spawn 一次, 双实例抢端口败者秒死 (cowork-web 40281→42476 实证)。
+    #[tokio::test]
+    async fn test_issue121_restart_clears_scheduled_crash_restart() {
+        let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
+            [
+                ProbeResult::Healthy { latency_ms: 1 },
+                ProbeResult::Unhealthy {
+                    reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let pq = probe_q.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            move |_: &ProbeSpec| {
+                pq.lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ProbeResult::Unhealthy {
+                        reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                    })
+            },
+            |_, _, _| Ok(()),
+        );
+        core.runners[0].state = runner::State::Unhealthy;
+        core.runners[0].restart_after = Some(9999);
+        core.restart_one("fusion-mlx").await.unwrap();
+        assert!(
+            core.runners[0].restart_after.is_none(),
+            "restart 必须清掉排定的崩溃重启 (单飞)"
+        );
     }
 
     // restart_one: stop 无效 (端口恒 Healthy) → bail, 绝不 start、绝不返回 ok
