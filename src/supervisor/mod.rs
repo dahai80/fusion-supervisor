@@ -967,12 +967,39 @@ impl SupervisorCore {
     // 容器: ps → exited/unhealthy → 标 Failed + 告警 (同 native 宕机路径)。
     // compose restart: unless-stopped 已处理自动重启, supervisor 仅报告状态 + 告警。
     pub async fn tick_all(&mut self, now_ts: u64) {
+        // issue #123: 探活并发预跑 — tick 全程持核心锁, 串行探活在降级 fleet 下
+        // (N 个宕机服务 × 2s 超时) 把锁扣住 N×2s, RPC/HTTP 全堵 (2026-11-11 实测:
+        // 睡眠唤醒后 10+ 服务 Timeout, /api/v1/status 连续 5s+ 无响应)。
+        // 并发预跑整轮压到 max(2s) 量级, 锁内只做状态机推进。
+        self.preflight_probes().await;
         for r in &mut self.runners {
             if let Err(e) = r.tick(now_ts, &self.store, &mut self.alerter).await {
                 tracing::warn!(svc = %r.def.name, err = %e, "tick fail (继续下一个)");
             }
         }
         self.tick_compose(now_ts).await;
+    }
+
+    // issue #123: 全 fleet 探活并发预跑 (spawn_blocking + JoinSet), 结果灌进
+    // runner.cached_probe, 本轮 tick 直接取用。单 runner 失败 (panic/join) 回落
+    // 现场探 (cached_probe 保持 None)。
+    async fn preflight_probes(&mut self) {
+        let jobs: Vec<(String, runner::ProbeFn)> = self
+            .runners
+            .iter()
+            .map(|r| (r.def.name.clone(), r.probe_fn_clone()))
+            .collect();
+        let mut set = tokio::task::JoinSet::new();
+        for (name, f) in jobs {
+            set.spawn_blocking(move || (name, f()));
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, result)) = joined
+                && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
+            {
+                r.cached_probe = Some(result);
+            }
+        }
     }
 
     // issue #107 D2: daemon 冷启动状态对账。launchd 崩溃重启 (如系统睡眠中

@@ -5,7 +5,7 @@ use crate::store::HistoryStore;
 use crate::supervisor::policy::RestartPolicy;
 use anyhow::Result;
 
-pub type ProbeFn = Box<dyn Fn() -> ProbeResult + Send + Sync>;
+pub type ProbeFn = std::sync::Arc<dyn Fn() -> ProbeResult + Send + Sync>;
 pub type StartFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 // issue #47: 配置致命退出码 (sysexits.h EX_CONFIG)。fusion-gateway 契约:
@@ -226,6 +226,9 @@ pub struct ServiceRunner {
     operator_race_notified: bool,
     probe_fn: ProbeFn,
     start_fn: StartFn,
+    // issue #123: 预跑探活缓存 — tick_all 并发预跑后灌入, tick 取走 (None=现场探)。
+    // 避免持锁串行探活在降级 fleet 下把锁扣 N×2s。
+    pub(crate) cached_probe: Option<ProbeResult>,
 }
 
 impl ServiceRunner {
@@ -251,7 +254,8 @@ impl ServiceRunner {
             fail_streak: 0,
             start_fail_streak: 0,
             start_retry: false,
-            probe_fn: Box::new(probe_fn),
+            cached_probe: None,
+            probe_fn: std::sync::Arc::new(probe_fn),
             start_fn: Box::new(start_fn),
         }
     }
@@ -263,7 +267,11 @@ impl ServiceRunner {
         store: &HistoryStore,
         alerter: &mut Alerter,
     ) -> Result<()> {
-        let result = (self.probe_fn)();
+        // issue #123: 优先取预跑缓存 (并发探活结果), 取走后本 tick 不再现场探
+        let result = self
+            .cached_probe
+            .take()
+            .unwrap_or_else(|| (self.probe_fn)());
         self.persist_health(&result, now_ts, store);
         // issue #9: draining 服务不进重启流。探活仍记录健康。
         // 探活不可达 (in-flight 完成/服务停响应) 或 grace 到期 → Stopped + 告警。
@@ -687,6 +695,11 @@ impl ServiceRunner {
     // issue #9: 单次探活 (prewarm 用)。复用注入的 probe_fn。
     pub fn probe_once(&self) -> ProbeResult {
         (self.probe_fn)()
+    }
+
+    // issue #123: 探活闭包克隆 (tick_all 并发预跑用)。
+    pub(crate) fn probe_fn_clone(&self) -> ProbeFn {
+        self.probe_fn.clone()
     }
 
     // issue #9: 进入摘流量。grace_sec=宽限期 (到期强制 Stopped)。
