@@ -1004,12 +1004,19 @@ impl SupervisorCore {
 
     // issue #122 phase-2: 收走 tick 挂起的到点重启作业 (锁内, 不 exec)。
     // 调用方在核心锁外经 run_pending_execs 并发执行, 再 finish_pending_execs 落账。
-    pub fn collect_pending_execs(&mut self) -> Vec<(String, bool, runner::StartFn)> {
+    pub fn collect_pending_execs(
+        &mut self,
+    ) -> Vec<(String, bool, runner::StartFn, runner::ProbeFn)> {
         let mut out = Vec::new();
         for r in &mut self.runners {
             if let Some(is_restart) = r.take_pending_exec() {
                 r.exec_in_flight = true;
-                out.push((r.def.name.clone(), is_restart, r.start_fn_clone()));
+                out.push((
+                    r.def.name.clone(),
+                    is_restart,
+                    r.start_fn_clone(),
+                    r.probe_fn_clone(),
+                ));
             }
         }
         if !out.is_empty() {
@@ -1019,14 +1026,20 @@ impl SupervisorCore {
     }
 
     // issue #122 phase-2: 锁外执行挂起重启作业 (并发), 返回逐服务结果。
+    // issue #124: exec 前置探活 — 操作员手工 start.sh restart 可能已把服务拉起
+    // (慢启动窗口内 #86 闸门已放行), 再拉就是双进程撞口 (调用方 502)。
+    // 已 Healthy → 采纳外部实例, 跳过 exec。
     pub async fn run_pending_execs(
-        execs: Vec<(String, bool, runner::StartFn)>,
-    ) -> Vec<(String, Result<()>)> {
+        execs: Vec<(String, bool, runner::StartFn, runner::ProbeFn)>,
+    ) -> Vec<(String, runner::ExecOutcome)> {
         let mut set = tokio::task::JoinSet::new();
-        for (name, is_restart, f) in execs {
+        for (name, is_restart, f, probe) in execs {
             set.spawn_blocking(move || {
+                if matches!(probe(), crate::probe::ProbeResult::Healthy { .. }) {
+                    return (name, runner::ExecOutcome::Adopted);
+                }
                 let res = runner::run_start_verbs(&f, is_restart);
-                (name, res)
+                (name, runner::ExecOutcome::Ran(res))
             });
         }
         let mut out = Vec::new();
@@ -1040,10 +1053,21 @@ impl SupervisorCore {
     }
 
     // issue #122 phase-2: 重新拿锁, 逐服务落账 exec 结果 (状态机/告警/pid 审计)。
-    pub async fn finish_pending_execs(&mut self, now_ts: u64, results: Vec<(String, Result<()>)>) {
-        for (name, res) in results {
+    pub async fn finish_pending_execs(
+        &mut self,
+        now_ts: u64,
+        results: Vec<(String, runner::ExecOutcome)>,
+    ) {
+        for (name, outcome) in results {
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
-                r.apply_exec_result(now_ts, &mut self.alerter, res).await;
+                match outcome {
+                    runner::ExecOutcome::Adopted => {
+                        r.apply_adopted(now_ts, &mut self.alerter).await
+                    }
+                    runner::ExecOutcome::Ran(res) => {
+                        r.apply_exec_result(now_ts, &mut self.alerter, res).await
+                    }
+                }
             }
         }
     }

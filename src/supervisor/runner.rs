@@ -17,6 +17,14 @@ pub(crate) fn run_start_verbs(f: &StartFn, is_restart: bool) -> Result<()> {
     }
 }
 
+// issue #124: 锁外 exec 的逐服务结果。Adopted = exec 前置探活发现端口已有
+// 健康实例应答 (操作员手工 start.sh restart 赢了竞态, 或慢启动期间服务已
+// 自愈) — 跳过拉起采纳外部实例, 防双进程撞口 (调用方 502)。
+pub enum ExecOutcome {
+    Ran(Result<()>),
+    Adopted,
+}
+
 // issue #47: 配置致命退出码 (sysexits.h EX_CONFIG)。fusion-gateway 契约:
 // 78 = 配置坏且自愈失败 (重启无救, 需人工修配置), 其它退出码 = 普通 crash。
 pub(crate) const EXIT_CONFIG: i32 = 78;
@@ -324,7 +332,9 @@ impl ServiceRunner {
                 // 自有 pidfile) 在探活通过时复核 PID 活性; pidfile pid 已死而端口仍
                 // 应答 = 陈旧监听器占口 (孤儿/撞口), 按真宕机 ProcessExit 走自动
                 // 重启 (#96 port 兜底 + #110 归属校验负责清掉陈旧监听)。
-                if matches!(self.state, State::Healthy)
+                // issue #124: Failed 态 + 探活恢复健康 (外部实例接管了端口) →
+                // 同走恢复路径摘掉 Failed — 服务明明健康, 状态表不该永久红。
+                if matches!(self.state, State::Healthy | State::Failed)
                     && let Some(reason) = self.process_exit_if_dead()
                 {
                     tracing::warn!(
@@ -334,7 +344,13 @@ impl ServiceRunner {
                     self.handle_unhealthy(reason, now_ts, alerter).await;
                     return Ok(());
                 }
-                let was_down = matches!(self.state, State::Unhealthy | State::Restarting);
+                // issue #124: Failed + 探活 Healthy = 外部实例已接管 (操作员手工
+                // restart 拉起的新进程), 状态翻回 Healthy + 全套复位 — 不再永久
+                // 卡 Failed 等人工 fusion-sv restart。
+                let was_down = matches!(
+                    self.state,
+                    State::Unhealthy | State::Restarting | State::Failed
+                );
                 self.state = State::Healthy;
                 // issue #79: 任一次成功探活即复位连续失败计数 (抖动不升级)。
                 self.fail_streak = 0;
@@ -693,12 +709,48 @@ impl ServiceRunner {
         }
     }
 
+    // issue #124: exec 前置探活已 Healthy — 外部实例 (操作员手工 start.sh
+    // restart) 已接管端口, 采纳而非拉起。走恢复路径: 全套计数复位 + ServiceBack
+    // 告警; 不发 AutoRestart (我们没有拉起任何进程)。
+    pub(crate) async fn apply_adopted(&mut self, now_ts: u64, alerter: &mut Alerter) {
+        self.exec_in_flight = false;
+        self.pending_old_pid = None;
+        self.restart_after = None;
+        self.fail_streak = 0;
+        self.start_fail_streak = 0;
+        self.start_retry = false;
+        self.fast_fail_streak = 0;
+        self.fast_fail_alerted = false;
+        self.config_fail_streak = 0;
+        self.operator_race_notified = false;
+        self.policy.reset();
+        self.state = State::Healthy;
+        tracing::info!(
+            svc = %self.def.name,
+            "exec 前探活已 Healthy, 采纳外部实例 (跳过拉起防双进程撞口)"
+        );
+        let _ = alerter
+            .alert(Alert {
+                service: self.def.name.clone(),
+                kind: AlertKind::ServiceBack,
+                detail: "adopted externally started instance (operator restart won the race); respawn skipped".to_string(),
+                ts: now_ts,
+            })
+            .await;
+    }
+
     // issue #122 phase-2: runner 级同步收尾 (测试/单机路径用) — 锁内执行挂起
     // 作业并落账。生产路径走 collect_pending_execs (锁外) + finish_pending_execs。
+    // issue #124: 与生产 run_pending_execs 同语义 — exec 前先探活, 已 Healthy
+    // 则采纳跳过拉起。
     pub async fn complete_pending_exec(&mut self, now_ts: u64, alerter: &mut Alerter) {
         let Some(is_restart) = self.pending_exec.take() else {
             return;
         };
+        if matches!((self.probe_fn)(), ProbeResult::Healthy { .. }) {
+            self.apply_adopted(now_ts, alerter).await;
+            return;
+        }
         let res = run_start_verbs(&self.start_fn, is_restart);
         self.apply_exec_result(now_ts, alerter, res).await;
     }

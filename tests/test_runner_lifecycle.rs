@@ -67,6 +67,130 @@ async fn test_lifecycle_crash_then_recover() {
     cleanup_db(&path);
 }
 
+#[tokio::test]
+async fn test_issue124_failed_recovers_on_healthy_probe() {
+    // issue #124: Failed 态 + 探活恢复健康 (操作员手工 restart 拉起了新实例)
+    // → 状态翻回 Healthy, 不再永久卡 Failed 等人工复位。
+    let (mut r, probe_cell, _calls, path) = failed_runner("a").await;
+    let store = HistoryStore::open(&path).unwrap();
+    let mut al = Alerter::new(300, String::new());
+    *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
+    r.tick(1100, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
+    cleanup_db(&path);
+}
+
+#[tokio::test]
+async fn test_issue124_adopt_skips_respawn_when_port_served() {
+    // issue #124: 到点重启 exec 前置探活已 Healthy (外部实例已接管端口)
+    // → 跳过拉起 (start 闭包零调用), 采纳外部实例翻回 Healthy。
+    let def = ServiceDef {
+        name: "fusion-agent-studio".into(),
+        port: 11442,
+        repo_dir: "fusion-agent-studio".into(),
+        purpose: "x".into(),
+        fixed: false,
+        managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
+        layer: Layer::App,
+    };
+    let probe_cell = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    }));
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pc = probe_cell.clone();
+    let cc = calls.clone();
+    let mut r = ServiceRunner::new(
+        def,
+        "restart",
+        move || pc.lock().unwrap().clone(),
+        move |c| {
+            cc.lock().unwrap().push(c.into());
+            Ok(())
+        },
+        RestartPolicy::new(300, 5, 30),
+    );
+    r.state = State::Healthy;
+    let path = std::env::temp_dir().join(format!("fusion-sv-i124-c-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = HistoryStore::open(&path).unwrap();
+    let mut al = Alerter::new(300, String::new());
+    // 3 连败排期 + 到点 tick 挂起 exec (cap=5 未封顶)
+    r.tick(1000, &store, &mut al).await.unwrap();
+    r.tick(1001, &store, &mut al).await.unwrap();
+    r.tick(1002, &store, &mut al).await.unwrap();
+    r.tick(1003, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Restarting), "实际 {:?}", r.state);
+    // 操作员的 start.sh 在退避窗口内把服务拉起来了 — 探活恢复健康
+    *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
+    r.complete_pending_exec(1003, &mut al).await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "采纳路径不得拉起 (双进程撞口), 实际 {:?}",
+        calls.lock().unwrap()
+    );
+    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
+    cleanup_db(&path);
+}
+
+// issue #124 测试脚手架: 已达 Failed 态的 runner (crash-window cap=1 封顶路径)。
+// 后缀区分两测试的 db 文件 (同进程并发跑, 共名会 database is locked)。
+async fn failed_runner(
+    suffix: &str,
+) -> (
+    ServiceRunner,
+    Arc<Mutex<ProbeResult>>,
+    Arc<Mutex<Vec<String>>>,
+    std::path::PathBuf,
+) {
+    let def = ServiceDef {
+        name: "fusion-agent-studio".into(),
+        port: 11442,
+        // 假 repo 目录 — 操作员竞态闸门 (issue #86) 会 pgrep 真机 start.sh,
+        // 用真实 repo 名可能撞上在跑的脚本导致测试不确定
+        repo_dir: "fusion-test-no-such-repo".into(),
+        purpose: "x".into(),
+        fixed: false,
+        managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
+        layer: Layer::App,
+    };
+    let probe_cell = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    }));
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pc = probe_cell.clone();
+    let cc = calls.clone();
+    let mut r = ServiceRunner::new(
+        def,
+        "restart",
+        move || pc.lock().unwrap().clone(),
+        move |c| {
+            cc.lock().unwrap().push(c.into());
+            Ok(())
+        },
+        RestartPolicy::new(300, 1, 30),
+    );
+    r.state = State::Healthy;
+    // 走真实路径进 Failed: 第一轮 crash (cap=1 未封顶) + 第二轮 crash 封顶
+    let path =
+        std::env::temp_dir().join(format!("fusion-sv-i124-{suffix}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = HistoryStore::open(&path).unwrap();
+    let mut al = Alerter::new(300, String::new());
+    r.tick(1000, &store, &mut al).await.unwrap();
+    r.tick(1001, &store, &mut al).await.unwrap();
+    r.tick(1002, &store, &mut al).await.unwrap();
+    r.tick(1003, &store, &mut al).await.unwrap();
+    r.complete_pending_exec(1003, &mut al).await;
+    r.tick(1004, &store, &mut al).await.unwrap();
+    r.tick(1005, &store, &mut al).await.unwrap();
+    r.tick(1006, &store, &mut al).await.unwrap();
+    r.tick(1007, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Failed), "实际 {:?}", r.state);
+    (r, probe_cell, calls, path)
+}
+
 fn cleanup_db(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
