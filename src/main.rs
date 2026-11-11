@@ -6,6 +6,7 @@ use fusion_supervisor::rpc;
 use fusion_supervisor::rpc::client::RpcClient;
 use fusion_supervisor::rpc::schema::RpcRequest;
 use fusion_supervisor::supervisor;
+use fusion_supervisor::supervisor::SupervisorCore;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -240,12 +241,22 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             // 锁纪律不变: tick 体内取锁, 外层 sleep 无锁。
             let core_inner = core_tick.clone();
             let tick_round = tokio::spawn(async move {
-                let mut c = core_inner.lock().await;
-                c.tick_all(now).await;
-                // issue #10/#113: 备份调度检查 (到期触发 spawn_backup, fail-closed 已告警)
-                c.check_backup_schedule(now).await;
-                // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
-                c.check_retention(now);
+                // issue #122 phase-2: tick 挂起的到点重启 exec 在核心锁外并发执行 —
+                // start.sh (go build 等) 可达数分钟, 持锁执行会堵死 RPC/HTTP status。
+                let execs = {
+                    let mut c = core_inner.lock().await;
+                    c.tick_all(now).await;
+                    // issue #10/#113: 备份调度检查 (到期触发 spawn_backup, fail-closed 已告警)
+                    c.check_backup_schedule(now).await;
+                    // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
+                    c.check_retention(now);
+                    c.collect_pending_execs()
+                };
+                if !execs.is_empty() {
+                    let results = SupervisorCore::run_pending_execs(execs).await;
+                    let mut c = core_inner.lock().await;
+                    c.finish_pending_execs(now, results).await;
+                }
             });
             if let Err(e) = tick_round.await {
                 tracing::error!(err = %e, "tick 单轮 panic (自愈续跑)");

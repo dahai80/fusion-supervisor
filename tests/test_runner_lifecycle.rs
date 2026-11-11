@@ -56,6 +56,8 @@ async fn test_lifecycle_crash_then_recover() {
     r.tick(1003, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     r.tick(1004, &store, &mut al).await.unwrap();
+    // issue #122 phase-2: 到点 tick 只挂起 exec (锁外执行), 同步收尾后 Restarting
+    r.complete_pending_exec(1004, &mut al).await;
     assert!(matches!(r.state, State::Restarting));
     assert_eq!(calls.lock().unwrap().len(), 1);
     // 恢复

@@ -44,13 +44,13 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
     // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
     core.runners[0].state = State::Unhealthy;
     core.runners[0].fail_streak = 2;
-    core.tick_all(1000).await;
+    core.drive(1000).await;
     assert!(
         matches!(core.runners[0].state, State::Unhealthy),
         "排期 tick 不应重启, 实测 {:?}",
         core.runners[0].state
     );
-    core.tick_all(1001).await;
+    core.drive(1001).await;
     assert!(
         matches!(core.runners[0].state, State::Restarting),
         "tick_all 后应 Restarting, 实测 {:?}",
@@ -58,7 +58,7 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
     );
     // 翻探活为健康: tick_all 应恢复 Healthy
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
-    core.tick_all(1001).await;
+    core.drive(1001).await;
     assert!(
         matches!(core.runners[0].state, State::Healthy),
         "恢复后 tick_all 应 Healthy, 实测 {:?}",
@@ -78,7 +78,7 @@ async fn test_tick_all_skips_stopped_runner() {
         |_, _, _| Ok(()),
     );
     core.runners[0].state = State::Stopped;
-    core.tick_all(2000).await;
+    core.drive(2000).await;
     assert!(
         matches!(core.runners[0].state, State::Stopped),
         "Stopped 态 tick_all 应 no-op, 实测 {:?}",

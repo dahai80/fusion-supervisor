@@ -6,7 +6,16 @@ use crate::supervisor::policy::RestartPolicy;
 use anyhow::Result;
 
 pub type ProbeFn = std::sync::Arc<dyn Fn() -> ProbeResult + Send + Sync>;
-pub type StartFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
+pub type StartFn = std::sync::Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+// issue #122 phase-2: 按动作模式执行 start 闭包 (restart 一条命令; 否则 stop+start)。
+pub(crate) fn run_start_verbs(f: &StartFn, is_restart: bool) -> Result<()> {
+    if is_restart {
+        f("restart")
+    } else {
+        f("stop").and_then(|_| f("start"))
+    }
+}
 
 // issue #47: 配置致命退出码 (sysexits.h EX_CONFIG)。fusion-gateway 契约:
 // 78 = 配置坏且自愈失败 (重启无救, 需人工修配置), 其它退出码 = 普通 crash。
@@ -229,6 +238,13 @@ pub struct ServiceRunner {
     // issue #123: 预跑探活缓存 — tick_all 并发预跑后灌入, tick 取走 (None=现场探)。
     // 避免持锁串行探活在降级 fleet 下把锁扣 N×2s。
     pub(crate) cached_probe: Option<ProbeResult>,
+    // issue #122 phase-2: 到点崩溃重启 exec 移出核心锁。tick 的 due 分支只挂起
+    // (记 old_pid + 动作模式), collect_pending_execs 取走锁外执行, finish 回填。
+    // Some(true)=restart 命令, Some(false)=stop+start; exec_in_flight 防执行窗口
+    // 内 tick 重入再拉起。
+    pending_exec: Option<bool>,
+    pending_old_pid: Option<i32>,
+    pub(crate) exec_in_flight: bool,
 }
 
 impl ServiceRunner {
@@ -255,8 +271,11 @@ impl ServiceRunner {
             start_fail_streak: 0,
             start_retry: false,
             cached_probe: None,
+            pending_exec: None,
+            pending_old_pid: None,
+            exec_in_flight: false,
             probe_fn: std::sync::Arc::new(probe_fn),
-            start_fn: Box::new(start_fn),
+            start_fn: std::sync::Arc::new(start_fn),
         }
     }
 
@@ -267,6 +286,11 @@ impl ServiceRunner {
         store: &HistoryStore,
         alerter: &mut Alerter,
     ) -> Result<()> {
+        // issue #122 phase-2: 崩溃恢复 exec 锁外在飞 — 本 tick 完全让路 (不探活
+        // 不计 streak, 与旧持锁 exec 期间 tick 阻塞的语义一致, 防重复拉起)。
+        if self.exec_in_flight {
+            return Ok(());
+        }
         // issue #123: 优先取预跑缓存 (并发探活结果), 取走后本 tick 不再现场探
         let result = self
             .cached_probe
@@ -545,76 +569,11 @@ impl ServiceRunner {
                         }
                         // issue #112: 审计 — 自动恢复实际拉起前先抓旧 pid,
                         // 成功后落 AutoRestart 事件 (old/new pid 可考)。
-                        let old_pid = self.pidfile_pid();
-                        match self.invoke_start() {
-                            Err(e) => {
-                                let detail = e.to_string();
-                                // issue #47: exit 78 (EX_CONFIG) = 配置致命, 重启无救 —
-                                // 不烧快速重试, 退避走 10→60→300; 连续达 cap 标 Failed。
-                                if exit_code_of(&detail) == Some(EXIT_CONFIG) {
-                                    self.config_fail_streak += 1;
-                                    self.last_start_ts = None;
-                                    tracing::error!(
-                                        svc = %self.def.name,
-                                        streak = self.config_fail_streak,
-                                        "config-fatal (exit 78), 重启无救需修配置"
-                                    );
-                                    let _ = alerter
-                                        .alert(Alert {
-                                            service: self.def.name.clone(),
-                                            kind: AlertKind::ServiceConfigFatal,
-                                            detail,
-                                            ts: now_ts,
-                                        })
-                                        .await;
-                                    if self.config_fail_streak >= CONFIG_FAIL_CAP {
-                                        self.state = State::Failed;
-                                        tracing::error!(svc = %self.def.name, "config-fatal 封顶, 标 Failed 停重启");
-                                        return;
-                                    }
-                                    self.restart_after =
-                                        Some(now_ts + escalated_delay(self.config_fail_streak));
-                                } else {
-                                    tracing::warn!(svc = %self.def.name, err = %detail, "start.sh fail");
-                                    let _ = alerter
-                                        .alert(Alert {
-                                            service: self.def.name.clone(),
-                                            kind: AlertKind::RestartFailed,
-                                            detail,
-                                            ts: now_ts,
-                                        })
-                                        .await;
-                                }
-                            }
-                            Ok(()) => {
-                                self.last_start_ts = Some(now_ts);
-                                // issue #112: 自动恢复 (crash / start-retry 退避流)
-                                // 实际拉起成功 → AutoRestart 审计事件 (不去抖, info)。
-                                // 触发原因见紧邻的 ServiceDown 事件行。
-                                let new_pid = self.pidfile_pid();
-                                let _ = alerter
-                                    .alert(Alert {
-                                        service: self.def.name.clone(),
-                                        kind: AlertKind::AutoRestart,
-                                        detail: format!(
-                                            "auto-recovery restart ok old_pid={} new_pid={}",
-                                            old_pid
-                                                .map(|p| p.to_string())
-                                                .unwrap_or_else(|| "?".into()),
-                                            new_pid
-                                                .map(|p| p.to_string())
-                                                .unwrap_or_else(|| "?".into()),
-                                        ),
-                                        ts: now_ts,
-                                    })
-                                    .await;
-                                // issue #90: 启动脚本成功即退出启动重试流 —
-                                // 后续失败回归 crash / 快速失败语义, 复位计数
-                                self.start_fail_streak = 0;
-                                self.start_retry = false;
-                                self.state = State::Restarting;
-                            }
-                        }
+                        // issue #122 phase-2: exec 锁外执行 — 这里只挂起作业,
+                        // collect_pending_execs 取走, finish_pending_execs 落账。
+                        self.pending_old_pid = self.pidfile_pid();
+                        self.pending_exec = Some(self.restart_cmd == "restart");
+                        self.state = State::Restarting;
                     }
                 }
             }
@@ -646,6 +605,102 @@ impl ServiceRunner {
     // pidfile 读 pid (缺失/非法 → None)
     fn pidfile_pid(&self) -> Option<i32> {
         read_pidfile(&crate::start_map::pid_path(&self.def.name))
+    }
+
+    // issue #122 phase-2: 取走挂起的到点重启作业 (锁外执行用)。
+    pub(crate) fn take_pending_exec(&mut self) -> Option<bool> {
+        self.pending_exec.take()
+    }
+
+    // issue #123: start 闭包克隆 (并发预跑/锁外 exec 用)。
+    pub(crate) fn start_fn_clone(&self) -> StartFn {
+        self.start_fn.clone()
+    }
+
+    // issue #122 phase-2: 锁外 exec 完成后落账 (原 due 分支的 Ok/Err 处理)。
+    pub(crate) async fn apply_exec_result(
+        &mut self,
+        now_ts: u64,
+        alerter: &mut Alerter,
+        res: Result<()>,
+    ) {
+        self.exec_in_flight = false;
+        let old_pid = self.pending_old_pid.take();
+        match res {
+            Err(e) => {
+                let detail = e.to_string();
+                // issue #47: exit 78 (EX_CONFIG) = 配置致命, 重启无救 —
+                // 不烧快速重试, 退避走 10→60→300; 连续达 cap 标 Failed。
+                if exit_code_of(&detail) == Some(EXIT_CONFIG) {
+                    self.config_fail_streak += 1;
+                    self.last_start_ts = None;
+                    tracing::error!(
+                        svc = %self.def.name,
+                        streak = self.config_fail_streak,
+                        "config-fatal (exit 78), 重启无救需修配置"
+                    );
+                    let _ = alerter
+                        .alert(Alert {
+                            service: self.def.name.clone(),
+                            kind: AlertKind::ServiceConfigFatal,
+                            detail,
+                            ts: now_ts,
+                        })
+                        .await;
+                    if self.config_fail_streak >= CONFIG_FAIL_CAP {
+                        self.state = State::Failed;
+                        tracing::error!(svc = %self.def.name, "config-fatal 封顶, 标 Failed 停重启");
+                        return;
+                    }
+                    self.restart_after = Some(now_ts + escalated_delay(self.config_fail_streak));
+                } else {
+                    tracing::warn!(svc = %self.def.name, err = %detail, "start.sh fail");
+                    let _ = alerter
+                        .alert(Alert {
+                            service: self.def.name.clone(),
+                            kind: AlertKind::RestartFailed,
+                            detail,
+                            ts: now_ts,
+                        })
+                        .await;
+                }
+                self.state = State::Unhealthy;
+            }
+            Ok(()) => {
+                self.last_start_ts = Some(now_ts);
+                // issue #112: 自动恢复 (crash / start-retry 退避流)
+                // 实际拉起成功 → AutoRestart 审计事件 (不去抖, info)。
+                // 触发原因见紧邻的 ServiceDown 事件行。
+                let new_pid = self.pidfile_pid();
+                let _ = alerter
+                    .alert(Alert {
+                        service: self.def.name.clone(),
+                        kind: AlertKind::AutoRestart,
+                        detail: format!(
+                            "auto-recovery restart ok old_pid={} new_pid={}",
+                            old_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                            new_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                        ),
+                        ts: now_ts,
+                    })
+                    .await;
+                // issue #90: 启动脚本成功即退出启动重试流 —
+                // 后续失败回归 crash / 快速失败语义, 复位计数
+                self.start_fail_streak = 0;
+                self.start_retry = false;
+                self.state = State::Restarting;
+            }
+        }
+    }
+
+    // issue #122 phase-2: runner 级同步收尾 (测试/单机路径用) — 锁内执行挂起
+    // 作业并落账。生产路径走 collect_pending_execs (锁外) + finish_pending_execs。
+    pub async fn complete_pending_exec(&mut self, now_ts: u64, alerter: &mut Alerter) {
+        let Some(is_restart) = self.pending_exec.take() else {
+            return;
+        };
+        let res = run_start_verbs(&self.start_fn, is_restart);
+        self.apply_exec_result(now_ts, alerter, res).await;
     }
 
     // issue #90: up 路径启动失败登记。非 exit-78 的启动失败多为环境未就绪
@@ -905,6 +960,7 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
         // 到点 tick (首退避 delay=1s): 真正重启 + 记 1 次 crash
         r.tick(1001, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1001, &mut al).await;
         assert!(matches!(r.state, State::Restarting));
         assert_eq!(r.policy.crash_count(), 1);
         assert_eq!(*calls.lock().unwrap(), vec!["restart".to_string()]);
@@ -1005,6 +1061,7 @@ mod tests {
         r.tick(1000, &s, &mut al).await.unwrap();
         assert!(calls.lock().unwrap().is_empty(), "排期 tick 不应重启");
         r.tick(1001, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1001, &mut al).await;
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["stop".to_string(), "start".to_string()]
@@ -1116,14 +1173,17 @@ mod tests {
         assert_eq!(r.restart_after, Some(1001));
         // 到点: start 失败 exit 78 → streak=1, 退避 10s
         r.tick(1001, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1001, &mut al).await;
         assert_eq!(r.config_fail_streak, 1);
         assert_eq!(r.restart_after, Some(1011));
         // 到点: streak=2, 退避 60s
         r.tick(1011, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1011, &mut al).await;
         assert_eq!(r.config_fail_streak, 2);
         assert_eq!(r.restart_after, Some(1071));
         // 到点: streak=3, 退避 300s (封顶)
         r.tick(1071, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1071, &mut al).await;
         assert_eq!(r.config_fail_streak, 3);
         assert_eq!(r.restart_after, Some(1371));
         // 状态仍 Unhealthy (未封顶不标 Failed)
@@ -1153,6 +1213,7 @@ mod tests {
         now += 1;
         loop {
             r.tick(now, &s, &mut al).await.unwrap(); // 失败 → streak+1
+            r.complete_pending_exec(now, &mut al).await;
             if matches!(r.state, State::Failed) {
                 break;
             }
@@ -1181,19 +1242,23 @@ mod tests {
         // 排期 1s → 到点 start 成功 (last_start_ts=1001)
         r.tick(1000, &s, &mut al).await.unwrap();
         r.tick(1001, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1001, &mut al).await;
         assert_eq!(r.last_start_ts, Some(1001));
         assert_eq!(r.fast_fail_streak, 0);
         // 轮 1: 排期 (退避 2s) → 到点 1004, 距上次 start 3s < 10s → streak=1
         r.tick(1002, &s, &mut al).await.unwrap();
         r.tick(1004, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1004, &mut al).await;
         assert_eq!(r.fast_fail_streak, 1);
         // 轮 2: 退避 4s → 到点 1009, 距上次 start 5s → streak=2
         r.tick(1005, &s, &mut al).await.unwrap();
         r.tick(1009, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1009, &mut al).await;
         assert_eq!(r.fast_fail_streak, 2);
         // 轮 3: 退避 8s → 到点 1018, 距上次 start 9s → streak=3 熔断 latch
         r.tick(1010, &s, &mut al).await.unwrap();
         r.tick(1018, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1018, &mut al).await;
         assert_eq!(r.fast_fail_streak, 3);
         assert!(r.fast_fail_alerted, "达阈值应置熔断 latch");
         // 下一轮排期退避升级: escalated_delay(3)=300s
@@ -1401,6 +1466,7 @@ mod tests {
         assert!(gone, "操作员脚本应已退出");
         r.tick(1002, &s, &mut al).await.unwrap();
         r.tick(1003, &s, &mut al).await.unwrap();
+        r.complete_pending_exec(1003, &mut al).await;
         assert!(
             !calls.lock().unwrap().is_empty(),
             "脚本退出后应恢复正常自动重启"

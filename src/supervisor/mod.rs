@@ -1002,6 +1002,65 @@ impl SupervisorCore {
         }
     }
 
+    // issue #122 phase-2: 收走 tick 挂起的到点重启作业 (锁内, 不 exec)。
+    // 调用方在核心锁外经 run_pending_execs 并发执行, 再 finish_pending_execs 落账。
+    pub fn collect_pending_execs(&mut self) -> Vec<(String, bool, runner::StartFn)> {
+        let mut out = Vec::new();
+        for r in &mut self.runners {
+            if let Some(is_restart) = r.take_pending_exec() {
+                r.exec_in_flight = true;
+                out.push((r.def.name.clone(), is_restart, r.start_fn_clone()));
+            }
+        }
+        if !out.is_empty() {
+            tracing::info!(n = out.len(), "tick 到点重启: exec 移出核心锁");
+        }
+        out
+    }
+
+    // issue #122 phase-2: 锁外执行挂起重启作业 (并发), 返回逐服务结果。
+    pub async fn run_pending_execs(
+        execs: Vec<(String, bool, runner::StartFn)>,
+    ) -> Vec<(String, Result<()>)> {
+        let mut set = tokio::task::JoinSet::new();
+        for (name, is_restart, f) in execs {
+            set.spawn_blocking(move || {
+                let res = runner::run_start_verbs(&f, is_restart);
+                (name, res)
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(pair) => out.push(pair),
+                Err(e) => tracing::error!(err = %e, "pending exec join fail (该服务本轮回落)"),
+            }
+        }
+        out
+    }
+
+    // issue #122 phase-2: 重新拿锁, 逐服务落账 exec 结果 (状态机/告警/pid 审计)。
+    pub async fn finish_pending_execs(&mut self, now_ts: u64, results: Vec<(String, Result<()>)>) {
+        for (name, res) in results {
+            if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+                r.apply_exec_result(now_ts, &mut self.alerter, res).await;
+            }
+        }
+    }
+
+    // 测试/单机便捷入口: tick + 到期 exec + 落账 (持 &mut 全程 — 测试无并发,
+    // 无锁可让)。生产 daemon 路径在 main.rs: tick_all (锁内) → collect → 锁外
+    // run_pending_execs → finish (重新拿锁)。
+    pub async fn drive(&mut self, now_ts: u64) {
+        self.tick_all(now_ts).await;
+        let execs = self.collect_pending_execs();
+        if execs.is_empty() {
+            return;
+        }
+        let results = Self::run_pending_execs(execs).await;
+        self.finish_pending_execs(now_ts, results).await;
+    }
+
     // issue #107 D2: daemon 冷启动状态对账。launchd 崩溃重启 (如系统睡眠中
     // 进程死亡) 后, 托管服务的 nohup 进程往往还活着, 但 runner 全部初始为
     // Stopped — 首个 tick 前的 status 会谎报 Stopped, 操作员据此手动 restart
@@ -2213,19 +2272,19 @@ mod tests {
         core.runners[0].state = runner::State::Unhealthy;
         // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
         core.runners[0].fail_streak = 2;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Unhealthy),
             "排期 tick 不应重启"
         );
-        core.tick_all(1001).await;
+        core.drive(1001).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Restarting),
             "tick_all 后应 Restarting"
         );
         // 翻探活为健康 → tick_all 应恢复 Healthy
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
-        core.tick_all(1001).await;
+        core.drive(1001).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Healthy),
             "探活恢复后 tick_all 应 Healthy"
@@ -2248,8 +2307,8 @@ mod tests {
         );
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
-        core.tick_all(1000).await;
-        core.tick_all(1001).await; // 到点重启, invoke_start Ok → AutoRestart 事件
+        core.drive(1000).await;
+        core.drive(1001).await; // 到点重启, invoke_start Ok → AutoRestart 事件
         // 事件落库: kind=AutoRestart, detail 带 pid 字段 (测试无 pidfile → "?")
         let (kind, detail): (String, String) = core
             .store
@@ -2266,7 +2325,7 @@ mod tests {
         assert!(detail.contains("new_pid="), "detail 应带 new_pid: {detail}");
         // 翻探活为健康 → 恢复
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
-        core.tick_all(1001).await;
+        core.drive(1001).await;
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
         // status enrichment: last_restart 列 = "AutoRestart ..."
         let status = core.status_all();
@@ -2318,7 +2377,7 @@ mod tests {
             |_svc, _cmd, _env| Ok(()),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Unhealthy),
             "探活通过但 pid 已死应转 Unhealthy"
@@ -2338,7 +2397,7 @@ mod tests {
             |_svc, _cmd, _env| Ok(()),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
         drop(core);
 
@@ -2351,7 +2410,7 @@ mod tests {
             |_svc, _cmd, _env| Ok(()),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
         live.kill().unwrap();
         live.wait().unwrap();
@@ -2591,7 +2650,7 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         // 告警经由 tracing WARN + 可选 webhook; 此处验证不 panic + 状态表见 Failed
         let st = core.status_all();
         let redis = st.iter().find(|e| e.name == "redis").unwrap();
@@ -2784,7 +2843,7 @@ mod tests {
         core.runners[0].state = runner::State::Healthy;
         // 5 tick, 去抖窗内 (默认 alert_dedup_sec=300, escalation=5)
         for ts in [1000u64, 1002, 1004, 1006, 1008] {
-            core.tick_all(ts).await;
+            core.drive(ts).await;
         }
         let rec = core.compose_tracker.record("redis").unwrap();
         assert_eq!(rec.fail_count, 5, "连续 5 tick 失败应累计 5");
@@ -2806,14 +2865,14 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert_eq!(
             core.compose_tracker.record("redis").unwrap().raw_state,
             "restarting"
         );
         // 切到 exited (经 Arc<Mutex> 内部可变, 无需借 core.compose)
         *containers.lock().unwrap() = vec![mk_container("redis", "exited", "", 6379)];
-        core.tick_all(1002).await;
+        core.drive(1002).await;
         assert_eq!(
             core.compose_tracker.record("redis").unwrap().raw_state,
             "exited",
@@ -2836,14 +2895,14 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         assert_eq!(
             core.compose_tracker.record("redis").unwrap().state,
             "Failed"
         );
         // 恢复 (经 Arc<Mutex> 内部可变)
         *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
-        core.tick_all(1010).await;
+        core.drive(1010).await;
         let rec = core.compose_tracker.record("redis").unwrap();
         assert_eq!(rec.state, "Healthy", "恢复应转 Healthy");
         assert_eq!(rec.fail_count, 0, "恢复应重置 fail_count");
@@ -2865,7 +2924,7 @@ mod tests {
         core.runners[0].state = runner::State::Healthy;
         // escalation=5 (fake_cfg 默认), 跑 5 tick
         for ts in [1000u64, 1002, 1004, 1006, 1008] {
-            core.tick_all(ts).await;
+            core.drive(ts).await;
         }
         let rec = core.compose_tracker.record("redis").unwrap();
         assert!(rec.escalated, "达阈值应升级标记");
@@ -2887,7 +2946,7 @@ mod tests {
             |_, _, _| Ok(()),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         let ev = core.store.recent_events("fusion-mlx", 10).unwrap();
         assert_eq!(ev.len(), 1, "首次宕机 ServiceDown 应落库");
         assert_eq!(ev[0].kind, "ServiceDown");
@@ -2895,7 +2954,7 @@ mod tests {
         assert_eq!(ev[0].severity, "warn");
         assert_eq!(core.alerter.alerts_emitted(), 1);
         // 去抖窗内第二次 ServiceDown: 不落库不计数 (tick 只排期重启, 不发新告警)
-        core.tick_all(1001).await;
+        core.drive(1001).await;
         let ev2 = core.store.recent_events("fusion-mlx", 10).unwrap();
         assert_eq!(ev2.len(), 1, "无新告警不应新增 event 行");
         assert_eq!(core.alerter.alerts_emitted(), 1);
@@ -2947,7 +3006,7 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         let ev = core.store.recent_events("redis", 10).unwrap();
         assert!(!ev.is_empty(), "exited 容器应写 event 行");
         assert_eq!(ev[0].kind, "ServiceDown");
@@ -2973,10 +3032,10 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        core.tick_all(1000).await;
+        core.drive(1000).await;
         // 恢复
         *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
-        core.tick_all(1010).await;
+        core.drive(1010).await;
         let ev = core.store.recent_events("redis", 10).unwrap();
         let has_back = ev
             .iter()
@@ -3143,7 +3202,7 @@ mod tests {
             r.start_fail_streak = runner::START_FAIL_CAP - 1;
             r.restart_after = Some(1000);
         }
-        core.tick_all(1001).await;
+        core.drive(1001).await;
         let r = &core.runners[0];
         assert!(matches!(r.state, runner::State::Failed), "达 cap 应 Failed");
         assert_eq!(r.start_fail_streak, runner::START_FAIL_CAP);
