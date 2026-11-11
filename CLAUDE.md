@@ -189,3 +189,11 @@ React 18 + Vite 5 + TypeScript + Tailwind SPA (issue #25/#28), served by the dae
 - Comments are in Chinese (codebase convention); match this.
 - 4-space indentation, no docstrings, always include logging (`tracing`).
 - Tests inject fakes via `new_with_fns` / `harness` rather than spinning real services — the probe/start functions are `Arc`-ed closures. Deterministic timestamps injected as `u64` unix-sec, never `SystemTime::now()` in `RestartPolicy` logic.
+
+## Lock discipline phase 2 (issue #122/#123, v0.1.57/v0.1.58)
+
+Exec 和探活不持核心锁的边界 (2026-11-11):
+
+- **Issue #122 (v0.1.57)**: 单服务 `up_one`/`down_one`/`restart_one` 拆成 StartJob 三段协议 — `prepare_*` (锁内, 只做 dep-gate/探活跳过/env 解析/状态复位, 不 exec) → `StartJob::run()` (锁外, `tokio::time::timeout` 包 exec) → `finish_*` (重新拿锁落状态机)。RPC `up`/`down`/`restart` 单服务臂 (`src/rpc/server.rs`, UDS+HTTP 共用 dispatch) 在 prepare 与 finish 之间丢 guard — start.sh 里 go build 数分钟不再堵 `/api/v1/status`。restart 保持 #96 语义: stop exec 锁外, `stop_and_verify(name, false)` 只验证 (有界 20×250ms 探活, 持锁无长 exec — `run_stop=false` 时不再重复跑 stop 命令; rollout 路径传 `true`), start exec 锁外。**仍持锁 (phase-2 未做)**: `up_all`/`down_all` 内部循环、`rollout`、tick 崩溃恢复的 `invoke_start` (runner 状态机手术风险高, 单独评估)。
+- **Issue #123 (v0.1.58)**: `tick_all` 全程持锁 + 串行探活, 降级 fleet (N 个宕机 × 2s 超时) 把锁扣 N×2s — #122 之后 status 仍 5s+ 无响应的元凶 (睡眠唤醒后 10+ 服务 Timeout 实证)。改 `preflight_probes()`: 每 runner 注入闭包并发 `spawn_blocking`+`JoinSet` 预跑, 结果灌 `runner.cached_probe`, tick 取走 (None 回落现场探); 最坏持锁 N×2s → ~max(2s)。`probe_once` (rollout prewarm) 不吃缓存。`ProbeFn`/`StartFn` 从 Box 改 Arc (并发预跑需 clone)。
+- 已知测试环境 flake: `tests/test_probe_http.rs` 直连真 socket + 2s 超时, 机器 load avg 80+ (多 Claude 会话并发) 时 accept 线程调度不上即 fail — 隔离跑通过, 与代码无关。
