@@ -85,6 +85,15 @@ pub struct Config {
     // daemonize) 全部继承; 空串禁用 (保持 launchd 原始 PATH)。
     #[serde(default = "default_native_extra_path")]
     pub native_extra_path: String,
+    // issue #126: 启动宽限窗口 (秒)。exec 拉起成功后, 宽限期内探活失败不计
+    // fail_streak / 不排重启 (慢启动 daemon 绑定口需 30-60s, 旧逻辑在启动窗口
+    // 内就烧完连续失败计数 → 到点重启杀掉正在启动的健康进程)。0 = 禁用。
+    #[serde(default = "default_startup_grace_secs")]
+    pub startup_grace_secs: u64,
+}
+
+fn default_startup_grace_secs() -> u64 {
+    90
 }
 
 // compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
@@ -237,6 +246,7 @@ impl Default for Config {
             native_pg_host: default_native_pg_host(),
             native_pg_port: default_native_pg_port(),
             native_extra_path: default_native_extra_path(),
+            startup_grace_secs: default_startup_grace_secs(),
         }
     }
 }

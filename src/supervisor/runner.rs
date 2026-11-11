@@ -253,6 +253,13 @@ pub struct ServiceRunner {
     pending_exec: Option<bool>,
     pending_old_pid: Option<i32>,
     pub(crate) exec_in_flight: bool,
+    // issue #126: 启动宽限窗口时长 (秒)。0=禁用 (测试默认); 生产 new() 从
+    // cfg.startup_grace_secs 灌入。宽限截止时刻在 exec Ok 时记 boot_grace_until。
+    pub startup_grace_secs: u64,
+    // issue #126: 启动宽限截止 (unix sec)。Some(t) 且 now < t → 探活失败不计
+    // streak 不排重启 (慢启动 daemon 绑定口需 30-60s, 不能在启动窗口烧完
+    // crash cap 杀掉正在启动的进程)。Healthy 恢复时清除。
+    boot_grace_until: Option<u64>,
 }
 
 impl ServiceRunner {
@@ -282,6 +289,8 @@ impl ServiceRunner {
             pending_exec: None,
             pending_old_pid: None,
             exec_in_flight: false,
+            startup_grace_secs: 0,
+            boot_grace_until: None,
             probe_fn: std::sync::Arc::new(probe_fn),
             start_fn: std::sync::Arc::new(start_fn),
         }
@@ -352,6 +361,8 @@ impl ServiceRunner {
                     State::Unhealthy | State::Restarting | State::Failed
                 );
                 self.state = State::Healthy;
+                // issue #126: 探活已恢复 — 启动宽限窗口使命完成, 清除。
+                self.boot_grace_until = None;
                 // issue #79: 任一次成功探活即复位连续失败计数 (抖动不升级)。
                 self.fail_streak = 0;
                 if was_down {
@@ -402,6 +413,26 @@ impl ServiceRunner {
         now_ts: u64,
         alerter: &mut Alerter,
     ) {
+        // issue #126: 启动宽限窗口 — exec 刚拉起的慢启动 daemon (绑定口需
+        // 30-60s) 探活必然失败, 旧逻辑在启动窗口内就烧完 fail_streak 并到点
+        // 重启, 把正在启动的健康进程杀掉 (2026-11-11 agent-studio 28 次
+        // AutoRestart + RestartCapHit mid-boot 实证)。宽限期内探活失败不计
+        // streak / 不排重启 / 不告警; 窗口过完回归正常监督。
+        if let Some(until) = self.boot_grace_until
+            && now_ts < until
+            && matches!(
+                self.state,
+                State::Starting | State::Unhealthy | State::Restarting
+            )
+        {
+            tracing::info!(
+                svc = %self.def.name,
+                remaining_sec = until - now_ts,
+                reason = ?reason,
+                "startup grace: 探活未达不计失败 (等 daemon 完成启动)"
+            );
+            return;
+        }
         // 防风暴: BadPath 不重启不记 crash, 只告警路径错
         if !reason.restart_eligible() {
             tracing::warn!(
@@ -684,6 +715,9 @@ impl ServiceRunner {
             }
             Ok(()) => {
                 self.last_start_ts = Some(now_ts);
+                // issue #126: exec 拉起成功 → 记启动宽限截止。窗口内探活失败
+                // 不计失败不排重启 (慢启动 daemon 绑定口需 30-60s)。
+                self.set_boot_grace(now_ts);
                 // issue #112: 自动恢复 (crash / start-retry 退避流)
                 // 实际拉起成功 → AutoRestart 审计事件 (不去抖, info)。
                 // 触发原因见紧邻的 ServiceDown 事件行。
@@ -712,10 +746,18 @@ impl ServiceRunner {
     // issue #124: exec 前置探活已 Healthy — 外部实例 (操作员手工 start.sh
     // restart) 已接管端口, 采纳而非拉起。走恢复路径: 全套计数复位 + ServiceBack
     // 告警; 不发 AutoRestart (我们没有拉起任何进程)。
+    // issue #126: exec 拉起成功后记启动宽限截止 (startup_grace_secs>0 时)。
+    pub fn set_boot_grace(&mut self, now_ts: u64) {
+        if self.startup_grace_secs > 0 {
+            self.boot_grace_until = Some(now_ts + self.startup_grace_secs);
+        }
+    }
+
     pub(crate) async fn apply_adopted(&mut self, now_ts: u64, alerter: &mut Alerter) {
         self.exec_in_flight = false;
         self.pending_old_pid = None;
         self.restart_after = None;
+        self.boot_grace_until = None;
         self.fail_streak = 0;
         self.start_fail_streak = 0;
         self.start_retry = false;

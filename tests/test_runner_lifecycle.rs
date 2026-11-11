@@ -133,6 +133,122 @@ async fn test_issue124_adopt_skips_respawn_when_port_served() {
     cleanup_db(&path);
 }
 
+#[tokio::test]
+async fn test_issue126_grace_defers_restart_during_window() {
+    // issue #126: 启动宽限期内探活失败不计 fail_streak / 不排重启,
+    // 慢启动 daemon (30-60s 才绑口) 不再被 auto-restart 击杀。
+    let def = ServiceDef {
+        name: "fusion-agent-studio".into(),
+        port: 11442,
+        repo_dir: "fusion-test-no-such-repo".into(),
+        purpose: "x".into(),
+        fixed: false,
+        managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
+        layer: Layer::App,
+    };
+    let probe_cell = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    }));
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pc = probe_cell.clone();
+    let cc = calls.clone();
+    let mut r = ServiceRunner::new(
+        def,
+        "restart",
+        move || pc.lock().unwrap().clone(),
+        move |c| {
+            cc.lock().unwrap().push(c.into());
+            Ok(())
+        },
+        RestartPolicy::new(300, 5, 30),
+    );
+    r.state = State::Starting;
+    r.startup_grace_secs = 60;
+    r.set_boot_grace(1000);
+    let path = std::env::temp_dir().join(format!("fusion-sv-i126-a-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = HistoryStore::open(&path).unwrap();
+    let mut al = Alerter::new(300, String::new());
+    // 宽限期内连续失败: 状态不变, 无 crash 记账, 无 exec 排期
+    r.tick(1001, &store, &mut al).await.unwrap();
+    r.tick(1010, &store, &mut al).await.unwrap();
+    r.tick(1050, &store, &mut al).await.unwrap();
+    assert!(
+        matches!(r.state, State::Starting),
+        "宽限期内状态不得转移, 实际 {:?}",
+        r.state
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    // 宽限到期后正常流转: 首次失败标 Unhealthy
+    r.tick(1061, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Unhealthy), "实际 {:?}", r.state);
+    cleanup_db(&path);
+}
+
+#[tokio::test]
+async fn test_issue126_grace_expires_normal_flow_resumes() {
+    // issue #126: 宽限到期 + 探活恢复健康 → 翻回 Healthy 且宽限窗口清除,
+    // 之后再次宕机走正常恢复流 (不受宽限残留影响)。
+    let def = ServiceDef {
+        name: "fusion-agent-studio".into(),
+        port: 11442,
+        repo_dir: "fusion-test-no-such-repo".into(),
+        purpose: "x".into(),
+        fixed: false,
+        managed: true,
+        boot_tier: fusion_supervisor::manifest::BootTier::T2,
+        layer: Layer::App,
+    };
+    let probe_cell = Arc::new(Mutex::new(ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    }));
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pc = probe_cell.clone();
+    let cc = calls.clone();
+    let mut r = ServiceRunner::new(
+        def,
+        "restart",
+        move || pc.lock().unwrap().clone(),
+        move |c| {
+            cc.lock().unwrap().push(c.into());
+            Ok(())
+        },
+        RestartPolicy::new(300, 5, 30),
+    );
+    r.state = State::Starting;
+    r.startup_grace_secs = 30;
+    r.set_boot_grace(1000);
+    let path = std::env::temp_dir().join(format!("fusion-sv-i126-b-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = HistoryStore::open(&path).unwrap();
+    let mut al = Alerter::new(300, String::new());
+    // 宽限期内失败被吞
+    r.tick(1010, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Starting));
+    // daemon 完成启动, 探活恢复健康
+    *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
+    r.tick(1020, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
+    // 再次宕机: 正常流转 (先 Unhealthy, 3 连败后排期重启)
+    *probe_cell.lock().unwrap() = ProbeResult::Unhealthy {
+        reason: UnhealthyReason::ConnectionRefused,
+    };
+    r.tick(1030, &store, &mut al).await.unwrap();
+    assert!(matches!(r.state, State::Unhealthy), "实际 {:?}", r.state);
+    r.tick(1031, &store, &mut al).await.unwrap();
+    r.tick(1032, &store, &mut al).await.unwrap();
+    r.tick(1033, &store, &mut al).await.unwrap();
+    r.complete_pending_exec(1033, &mut al).await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "宽限清除后重启应正常执行, 实际 {:?}",
+        calls.lock().unwrap()
+    );
+    cleanup_db(&path);
+}
+
 // issue #124 测试脚手架: 已达 Failed 态的 runner (crash-window cap=1 封顶路径)。
 // 后缀区分两测试的 db 文件 (同进程并发跑, 共名会 database is locked)。
 async fn failed_runner(

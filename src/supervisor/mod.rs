@@ -160,6 +160,15 @@ impl SupervisorCore {
                 )
             })
             .collect();
+        // issue #126: 仅生产构造器注入启动宽限窗口; 测试构造器保持 0 (行为不变)
+        let grace = cfg.startup_grace_secs;
+        let runners: Vec<_> = runners
+            .into_iter()
+            .map(|mut r| {
+                r.startup_grace_secs = grace;
+                r
+            })
+            .collect();
         let boot_pins = load_boot_pins(&store);
         let compose = build_compose(&cfg);
         let compose_tracker = crate::compose_tracker::ComposeTracker::new(
@@ -383,6 +392,8 @@ impl SupervisorCore {
                         r.state = runner::State::Healthy;
                     } else if start_res.is_ok() {
                         r.state = runner::State::Starting;
+                        // issue #126: 拉起成功记启动宽限截止
+                        r.set_boot_grace(now_unix());
                     } else {
                         let detail = start_res
                             .err()
@@ -556,6 +567,9 @@ impl SupervisorCore {
         match res {
             Ok(()) => {
                 r.state = runner::State::Starting;
+                // issue #126: 拉起成功记启动宽限截止 — 窗口内探活失败不计失败
+                // 不排重启 (慢启动 daemon 绑定口需 30-60s)
+                r.set_boot_grace(now_unix());
                 Ok(())
             }
             Err(e) => {
@@ -748,6 +762,8 @@ impl SupervisorCore {
             .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
         res?;
         r.state = runner::State::Starting;
+        // issue #126: restart 拉起成功记启动宽限截止 (慢启动 daemon 绑口窗口)
+        r.set_boot_grace(now_unix());
         let new_pid = read_pidfile_pid(name);
         tracing::info!(svc = %name, old_pid, new_pid, "restart: start 已发起 (pid 替换)");
         Ok((old_pid, new_pid))
@@ -1392,6 +1408,8 @@ impl SupervisorCore {
             anyhow::bail!("rollout start fail: {e}");
         }
         r.state = runner::State::Starting;
+        // issue #126: rollout 拉起成功记启动宽限截止
+        r.set_boot_grace(now_ts);
         tracing::info!(svc = %service, "rollout: start 完成, prewarm 等健康");
         // 4. prewarm: 探活循环, 达 Healthy 即成功
         // issue #96 伴生缺陷: 此前循环以 t+=1 模拟时间推进且无 sleep — 60 次
