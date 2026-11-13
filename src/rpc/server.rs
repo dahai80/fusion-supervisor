@@ -241,7 +241,29 @@ async fn dispatch(
                     {
                         tracing::warn!(err = %e, "StopAll event write fail");
                     }
-                    c.down_all().await
+                    // issue #128: 全停逐服务记 ManualStop — 此前只有一条 StopAll("*")
+                    // 聚合事件, 单服务 last_restart 留着陈旧 note (如 AutoRestart
+                    // "restart ok"), fleet drift 排障无法归因停止方
+                    let was_running: Vec<String> = c
+                        .runners
+                        .iter()
+                        .filter(|r| !matches!(r.state, crate::supervisor::runner::State::Stopped))
+                        .map(|r| r.def.name.clone())
+                        .collect();
+                    let res = c.down_all().await;
+                    for svc in &was_running {
+                        if let Err(e) = c.store.record_event(
+                            svc,
+                            "ManualStop",
+                            &origin,
+                            now_ts,
+                            "native",
+                            "warn",
+                        ) {
+                            tracing::warn!(svc = %svc, err = %e, "ManualStop event write fail");
+                        }
+                    }
+                    res
                 }
             };
             match res {

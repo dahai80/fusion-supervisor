@@ -273,6 +273,58 @@ async fn test_up_records_startall_and_manualstart_events() {
     handle.abort();
 }
 
+// issue #128: 全量 down (STOP-ALL) 必须逐服务记 ManualStop — 此前只有一条
+// StopAll("*") 聚合事件, 单服务 last_restart 留陈旧 note (如 AutoRestart
+// "restart ok"), fleet drift 排障无法归因停止方。
+#[tokio::test]
+async fn test_stopall_records_per_service_manualstop_events() {
+    let core = SupervisorCore::new_with_fns(
+        vec![def("fusion-mlx", 11434), def("fusion-rag", 11436)],
+        cfg(),
+        |_| ProbeResult::Healthy { latency_ms: 1 },
+        |_, _, _| Ok(()),
+    );
+    let core_arc = Arc::new(tokio::sync::Mutex::new(core));
+    let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
+
+    // 先全量 up 让 runner 进入 Healthy (was_running 快照非空)
+    let up = http_req(
+        &addr,
+        "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(up.starts_with("HTTP/1.1 200"), "{}", &up[..30]);
+
+    // 全量 down (无 body) → StopAll("*") + 每个先前运行的服务一条 ManualStop
+    let down = http_req(
+        &addr,
+        "POST /api/v1/down HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(down.starts_with("HTTP/1.1 200"), "{}", &down[..30]);
+
+    {
+        let c = core_arc.lock().await;
+        let evs = c.store.recent_events_all(20).unwrap();
+        for svc in ["fusion-mlx", "fusion-rag"] {
+            let ev = evs
+                .iter()
+                .find(|e| e.kind == "ManualStop" && e.service == svc)
+                .unwrap_or_else(|| panic!("{svc} 缺 ManualStop 事件"));
+            assert!(
+                ev.detail.contains("http POST /api/v1/down from"),
+                "origin 应带 http 来源: {}",
+                ev.detail
+            );
+        }
+        assert!(
+            evs.iter().any(|e| e.kind == "StopAll" && e.service == "*"),
+            "StopAll 聚合事件缺失"
+        );
+    }
+    handle.abort();
+}
+
 #[tokio::test]
 async fn test_static_serving_and_traversal_rejected() {
     let core = SupervisorCore::new_with_fns(
