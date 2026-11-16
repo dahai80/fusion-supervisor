@@ -7,6 +7,11 @@ on:
       - "ci/validate_docs.py"
       - ".github/workflows/docs.yml"
 
+# issue #129 (fusion#2 CI retrofit): 同 ref 新提交取消旧 run
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
