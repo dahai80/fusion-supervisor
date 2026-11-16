@@ -34,6 +34,8 @@ cargo clippy --all-targets -- -D warnings   # warnings = errors
 cargo fmt --all --check
 ```
 
+CI (`.github/workflows/ci.yml`, issue #129 per fusion#2 retrofit): concurrency cancel per ref, `Swatinem/rust-cache@v2` on check/test/clippy/build, `paths-ignore` docs-only PRs, fmt on ubuntu (其余 macos — rustfmt 平台无关, 省稀缺 macOS runner 名额)。测试套件 ~2 min 不分片; 无 nightly tier (PR gate 已是全量)。
+
 Web console (`web/`, Bun + React + Vite):
 
 ```bash
