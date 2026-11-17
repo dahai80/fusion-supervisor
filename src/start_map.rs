@@ -373,6 +373,23 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
+        // issue #131: fusion-site 仓库无 start.sh — Next standalone 前台 node
+        // 进程 (cwd .next/standalone, server.js 读 PORT/HOSTNAME env)。此前只能
+        // 手工 nohup 注入 env, 外部重启/接管必丢 env (auth callback 401 实证)。
+        // 端口钉死 registry :11481 (3000 是保留端口, 上游 fusion-site#54 迁移)。
+        // NEXT_PUBLIC_SITE_URL 随部署而变 (公网 origin / 本地口) 且 key 语义
+        // 属部署 — 走 ~/.fusion-sv/env/fusion-site.env overlay (#125), 不钉死。
+        "fusion-site" => Some(StartSpec::Daemon {
+            bin: "node".into(),
+            args: vec!["server.js".into()],
+            cwd: Some("fusion-site/.next/standalone".into()),
+            env: vec![
+                ("PORT".into(), "11481".into()),
+                ("HOSTNAME".into(), "127.0.0.1".into()),
+                ("NODE_ENV".into(), "production".into()),
+            ],
+            env_file: None,
+        }),
         _ => None,
     }
 }
@@ -992,6 +1009,45 @@ mod tests {
         );
         assert!(!cmd.contains("&& nohup"), "不得破坏 pid 纪律: {cmd}");
         assert!(cmd.contains("; nohup"), "nohup 须 ; 分隔: {cmd}");
+    }
+
+    // issue #131: fusion-site Next standalone — node server.js @ .next/standalone,
+    // 端口/主机/NODE_ENV 钉死 registry 值, NEXT_PUBLIC_SITE_URL 走 overlay 不在此表
+    #[test]
+    fn test_issue131_fusion_site_daemon_spec() {
+        let spec = start_spec_for("fusion-site").expect("fusion-site spec missing");
+        let StartSpec::Daemon {
+            bin,
+            args,
+            cwd,
+            env,
+            env_file,
+        } = &spec
+        else {
+            panic!("应为 Daemon spec");
+        };
+        assert_eq!(bin, "node");
+        assert_eq!(args, &vec!["server.js".to_string()]);
+        assert_eq!(cwd.as_deref(), Some("fusion-site/.next/standalone"));
+        assert!(env.contains(&("PORT".to_string(), "11481".to_string())));
+        assert!(env.contains(&("HOSTNAME".to_string(), "127.0.0.1".to_string())));
+        assert!(env.contains(&("NODE_ENV".to_string(), "production".to_string())));
+        assert_eq!(*env_file, None);
+        let cmd = daemon_start_cmd(&spec, "fusion-site").unwrap();
+        assert!(
+            cmd.contains("fusion-site/.next/standalone"),
+            "应 cd standalone: {cmd}"
+        );
+        assert!(cmd.contains("|| exit 1;"), "cd 失败应拒启: {cmd}");
+        assert!(
+            cmd.contains("export PORT='11481';"),
+            "应 export 端口: {cmd}"
+        );
+        assert!(cmd.contains("; nohup"), "nohup 须 ; 分隔: {cmd}");
+        assert_eq!(
+            crate::probe_map::restart_cmd_for("fusion-site"),
+            "stop+start"
+        );
     }
 
     #[test]

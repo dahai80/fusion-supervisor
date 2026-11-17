@@ -118,6 +118,8 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("customer-insight", ProbeSpec::tcp(11594));
     m.insert("customer-insight-api", ProbeSpec::tcp(11501));
     m.insert("ai-apparelmockup-web", ProbeSpec::tcp(11593));
+    // issue #131: fusion-site Next standalone — 无专用健康口, 首页 200 即活
+    m.insert("fusion-site", ProbeSpec::http(11481, "/"));
     // issue #81: office-api 自带健康口 (上游 start.sh 启动后同 curl 验证,
     // services/office-api, :11492)
     m.insert("fusion-office-api", ProbeSpec::http(11492, "/healthz"));
