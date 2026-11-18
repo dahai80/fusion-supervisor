@@ -886,7 +886,7 @@ mod tests {
     // issue #113: env 覆盖 → run_stamp 原样返回 (测试确定性不破)
     #[test]
     fn test_run_stamp_env_override_verbatim() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         assert_eq!(run_stamp(), "20260903");
     }
@@ -894,7 +894,7 @@ mod tests {
     // issue #113: 无覆盖 → date-hhmmss 后缀, 同日多次备份不覆写
     #[test]
     fn test_run_stamp_time_suffix_when_no_env() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::remove("FUSION_BACKUP_DATE");
         let s = run_stamp();
         let (date, tail) = s.rsplit_once('-').expect("stamp 应为 date-hhmmss 形态");
@@ -931,17 +931,29 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
+        // 持有 env 测试锁 (#134 CI flake): set/remove/恢复全程与其他 env 测试互斥。
+        _lock: crate::env_map::tests::EnvLockGuard,
     }
     impl EnvGuard {
         fn set(key: &'static str, val: &str) -> Self {
+            let lock = crate::env_map::tests::env_lock();
             let prev = std::env::var(key).ok();
             unsafe { std::env::set_var(key, val) };
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
         fn remove(key: &'static str) -> Self {
+            let lock = crate::env_map::tests::env_lock();
             let prev = std::env::var(key).ok();
             unsafe { std::env::remove_var(key) };
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
     impl Drop for EnvGuard {
@@ -960,7 +972,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_pg_dump_success() {
         // issue #31: env 全局共享, 并行测试 Drop 会移走本测试依赖的 DATE — 共享锁串行
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -987,7 +999,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_dump_tmp_removed_on_failure() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -1019,7 +1031,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_fail_closed_no_target() {
         // issue #31: 同上, env 锁串行 (env_map/supervisor 测试共用同一锁)
-        let _g0 = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g0 = crate::env_map::tests::env_lock();
         let _g1 = EnvGuard::remove("FUSION_BACKUP_TARGET");
         let _g2 = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let mut alerter = Alerter::new(0, String::new());
@@ -1045,7 +1057,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_retention_prunes_old() {
         // issue #31: 同上, env 锁串行
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -1087,7 +1099,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_pg_success_docker_absent() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -1129,7 +1141,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_missing_pg_dump_fail_closed() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
@@ -1154,7 +1166,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_qdrant_container_found() {
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260930");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();

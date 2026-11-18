@@ -86,6 +86,11 @@ rsync -av --delete fusion-vps:/opt/fusion-backups/ /backup/vps-fusion/
 
 ## VPS deployment notes (fusion-vps)
 
+0. **Config path alignment (issue #134)**: the daemon reads `FUSION_SV_CONFIG` from its systemd unit, but one-shot CLI runs (`sudo /opt/fusion-sv/bin/fusion-sv backup`) default to `~/.fusion-sv/config.toml` and would silently run with different retention/schedule settings. Always export the same variable for manual runs:
+   ```bash
+   sudo FUSION_SV_CONFIG=/opt/fusion-sv/config.toml /opt/fusion-sv/bin/fusion-sv backup
+   ```
+   A CLI fallback to defaults now logs a WARN naming the path and this hint.
 1. Install the release artifact (`fusion-sv-linux-x86_64.tar.gz` from the GitHub Release) into `/opt/fusion-sv/bin/fusion-sv`, then `systemctl restart fusion-sv`.
 2. Create the backup dir and key file:
    ```bash

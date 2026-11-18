@@ -627,11 +627,15 @@ impl SupervisorCore {
     // 此前 RPC restart 与 rollout 都只 invoke_start (从不 stop): 旧监听器存活,
     // 新进程撞注册端口死掉, 探活命中旧进程 → "ok"/Healthy 但代码从未被替换。
 
-    // stop 命令 + 端口探活验证 — 旧进程未死则 bail (调用方不得返回 ok)。
-    // stop 命令失败不 bail (pidfile 缺失等 no-op 场景), 由探活验证兜底;
-    // daemon spec 的孤儿监听由 daemon_stop_cmd 的 port 锚定 lsof 补杀处理。
+    // stop 命令 + 端口探活验证 — 窗口内端口仍被占则重发 stop (issue #134:
+    // 脚本型 stop 的孤儿兜底/异步退出偶发慢于首轮验证, 有界重试后仍占口才
+    // fail, 失败信息带占口 PID), 调用方不得返回 ok。stop 命令失败不 bail
+    // (pidfile 缺失等 no-op 场景), 由探活验证兜底; daemon spec 的孤儿监听
+    // 由 daemon_stop_cmd 的 port 锚定 lsof 补杀处理。
     async fn stop_and_verify(&mut self, name: &str, run_stop: bool) -> Result<()> {
-        // issue #122: restart 路径的 stop exec 已在锁外作业执行, 这里只验证
+        // issue #122: restart 路径的 stop exec 已在锁外作业执行; 这里的重发
+        // 是 stop verb 本身 (TERM→宽限→KILL, 有界秒级, 非长构建脚本), 锁内
+        // 可接受 — 与 #123 的 5s 预跑窗口同量级。
         if run_stop && let Err(e) = (self.start_fn)(name, "stop", &[]) {
             tracing::warn!(svc = %name, err = %e, "stop 命令失败 (由探活验证兜底)");
         }
@@ -642,18 +646,28 @@ impl SupervisorCore {
             .map(|r| r.def.port)
             .unwrap_or(0);
         let spec = ProbeSpec::tcp(port);
-        // 20×250ms — daemon_stop_cmd 已在 shell 内等进程退出, 此处是脚本型
-        // stop 异步退出 / 孤儿兜底生效的最后确认
-        for i in 0..20 {
+        // 30×250ms (7.5s) — daemon_stop_cmd 已在 shell 内等进程退出, 此处是
+        // 脚本型 stop 异步退出 / 孤儿兜底生效的最后确认; i=8 与 i=20 时端口
+        // 仍被占则重发 stop (最多补发 2 次)。
+        for i in 0..30 {
             if !matches!((self.probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                 if i > 0 {
                     tracing::info!(svc = %name, waits = i, "stop 确认: 端口已释放");
                 }
                 return Ok(());
             }
+            if i == 8 || i == 20 {
+                tracing::warn!(svc = %name, round = i, "端口仍被占, 重发 stop 命令");
+                if let Err(e) = (self.start_fn)(name, "stop", &[]) {
+                    tracing::warn!(svc = %name, err = %e, "stop 重发失败 (继续探活验证)");
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        anyhow::bail!("stop 后端口仍被占用 (旧进程未被替换): {name}")
+        let holder = port_holder_pid(port)
+            .map(|p| format!(", pid={p}"))
+            .unwrap_or_default();
+        anyhow::bail!("stop 后端口仍被占用 (旧进程未被替换, 重发 stop 无效): {name}:{port}{holder}")
     }
 
     // 人工 restart: stop 旧进程 (验证端口释放) → start 新进程。返回 pidfile
@@ -1632,6 +1646,23 @@ fn read_pidfile_pid(svc: &str) -> Option<u32> {
     s.trim().parse::<u32>().ok()
 }
 
+// issue #134: 只读查询占口监听器 PID (lsof, best-effort)。仅用于 stop 验证
+// 失败信息的可归因性 — 绝不据此击杀 (kill-safety #110: 无 pattern-kill 路径)。
+// lsof 缺席/端口 0/未注册 → None。
+fn port_holder_pid(port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let first = s.lines().map(str::trim).find(|l| !l.is_empty())?;
+    (!first.is_empty()).then(|| first.to_string())
+}
+
 fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> Result<()> {
     match crate::start_map::start_spec_for(svc) {
         Some(spec) => exec_start_spec(svc, &spec, cmd, env_overrides),
@@ -1894,7 +1925,7 @@ mod tests {
     // 其它服务照常继承。
     #[test]
     fn test_exec_bash_script_strips_pinned_env() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         let prev = std::env::var("FUSION_MLX_API_KEY").ok();
         unsafe { std::env::set_var("FUSION_MLX_API_KEY", "stale-snapshot-key") };
         // 脚本: env 存在即 fail
@@ -2412,7 +2443,7 @@ mod tests {
                 }
             }
         }
-        let _g0 = env_lock().lock().unwrap();
+        let _g0 = env_lock();
         let home = std::env::temp_dir().join(format!("fusion-sv-111-home-{}", std::process::id()));
         std::fs::create_dir_all(home.join(".fusion-sv/pids")).unwrap();
         let _g1 = HomeGuard::set(&home);
@@ -3107,7 +3138,7 @@ mod tests {
         // made these tests environment-dependent. Same fix as the trainer-bridge
         // tests in env_map.rs.
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let env_f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(env_f.path(), "FUSION_PG_PASSWORD=pw78\n").unwrap();
@@ -3152,7 +3183,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_issue125_overlay_env_reaches_start_fn() {
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-ovl-test");
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let home = tempfile::tempdir().unwrap();
         let ovl_dir = home.path().join(".fusion-sv/env");
         std::fs::create_dir_all(&ovl_dir).unwrap();
@@ -3194,7 +3225,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_up_native_fail_closed_when_pg_password_missing() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         // .env 只有 USER 无 PASSWORD → DATABASE_URL 构造不出
         let env_f = tempfile::NamedTempFile::new().unwrap();
@@ -3555,8 +3586,9 @@ mod tests {
         );
     }
 
-    // restart_one: stop 无效 (端口恒 Healthy) → bail, 绝不 start、绝不返回 ok
-    #[tokio::test]
+    // restart_one: stop 无效 (端口恒 Healthy) → 窗口内重发 stop ×2 (issue #134)
+    // 仍占用 → bail, 绝不 start、绝不返回 ok
+    #[tokio::test(start_paused = true)]
     async fn test_issue96_restart_bails_when_stop_ineffective() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let cp = calls.clone();
@@ -3575,10 +3607,53 @@ mod tests {
         let got = calls.lock().unwrap().clone();
         assert_eq!(
             got,
-            vec!["fusion-mlx/stop"],
-            "旧进程未死不得 start (防双启/防假替换)"
+            vec!["fusion-mlx/stop", "fusion-mlx/stop", "fusion-mlx/stop"],
+            "旧进程未死: 首轮 stop + 窗口内重发 ×2, 不得 start (防双启/防假替换)"
         );
         assert!(matches!(core.runners[0].state, runner::State::Stopped));
+    }
+
+    // issue #134: 脚本型 stop 慢于首轮验证 — 窗口内重发 stop 后端口释放,
+    // restart 正常完成 (容忍窗口语义)
+    #[tokio::test(start_paused = true)]
+    async fn test_issue134_stop_reissue_recovers() {
+        // i=0..8 探活 Healthy (9 次), i=8 重发 stop, i=9 起端口释放
+        let probe_n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pn = probe_n.clone();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cp = calls.clone();
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            move |_: &ProbeSpec| {
+                let n = pn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 9 {
+                    ProbeResult::Healthy { latency_ms: 1 }
+                } else {
+                    ProbeResult::Unhealthy {
+                        reason: crate::probe::UnhealthyReason::ConnectionRefused,
+                    }
+                }
+            },
+            move |svc, cmd, _env| {
+                cp.lock().unwrap().push(format!("{svc}/{cmd}"));
+                Ok(())
+            },
+        );
+        core.runners[0].state = runner::State::Healthy;
+        core.restart_one("fusion-mlx").await.unwrap();
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["fusion-mlx/stop", "fusion-mlx/stop", "fusion-mlx/restart"],
+            "重发 stop 后端口释放 → 正常拉起新进程"
+        );
+    }
+
+    // issue #134: 端口 0 (未注册/探活无口) 不查 lsof, 占口 PID 查询返回 None
+    #[test]
+    fn test_issue134_port_holder_pid_zero_port() {
+        assert_eq!(port_holder_pid(0), None);
     }
 
     // restart_one: 未知服务 bail

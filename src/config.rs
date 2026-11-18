@@ -263,7 +263,13 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("~/.fusion-sv/config.toml"));
         let expanded = expand_tilde(&path);
         if !expanded.exists() {
-            tracing::info!("config 不存在, 用默认值: {}", expanded.display());
+            // issue #134: CLI 与 daemon 可能各持一份配置 (daemon 走 systemd
+            // FUSION_SV_CONFIG, CLI 默认 ~/.fusion-sv/config.toml) — 回退默认
+            // 值时升级 WARN 并给出对齐提示, 避免 "CLI 静默跑错配置" 无从归因。
+            tracing::warn!(
+                path = %expanded.display(),
+                "config not found, using defaults (if a daemon runs with FUSION_SV_CONFIG set, set the same variable for one-shot CLI runs)"
+            );
             let mut cfg = Config::default();
             cfg.db_path = expand_tilde(&cfg.db_path);
             cfg.registry_path = expand_tilde(&cfg.registry_path);
@@ -339,13 +345,20 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
+        // 持有 env 测试锁 (#134 CI flake): set/恢复全程与其他 env 测试互斥。
+        _lock: crate::env_map::tests::EnvLockGuard,
     }
     impl EnvGuard {
         fn set(key: &'static str, val: &str) -> Self {
+            let lock = crate::env_map::tests::env_lock();
             let prev = std::env::var(key).ok();
             // SAFETY: 测试单线程内设 env, 此处无并发读此 key 的代码。
             unsafe { std::env::set_var(key, val) };
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
     impl Drop for EnvGuard {
@@ -394,7 +407,7 @@ mod tests {
         std::fs::write(&path, "auto_up_on_start = true\n").unwrap();
         let _guard = EnvGuard::set("FUSION_SV_CONFIG", path.to_str().unwrap());
         // issue #31: env 全局共享, config 测试也须与其它 env 测试共用锁串行
-        let _g0 = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g0 = crate::env_map::tests::env_lock();
         // 钉住 FUSION_ROOT 到无 .env 的临时目录, 断言不受宿主环境影响
         let empty_root = std::env::temp_dir().join("fusion-sv-config-test-root");
         std::fs::create_dir_all(&empty_root).unwrap();
@@ -418,7 +431,7 @@ mod tests {
     #[test]
     fn test_resolve_env_file_fusion_root_priority() {
         // issue #31: 同上, env 锁串行
-        let _g = crate::env_map::tests::env_lock().lock().unwrap();
+        let _g = crate::env_map::tests::env_lock();
         let root = std::env::temp_dir().join("fusion-sv-envroot-test");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".env"), "K=V\n").unwrap();

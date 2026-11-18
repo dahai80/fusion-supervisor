@@ -551,11 +551,32 @@ pub(crate) mod tests {
         assert_eq!(parse_health_env_key(""), None);
     }
 
-    // 进程 env 是全局共享的, 测试并行会互相污染。此锁强制 env_map 测试串行。
-    // pub(crate): supervisor/mod.rs env 测试共用此锁, 避免双锁竞态 (#8 rebased onto #7)。
-    pub(crate) fn env_lock() -> &'static Mutex<()> {
+    // 进程 env 是全局共享的, 测试并行会互相污染。此锁强制 env 测试串行。
+    // pub(crate): supervisor/config/backup 的 env 测试共用此锁。
+    // 线程内可重入 (thread_local 深度计数 + 最外层持 std Mutex): EnvGuard 自身
+    // 也获取此锁 (#134 CI flake — 裸 set/remove 与持锁测试并发), 同线程嵌套
+    // set 不自锁, 跨线程仍互斥。
+    thread_local! {
+        static ENV_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) struct EnvLockGuard {
+        _inner: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+    impl Drop for EnvLockGuard {
+        fn drop(&mut self) {
+            ENV_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    pub(crate) fn env_lock() -> EnvLockGuard {
         static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(()))
+        let outermost = ENV_LOCK_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v + 1);
+            v == 0
+        });
+        EnvLockGuard {
+            _inner: outermost.then(|| M.get_or_init(|| Mutex::new(())).lock().unwrap()),
+        }
     }
 
     fn env_file(content: &str) -> NamedTempFile {
@@ -567,7 +588,7 @@ pub(crate) mod tests {
     // identity + .env 有 PG 密码 → 解析出 DATABASE_URL
     #[test]
     fn test_native_env_injected_for_identity() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=secret123\nFUSION_PG_USER=appuser\n");
         let env = native_env_for("fusion-identity", f.path(), false).unwrap();
@@ -581,7 +602,7 @@ pub(crate) mod tests {
     // issue #78 补: FUSION_PG_PASSWORD 缺失 + PG 可达 (brew trust auth) → 无密码连接串
     #[test]
     fn test_native_env_trust_auth_when_pg_up() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_USER=fusion\n");
         let env = native_env_for_opts("fusion-identity", f.path(), false, true, true).unwrap();
@@ -594,7 +615,7 @@ pub(crate) mod tests {
     // issue #78 补: 密码与 FUSION_PG_USER 双缺 + PG 可达 → 省略 user 段 (libpq 默认 OS user)
     #[test]
     fn test_native_env_trust_auth_no_user() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         unsafe { std::env::remove_var("FUSION_PG_USER") };
         let f = env_file("");
@@ -609,7 +630,7 @@ pub(crate) mod tests {
     // 不让整个注入失败; REDIS_URL 仍无条件注入
     #[test]
     fn test_native_env_pg_down_skips_db_keeps_redis() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("");
         let env = native_env_for_opts("fusion-cowork", f.path(), false, false, true).unwrap();
@@ -624,7 +645,7 @@ pub(crate) mod tests {
     // 静默降级 trust 串会打错库)
     #[test]
     fn test_compose_plane_missing_password_fail_closed() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_USER=fusion\n");
         let r = native_env_for_opts("fusion-identity", f.path(), true, true, true);
@@ -638,7 +659,7 @@ pub(crate) mod tests {
     // 非依赖服务 → 空注入 (保留现状)
     #[test]
     fn test_native_env_unknown_service_no_injection() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=x\n");
         let env = native_env_for("fusion-mlx", f.path(), false).unwrap();
@@ -648,7 +669,7 @@ pub(crate) mod tests {
     // 进程 env 优先于 env_file
     #[test]
     fn test_process_env_precedence() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         // edition 2024: set_var/remove_var 需 unsafe (见 CLAUDE.md EnvGuard)
         unsafe { std::env::set_var("FUSION_PG_PASSWORD", "fromproc") };
         // RAII: panic 也清掉进程 env, 避免污染其它测试
@@ -668,7 +689,7 @@ pub(crate) mod tests {
     // cowork 需 DATABASE_URL + REDIS_URL 两条
     #[test]
     fn test_cowork_gets_db_and_redis() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=pw\n");
         let env = native_env_for("fusion-cowork", f.path(), false).unwrap();
@@ -700,7 +721,7 @@ pub(crate) mod tests {
     // issue #78 补: db 名回退按平面分 — compose=短名 (pg-init), native=下划线全名 (brew)
     #[test]
     fn test_pg_db_name_per_plane() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         unsafe { std::env::remove_var("FUSION_COWORK_DB") };
         let f = env_file("FUSION_PG_PASSWORD=pw\n");
@@ -734,7 +755,7 @@ pub(crate) mod tests {
     // issue #54: 注入名迁 FUSION_ADMIN_KEY; cowork 仍读旧 URL 名。
     #[test]
     fn test_shell_env_from_process_env() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         // issue #85: 反转默认后 cowork-web 也注入 FUSION_CLIENT_KEY, 测试显式供 key
         let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-proc");
         let _c = EnvGuard::set("FUSION_ADMIN_KEY", "fromproc");
@@ -752,7 +773,7 @@ pub(crate) mod tests {
     // plugins console 读新 URL 名 FUSION_GATEWAY_BASE_URL (issue #54)
     #[test]
     fn test_shell_env_from_env_file() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_ADMIN_KEY") };
         unsafe { std::env::remove_var("FUSION_GATEWAY_BASE_URL") };
         let f = env_file("FUSION_ADMIN_KEY=fromfile\nFUSION_CLIENT_KEY=ck-file\n");
@@ -768,7 +789,7 @@ pub(crate) mod tests {
     // issue #105: workspace 根从 env_file 注入; 缺失时不注入也不 fail (可选收敛)
     #[test]
     fn test_shell_env_workspace_root_optional() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-105");
         let _ak = EnvGuard::set("FUSION_ADMIN_KEY", "ak-105");
         let _wr = EnvGuard::set("FUSION_COWORK_WORKSPACE_ROOT", "");
@@ -787,7 +808,7 @@ pub(crate) mod tests {
     // admin key 全缺 + gateway config 不可读 (指到不存在路径) → fail-closed Err
     #[test]
     fn test_shell_env_fail_closed_no_admin_key() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_ADMIN_KEY") };
         let _c = EnvGuard::set(
             "FUSION_GATEWAY_CONFIG",
@@ -806,7 +827,7 @@ pub(crate) mod tests {
     // trainer-bridge key 无兜底: env/.env 均无 → fail-closed Err
     #[test]
     fn test_shell_env_bridge_key_fail_closed() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
         // issue #85 inverts FUSION_CLIENT_KEY injection onto every managed
         // service, trainer-bridge included. Without an explicit value the
@@ -828,7 +849,7 @@ pub(crate) mod tests {
     // trainer-bridge key 从 .env 解析成功
     #[test]
     fn test_shell_env_bridge_key_from_file() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_TRAINER_BRIDGE_KEY") };
         // Same #85 reason as test_shell_env_bridge_key_fail_closed: without a
         // pinned FUSION_CLIENT_KEY the gateway-config fallback fails first on
@@ -885,7 +906,7 @@ pub(crate) mod tests {
     // 进程 env 直接给 key → 注入成功, 不读 gateway config
     #[test]
     fn test_client_key_from_process_env() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let _c = EnvGuard::set("FUSION_CLIENT_KEY", "fromproc");
         let f = env_file("");
         let env = shell_env_for("ai-fit", f.path()).unwrap();
@@ -914,7 +935,7 @@ pub(crate) mod tests {
     // .env 给 key → 进程 env 缺失时从文件解析
     #[test]
     fn test_client_key_from_env_file() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
         let f = env_file("FUSION_CLIENT_KEY=fromfile\n");
         let env = shell_env_for("ai-speech-exam", f.path()).unwrap();
@@ -924,7 +945,7 @@ pub(crate) mod tests {
     // 全缺 + gateway config 不可读 → fail-closed Err, 点名缺失 key
     #[test]
     fn test_client_key_fail_closed_no_source() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
         let _c = EnvGuard::set(
             "FUSION_GATEWAY_CONFIG",
@@ -942,7 +963,7 @@ pub(crate) mod tests {
     // 兜底读 gateway config auth.api_keys — 优先 name=admin 条目
     #[test]
     fn test_client_key_gateway_fallback_prefers_admin() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_CLIENT_KEY") };
         let f = env_file("");
         std::fs::write(
@@ -959,12 +980,19 @@ pub(crate) mod tests {
     pub(crate) struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
+        // 持有 env 测试锁: 设/删/恢复全程与其他 env 测试互斥 (#134 CI flake)。
+        _lock: EnvLockGuard,
     }
     impl EnvGuard {
         pub(crate) fn set(key: &'static str, val: &str) -> Self {
+            let lock = env_lock();
             let prev = std::env::var(key).ok();
             unsafe { std::env::set_var(key, val) };
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
     impl Drop for EnvGuard {
