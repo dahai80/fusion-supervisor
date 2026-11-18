@@ -1131,6 +1131,9 @@ mod tests {
     // env 快照旧 key); 文件缺失 fail-closed 拒启; 其他 Daemon 服务不带该段
     #[test]
     fn test_issue49_k12_env_file_source_segment() {
+        // fusion_root() 读 FUSION_ROOT env — 与 config/runner 测试的 EnvGuard
+        // 互斥 (#134 CI flake: FUSION_ROOT 被并发改写时 seg 路径漂移)。
+        let _env = crate::env_map::tests::env_lock();
         let spec = start_spec_for("fusion-k12-teacher").unwrap();
         let StartSpec::Daemon {
             env_file: Some(env_file),
