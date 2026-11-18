@@ -82,7 +82,7 @@ Backups on the same host as the databases do not survive host loss. Pull from a 
 rsync -av --delete fusion-vps:/opt/fusion-backups/ /backup/vps-fusion/
 ```
 
-Schedule it (cron/launchd) on the second machine. Keep `FUSION_BACKUP_ENC_KEY` there too so pulled `.enc` files remain verifiable/restorable.
+`scripts/vps-backup-pull.sh` implements this (backups + a 0600 copy of the encryption env, so the mirror restores standalone); on the operator's Mac it runs daily 03:30 via the `com.fusion.vps-backup-pull` LaunchAgent, mirroring into `~/.fusion-backups-vps/`. Keep `FUSION_BACKUP_ENC_KEY` off-host either way so pulled `.enc` files remain verifiable/restorable.
 
 ## VPS deployment notes (fusion-vps)
 
