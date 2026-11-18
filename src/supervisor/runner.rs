@@ -130,6 +130,9 @@ fn dead_pid_at(path: &std::path::Path) -> Option<crate::probe::UnhealthyReason> 
 // (测试并行跑出过 7 个假阳性); supervisor 自身 exec 在核心锁内同步执行,
 // tick 不会并发看到自己的 start.sh 进程。pgrep/lsof 不可用 → false
 // (pass-open, 行为回落到修复前)。
+// 提及≠执行 (#136 附带): pgrep 命中的候选进程 comm 还须经 is_shell_process
+// 复核 — 只要是 shell 二进制才算真在跑脚本, 排除 cmdline 携带脚本路径文本
+// 的无关进程 (并行 agent 的 claude 进程实证)。
 fn pgrep_pids(pat: &str) -> Option<Vec<String>> {
     match std::process::Command::new("pgrep")
         .arg("-f")
@@ -170,10 +173,32 @@ fn proc_cwd(pid: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+// issue #136 附带: pgrep -f 只匹配全量 cmdline 文本, 任何"提及"脚本路径的
+// 进程都命中 — 实证: 并行 agent 的 claude 进程 cmdline 携带 monorepo
+// CLAUDE.md 全文 (含 "fusion-mlx/start.sh"), 误判操作员脚本存活, 自动重启
+// 被跳过 (test_issue90 熔断测试实证, 生产同样会撞)。start.sh 是 bash 脚本,
+// 真实调用者 comm 必为 shell; agent 二进制 (claude/node) 排除。
+fn is_shell_process(pid: &str) -> bool {
+    let out = match std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", pid])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    matches!(
+        std::path::Path::new(&comm)
+            .file_name()
+            .and_then(|s| s.to_str()),
+        Some("bash") | Some("sh") | Some("zsh") | Some("dash") | Some("ksh")
+    )
+}
+
 fn start_sh_process_alive(repo_dir: &str) -> bool {
-    // 阶段 1: cmdline 带路径前缀
+    // 阶段 1: cmdline 带路径前缀 (候选须经 shell comm 复核, 见 is_shell_process)
     let pat = format!("{repo_dir}/start[.]sh");
-    if pgrep_pids(&pat).is_some_and(|p| !p.is_empty()) {
+    if pgrep_pids(&pat).is_some_and(|pids| pids.iter().any(|p| is_shell_process(p))) {
         return true;
     }
     // 阶段 2: cwd 相对调用 (./start.sh), 按 cwd 鉴别归属
@@ -184,6 +209,9 @@ fn start_sh_process_alive(repo_dir: &str) -> bool {
     let want = std::path::Path::new(&root).join(repo_dir);
     let want = std::fs::canonicalize(&want).unwrap_or(want);
     for pid in pids {
+        if !is_shell_process(&pid) {
+            continue;
+        }
         if let Some(cwd) = proc_cwd(&pid)
             && cwd == want
         {
@@ -1446,6 +1474,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(cleared, "脚本退出后应不再检出");
+    }
+
+    // issue #136 附带: pgrep 候选须经 shell comm 复核 — bash 进程 true,
+    // 非 shell 二进制 (sleep) false (agent 进程 cmdline 携带脚本路径文本的
+    // 误报治理, 见 is_shell_process 注释)。
+    #[test]
+    fn test_issue136_shell_comm_verification() {
+        let mut bash = std::process::Command::new("bash")
+            // 复合命令防 bash exec 优化: 单命令会被 exec 替换成 sleep, comm 变 sleep
+            .args(["-c", "sleep 30; true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bash");
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let bash_res = is_shell_process(&bash.id().to_string());
+        let other_res = is_shell_process(&other.id().to_string());
+        let _ = bash.kill();
+        let _ = other.kill();
+        let _ = bash.wait();
+        let _ = other.wait();
+        assert!(bash_res, "bash 进程应被识别为 shell");
+        assert!(!other_res, "sleep 进程不应被识别为 shell");
     }
 
     // issue #86 生产补: 操作员 cd 进 repo 目录用 ./start.sh (cmdline 无 repo

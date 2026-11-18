@@ -148,7 +148,7 @@ When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 nati
 
 ## Config
 
-Optional `~/.fusion-sv/config.toml` (all fields have defaults):
+Optional `~/.fusion-sv/config.toml` (all fields have defaults). Override the path with `FUSION_SV_CONFIG`. Config-path resolution (issue #136): when `FUSION_SV_CONFIG` is unset and the default path does not exist but the deploy-convention path `/opt/fusion-sv/config.toml` does, the CLI adopts the deploy config (same file the systemd daemon reads); when both exist a WARN names both paths so silent divergence (different retention/schedule between one-shot CLI and daemon) is attributable. Always set `FUSION_SV_CONFIG` explicitly for one-shot CLI runs against a daemon launched with a custom config:
 
 ```toml
 socket_path = "/tmp/fusion-sv.sock"
