@@ -4,21 +4,49 @@ use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::supervisor::SupervisorCore;
 use std::sync::{Mutex, OnceLock};
 
-fn env_lock() -> &'static Mutex<()> {
+// 可重入 env 测试锁 (同 #134: 线程本地深度 + 最外层持 std Mutex),
+// EnvGuard 与测试体同锁域, set/恢复窗口对其他 env 测试原子。
+thread_local! {
+    static ENV_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct EnvLockGuard {
+    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for EnvLockGuard {
+    fn drop(&mut self) {
+        ENV_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn env_lock() -> EnvLockGuard {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
+    let outermost = ENV_LOCK_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v == 0
+    });
+    EnvLockGuard {
+        _inner: outermost.then(|| L.get_or_init(|| Mutex::new(())).lock().unwrap()),
+    }
 }
 
 struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
+    _lock: EnvLockGuard,
 }
 
 impl EnvGuard {
     fn set(key: &'static str, val: &str) -> Self {
+        let lock = env_lock();
         let prev = std::env::var(key).ok();
         unsafe { std::env::set_var(key, val) };
-        Self { key, prev }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
     }
 }
 
