@@ -1,3 +1,21 @@
+---
+doc_id: fusion-supervisor/backup-restore
+product: fusion-supervisor
+class: core
+entry: service
+doc_type: guide
+title: { zh: "备份与恢复", en: "Backup & Restore" }
+audience: engineer
+status: draft
+version: 0.1.65
+updated: 2026-11-18
+owner: "@dahai"
+source_of_truth:
+  - src/backup.rs
+  - src/config.rs
+  - scripts/restore-drill.sh
+---
+
 # Backup & Restore (issue #132)
 
 Automated PostgreSQL backup with two-tier retention and at-rest encryption, run by the `fusion-sv` daemon. Qdrant snapshots ride along when the compose plane is enabled.
