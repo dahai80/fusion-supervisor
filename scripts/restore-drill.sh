@@ -23,7 +23,8 @@ log() { echo "[restore-drill] $*"; }
 # 1. locate newest backup
 FILE="${1:-}"
 if [ -z "$FILE" ]; then
-    FILE=$(ls -1 "$TARGET"/fusion-pg-*.sql.gz "$TARGET"/fusion-pg-*.sql.gz.enc 2>/dev/null | sort | tail -1)
+    # ls may fail on unmatched globs (e.g. no plaintext backup) — tolerate, keep last match
+    FILE=$( { ls -1 "$TARGET"/fusion-pg-*.sql.gz "$TARGET"/fusion-pg-*.sql.gz.enc 2>/dev/null || true; } | sort | tail -1)
 fi
 [ -n "$FILE" ] && [ -f "$FILE" ] || { log "FAIL: no backup file found in $TARGET"; exit 1; }
 log "backup file: $FILE"
@@ -50,13 +51,25 @@ SIZE=$(wc -c < "$WORK/dump.sql")
 [ "$SIZE" -gt 1000 ] || { log "FAIL: decompressed dump suspiciously small ($SIZE bytes)"; exit 1; }
 log "gunzip: OK ($SIZE bytes)"
 
-# 4. restore into scratch DB (drop first so the drill is repeatable)
+# 4. restore one database section into a scratch DB (drop first so repeatable).
+# pg_dumpall output: globals (roles/CREATE DATABASE — collide with a live
+# cluster) then per-DB sections introduced by \connect. Drill extracts the
+# DRILL_DB section only; ownership refs resolve against the existing roles.
+DRILL_DB="${DRILL_DB:-fusion_identity}"
 PSQL="${PG_BIN:+$PG_BIN/}psql"
+awk -v db="$DRILL_DB" '
+    $0 ~ "^\\\\connect " db "$" { insec=1; next }
+    insec && /^\\connect /      { exit }
+    insec                       { print }
+' "$WORK/dump.sql" > "$WORK/db-section.sql"
+if [ ! -s "$WORK/db-section.sql" ]; then
+    log "FAIL: database '$DRILL_DB' section not found in dump (set DRILL_DB=...)"; exit 1
+fi
 "$PSQL" -d postgres -c "DROP DATABASE IF EXISTS $SCRATCH_DB" >/dev/null
 "$PSQL" -d postgres -c "CREATE DATABASE $SCRATCH_DB" >/dev/null
-"$PSQL" -d "$SCRATCH_DB" -v ON_ERROR_STOP=1 -q < "$WORK/dump.sql" \
+"$PSQL" -d "$SCRATCH_DB" -v ON_ERROR_STOP=1 -q < "$WORK/db-section.sql" \
     || { log "FAIL: restore into $SCRATCH_DB errored"; exit 1; }
-log "restore into scratch DB '$SCRATCH_DB': OK"
+log "restore of '$DRILL_DB' into scratch DB '$SCRATCH_DB': OK"
 
 # 5. row count per table as integrity evidence
 COUNTS=$("$PSQL" -d "$SCRATCH_DB" -t -A -F, \
