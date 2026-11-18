@@ -263,7 +263,13 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("~/.fusion-sv/config.toml"));
         let expanded = expand_tilde(&path);
         if !expanded.exists() {
-            tracing::info!("config 不存在, 用默认值: {}", expanded.display());
+            // issue #134: CLI 与 daemon 可能各持一份配置 (daemon 走 systemd
+            // FUSION_SV_CONFIG, CLI 默认 ~/.fusion-sv/config.toml) — 回退默认
+            // 值时升级 WARN 并给出对齐提示, 避免 "CLI 静默跑错配置" 无从归因。
+            tracing::warn!(
+                path = %expanded.display(),
+                "config not found, using defaults (if a daemon runs with FUSION_SV_CONFIG set, set the same variable for one-shot CLI runs)"
+            );
             let mut cfg = Config::default();
             cfg.db_path = expand_tilde(&cfg.db_path);
             cfg.registry_path = expand_tilde(&cfg.registry_path);

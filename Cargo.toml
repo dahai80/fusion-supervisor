@@ -4,7 +4,7 @@ members = [".", "tray"]
 
 [package]
 name = "fusion-supervisor"
-version = "0.1.65"
+version = "0.1.66"
 edition = "2024"
 license = "Apache-2.0"
 description = "Local-first fusion service supervisor and monitor"
@@ -36,3 +36,5 @@ flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# issue #134: stop 验证窗口测试用 start_paused (tokio time auto-advance)
+tokio = { version = "1", features = ["full", "test-util"] }
