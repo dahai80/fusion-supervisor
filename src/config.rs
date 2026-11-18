@@ -256,12 +256,51 @@ impl Default for Config {
     }
 }
 
+// issue #136: 部署约定配置路径 (docs/backup-restore.md VPS systemd 部署,
+// daemon unit 的 FUSION_SV_CONFIG 指向此处)。CLI 在 FUSION_SV_CONFIG 未设
+// 且默认路径缺失时采纳它, 避免 root 手跑 CLI 静默用默认值 (retention 等)。
+const DEPLOY_CONFIG_PATH: &str = "/opt/fusion-sv/config.toml";
+
+// 纯函数: 解析配置路径。explicit (FUSION_SV_CONFIG) 恒优先; 未设时默认
+// ~/.fusion-sv/config.toml, 但默认缺失而部署约定路径存在则采纳部署配置
+// (adopted=true)。两个 exists 由调用方现场探测, 便于测试注入。
+fn resolve_config_path(
+    explicit: Option<String>,
+    default_exists: bool,
+    deploy_exists: bool,
+) -> (PathBuf, bool) {
+    if let Some(p) = explicit {
+        return (PathBuf::from(p), false);
+    }
+    let default = PathBuf::from("~/.fusion-sv/config.toml");
+    if !default_exists && deploy_exists {
+        return (PathBuf::from(DEPLOY_CONFIG_PATH), true);
+    }
+    (default, false)
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = std::env::var("FUSION_SV_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("~/.fusion-sv/config.toml"));
+        let explicit = std::env::var("FUSION_SV_CONFIG").ok();
+        let default_expanded = expand_tilde(&PathBuf::from("~/.fusion-sv/config.toml"));
+        let deploy_path = PathBuf::from(DEPLOY_CONFIG_PATH);
+        let (path, adopted) =
+            resolve_config_path(explicit, default_expanded.exists(), deploy_path.exists());
         let expanded = expand_tilde(&path);
+        // issue #136: FUSION_SV_CONFIG 未设且默认配置与部署配置并存 → WARN。
+        // 两份配置可能各持不同 retention/schedule, CLI 与 daemon 静默分歧
+        // (VPS 实证: /root/.fusion-sv/config.toml ≠ /opt/fusion-sv/config.toml)。
+        if !adopted
+            && std::env::var("FUSION_SV_CONFIG").is_err()
+            && deploy_path.exists()
+            && deploy_path != expanded
+        {
+            tracing::warn!(
+                cli_config = %expanded.display(),
+                daemon_config = DEPLOY_CONFIG_PATH,
+                "CLI default config coexists with daemon deploy config; settings may diverge (set FUSION_SV_CONFIG to align one-shot CLI runs)"
+            );
+        }
         if !expanded.exists() {
             // issue #134: CLI 与 daemon 可能各持一份配置 (daemon 走 systemd
             // FUSION_SV_CONFIG, CLI 默认 ~/.fusion-sv/config.toml) — 回退默认
@@ -397,6 +436,38 @@ mod tests {
             cfg.registry_path
         );
         let _ = std::fs::remove_file(&nonexistent);
+    }
+
+    // issue #136: 配置路径解析纯函数 — explicit 恒优先。
+    #[test]
+    fn test_issue136_resolve_path_explicit_wins() {
+        let (path, adopted) = resolve_config_path(Some("/custom/sv.toml".into()), true, true);
+        assert_eq!(path, PathBuf::from("/custom/sv.toml"));
+        assert!(!adopted);
+    }
+
+    // issue #136: 默认配置存在 → 用默认, 不采纳部署配置。
+    #[test]
+    fn test_issue136_resolve_path_default_present() {
+        let (path, adopted) = resolve_config_path(None, true, true);
+        assert_eq!(path, PathBuf::from("~/.fusion-sv/config.toml"));
+        assert!(!adopted);
+    }
+
+    // issue #136: 默认缺失 + 部署配置存在 (VPS root 跑 CLI) → 采纳部署配置。
+    #[test]
+    fn test_issue136_resolve_path_adopts_deploy() {
+        let (path, adopted) = resolve_config_path(None, false, true);
+        assert_eq!(path, PathBuf::from(DEPLOY_CONFIG_PATH));
+        assert!(adopted);
+    }
+
+    // issue #136: 两者都缺 → 回默认路径 (缺失分支由调用方 WARN, #134)。
+    #[test]
+    fn test_issue136_resolve_path_neither_exists() {
+        let (path, adopted) = resolve_config_path(None, false, false);
+        assert_eq!(path, PathBuf::from("~/.fusion-sv/config.toml"));
+        assert!(!adopted);
     }
 
     // 部分配置文件 (只写覆盖项) 应可加载, 其余字段取默认 —
