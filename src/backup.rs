@@ -189,6 +189,8 @@ pub struct BackupRunner {
     pg_user: Option<String>,
     target: Option<PathBuf>,
     retention: u32,
+    // issue #132: 周保留份数 (0 = 关闭)
+    weekly_retention: u32,
 }
 
 impl BackupRunner {
@@ -238,6 +240,7 @@ impl BackupRunner {
             pg_user,
             target,
             retention: cfg.backup_retention,
+            weekly_retention: cfg.backup_weekly_retention,
         }
     }
 
@@ -259,6 +262,7 @@ impl BackupRunner {
             pg_user: None,
             target,
             retention,
+            weekly_retention: 0,
         }
     }
 
@@ -284,6 +288,7 @@ impl BackupRunner {
             pg_user: None,
             target,
             retention,
+            weekly_retention: 0,
         }
     }
 
@@ -326,12 +331,23 @@ impl BackupRunner {
         } else {
             "compose"
         };
-        // 1. Postgres: pg_dumpall → gzip
+        // 1. Postgres: pg_dumpall → gzip → (可选) 静态加密
         // #117: 先写 .sql.gz.tmp, 成功后原子 rename — daemon 中途被杀 (SIGTERM/
         // SIGKILL) 只留 tmp 残片, 最终名永远对应完整 gzip (旧实现直接写最终名,
         // 2026-11-09 daemon 死在 dump 中段留 157MB 无 footer 假备份实证)。
         // tmp 名不以 .sql.gz 结尾 → prune_old 过滤器天然跳过。
-        let pg_path = target.join(format!("fusion-pg-{date}.sql.gz"));
+        // issue #132: FUSION_BACKUP_ENC_KEY 设置时 dump 落盘后静态加密 (openssl
+        // aes-256-cbc) — 加密失败 fail-closed (绝不留明文落 target), 最终名 .enc 后缀。
+        let enc_key = resolve_enc_key();
+        if enc_key.is_some() {
+            tracing::info!("FUSION_BACKUP_ENC_KEY 已设置, 备份将静态加密 (aes-256-cbc)");
+        }
+        let pg_suffix = if enc_key.is_some() {
+            "sql.gz.enc"
+        } else {
+            "sql.gz"
+        };
+        let pg_path = target.join(format!("fusion-pg-{date}.{pg_suffix}"));
         let pg_tmp = target.join(format!("fusion-pg-{date}.sql.gz.tmp"));
         let _ = std::fs::remove_file(&pg_tmp);
         let pg_started = std::time::SystemTime::now()
@@ -345,10 +361,33 @@ impl BackupRunner {
         };
         let pg_res = match pg_res {
             Ok(n) => {
-                if let Err(e) = std::fs::rename(&pg_tmp, &pg_path) {
-                    Err(anyhow::anyhow!(e).context("backup tmp rename 失败"))
-                } else {
-                    Ok(n)
+                // issue #132: 静态加密 — tmp 加密成 .enc.tmp, 成功后清明文 tmp 再 rename。
+                let enc_step: Result<Option<PathBuf>> = match &enc_key {
+                    None => Ok(None),
+                    Some(key) => {
+                        let enc_tmp = target.join(format!("fusion-pg-{date}.sql.gz.enc.tmp"));
+                        encrypt_file(&pg_tmp, &enc_tmp, key)
+                            .map(|_| {
+                                let _ = std::fs::remove_file(&pg_tmp);
+                                Some(enc_tmp)
+                            })
+                            .map_err(|e| {
+                                let _ = std::fs::remove_file(&pg_tmp);
+                                anyhow::anyhow!(e)
+                                    .context("backup 静态加密失败 (fail-closed, 不留明文)")
+                            })
+                    }
+                };
+                match enc_step {
+                    Err(e) => Err(e),
+                    Ok(Some(enc_tmp)) => match std::fs::rename(&enc_tmp, &pg_path) {
+                        Ok(()) => Ok(n),
+                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename 失败")),
+                    },
+                    Ok(None) => match std::fs::rename(&pg_tmp, &pg_path) {
+                        Ok(()) => Ok(n),
+                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename 失败")),
+                    },
                 }
             }
             Err(e) => {
@@ -390,6 +429,16 @@ impl BackupRunner {
             )
             .await;
             qd_res.context("qdrant snapshot 失败")?;
+        }
+        // 2.5 issue #132: qdrant tar 同样静态加密 (key 设置时, 缺席平面无目录跳过)
+        if let Some(key) = &enc_key {
+            let tar = qd_dir.join("storage.tar");
+            if tar.exists() {
+                let tar_enc = qd_dir.join("storage.tar.enc");
+                encrypt_file(&tar, &tar_enc, key).context("qdrant snapshot 静态加密失败")?;
+                let _ = std::fs::remove_file(&tar);
+                tracing::info!(file = %tar_enc.display(), "qdrant 快照已加密");
+            }
         }
         // 3. 保留裁剪
         if let Err(e) = self.prune_old(&target) {
@@ -495,37 +544,55 @@ impl BackupRunner {
         Ok(())
     }
 
-    // 保留裁剪: 按文件名 date 排序 (词序=时序, 因 date 为 YYYYMMDD 或 d{日序号}),
-    // 删除超出 retention 的最旧备份。日志记录每次裁剪。
+    // 保留裁剪 (issue #132 两层保留): 按文件名 date 降序 (词序=时序, date 为
+    // YYYYMMDD[-hhmmss] 或 d{日序号}), 前 retention 份为日保留; 其余候选中按
+    // 自然周 (day_index/7) 每周留最新一份, 最多 weekly_retention 周 — 供月级回溯。
+    // weekly_retention=0 → 旧平铺行为。裁剪只动 pg 文件 + 同 date qdrant 目录。
     fn prune_old(&self, target: &Path) -> Result<()> {
         if self.retention == 0 {
             return Ok(());
         }
-        // 收集 pg 备份 (path, date_str), 按日期降序, 保留前 retention 份
-        let mut pg_files: Vec<(PathBuf, String)> = Vec::new();
+        // 收集 pg 备份 (path, date_str, day_index), 按日期降序
+        let mut pg_files: Vec<(PathBuf, String, i64)> = Vec::new();
         for entry in std::fs::read_dir(target)? {
             let e = entry?;
             let p = e.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str())
                 && name.starts_with("fusion-pg-")
-                && name.ends_with(".sql.gz")
+                && (name.ends_with(".sql.gz") || name.ends_with(".sql.gz.enc"))
             {
                 let date = name
                     .trim_start_matches("fusion-pg-")
+                    .trim_end_matches(".sql.gz.enc")
                     .trim_end_matches(".sql.gz")
                     .to_string();
-                pg_files.push((p, date));
+                let day = parse_backup_day(&date).unwrap_or(i64::MAX);
+                pg_files.push((p, date, day));
             }
         }
-        // 按日期降序 (新→旧), 保留前 retention, 删其余
         pg_files.sort_by(|a, b| b.1.cmp(&a.1));
-        if pg_files.len() <= self.retention as usize {
-            return Ok(());
+        // 日保留 = 前 retention 份; 周保留 = 其余候选中每周最新一份 (最多 N 周)
+        let daily_keep = (self.retention as usize).min(pg_files.len());
+        let mut prune: Vec<(PathBuf, String)> = Vec::new();
+        let mut last_week: Option<i64> = None;
+        let mut weeks_kept: u32 = 0;
+        for (i, (p, date, day)) in pg_files.iter().enumerate() {
+            if i < daily_keep {
+                continue;
+            }
+            if self.weekly_retention > 0 && weeks_kept < self.weekly_retention {
+                let week = day / 7;
+                if last_week != Some(week) {
+                    // 每周第一份 (即该周最新) 保留, 同周其余裁剪
+                    last_week = Some(week);
+                    weeks_kept += 1;
+                    continue;
+                }
+            }
+            prune.push((p.clone(), date.clone()));
         }
-        let prune_count = pg_files.len() - self.retention as usize;
-        // 取最旧的 prune_count 份 (降序后尾部)
-        for (p, date) in pg_files.iter().rev().take(prune_count) {
-            tracing::info!(file = %p.display(), "prune 旧 pg 备份 (超出 retention {})", self.retention);
+        for (p, date) in &prune {
+            tracing::info!(file = %p.display(), "prune 旧 pg 备份 (日保留 {}, 周保留 {})", self.retention, self.weekly_retention);
             if let Err(e) = std::fs::remove_file(p) {
                 tracing::warn!(file = %p.display(), err = %e, "prune pg 文件失败");
             }
@@ -626,6 +693,101 @@ pub fn resolve_target() -> Option<PathBuf> {
         }
     }
     None
+}
+
+// issue #132: 解析 FUSION_BACKUP_ENC_KEY — 进程 env 优先, 再 .env 文件 (与
+// resolve_target 同链)。值绝不落日志/事件。None = 不加密 (旧行为)。
+pub fn resolve_enc_key() -> Option<String> {
+    if let Ok(v) = std::env::var("FUSION_BACKUP_ENC_KEY")
+        && !v.is_empty()
+    {
+        return Some(v);
+    }
+    let env_path = PathBuf::from(".env");
+    if let Ok(text) = std::fs::read_to_string(&env_path) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=')
+                && k.trim() == "FUSION_BACKUP_ENC_KEY"
+                && !v.trim().is_empty()
+            {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+// issue #132: 文件级静态加密 — openssl enc aes-256-cbc (pbkdf2, 20 万轮)。
+// key 经 stdin 传入 (避开 argv/env 泄漏面), openssl 缺失/失败 → Err (调用方
+// fail-closed 清明文残片)。流式拷贝不经内存整包缓冲。
+pub fn encrypt_file(src: &Path, dst: &Path, key: &str) -> Result<u64> {
+    // key 走子进程私有 env (-pass env:VAR) — 不进 argv、不进父进程环境、不落盘
+    let mut child = std::process::Command::new("openssl")
+        .args([
+            "enc",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-iter",
+            "200000",
+            "-salt",
+            "-in",
+        ])
+        .arg(src)
+        .args(["-pass", "env:FUSION_BACKUP_ENC_KEY"])
+        .env("FUSION_BACKUP_ENC_KEY", key)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn openssl: {e}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        bail!("openssl stdout 不可读");
+    };
+    let mut out =
+        std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    let mut rdr = std::io::BufReader::new(stdout);
+    let n = std::io::copy(&mut rdr, &mut out)
+        .with_context(|| format!("stream encrypt → {}", dst.display()))?;
+    drop(out);
+    let status = child.wait().with_context(|| "wait openssl")?;
+    if !status.success() {
+        let _ = std::fs::remove_file(dst);
+        bail!("openssl 加密失败: exit {:?}", status.code());
+    }
+    Ok(n)
+}
+
+// issue #132: 备份文件 date → 自 1970-01-01 天数 (周桶用)。
+// 支持 "YYYYMMDD[-hhmmss]" (取前 8 位) 与遗留 "d{日序号}"。
+fn parse_backup_day(date: &str) -> Option<i64> {
+    if let Some(rest) = date.strip_prefix('d') {
+        return rest.parse::<i64>().ok();
+    }
+    let ymd = &date.get(..8)?;
+    if ymd.len() != 8 || !ymd.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = ymd[..4].parse().ok()?;
+    let m: i64 = ymd[4..6].parse().ok()?;
+    let d: i64 = ymd[6..8].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+// Howard Hinnant days_from_civil (纯日历算法, 无 chrono 依赖)。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 // 调度判定纯函数 (供 daemon tick 循环 + 测试共用)。
@@ -1013,6 +1175,122 @@ mod tests {
         let tar = target.join("fusion-qdrant-20260930/storage.tar");
         assert!(tar.exists(), "qdrant storage.tar 应存在: {}", tar.display());
         assert_eq!(std::fs::read(&tar).unwrap(), b"tar-bytes");
+    }
+
+    // issue #132: date → day index (civil 算法 vs 已知锚点)
+    #[test]
+    fn test_parse_backup_day() {
+        assert_eq!(parse_backup_day("19700101"), Some(0));
+        let a = parse_backup_day("20260101").unwrap();
+        let b = parse_backup_day("20261118").unwrap();
+        assert_eq!(b - a, 321);
+        assert_eq!(
+            parse_backup_day("20261118-153000"),
+            parse_backup_day("20261118")
+        );
+        assert_eq!(parse_backup_day("d20766"), Some(20766));
+        assert_eq!(parse_backup_day("garbage"), None);
+    }
+
+    // issue #132: 两层保留 — 日 retention 之外, 候选里每周最新一份留最多 N 周
+    #[test]
+    fn test_prune_weekly_tier() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        let d0 = parse_backup_day("20260920").unwrap();
+        let d1 = parse_backup_day("20261118").unwrap();
+        for d in d0..=d1 {
+            std::fs::File::create(target.join(format!("fusion-pg-d{d}.sql.gz"))).unwrap();
+        }
+        let native: NativeExecFn = Arc::new(|_bin: &str, _args: &[&str]| bail!("no docker"));
+        let mut runner = BackupRunner::new_native_with_exec(native, Some(target.to_path_buf()), 14);
+        runner.weekly_retention = 4;
+        runner.prune_old(target).unwrap();
+        let left = std::fs::read_dir(target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(left, 18, "14 daily + 4 weekly 应保留 18 份, got {left}");
+        assert!(
+            target.join(format!("fusion-pg-d{d1}.sql.gz")).exists(),
+            "最新日备份应保留"
+        );
+    }
+
+    // issue #132: weekly=0 → 旧平铺行为
+    #[test]
+    fn test_prune_weekly_disabled_flat() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        for d in 100..=110 {
+            std::fs::File::create(target.join(format!("fusion-pg-d{d}.sql.gz"))).unwrap();
+        }
+        let native: NativeExecFn = Arc::new(|_bin: &str, _args: &[&str]| bail!("no docker"));
+        let runner = BackupRunner::new_native_with_exec(native, Some(target.to_path_buf()), 7);
+        runner.prune_old(target).unwrap();
+        let left = std::fs::read_dir(target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(left, 7, "weekly=0 应只留 7 份, got {left}");
+    }
+
+    // issue #132: .enc 后缀备份同样参与收集与裁剪
+    #[test]
+    fn test_prune_covers_enc_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        for d in 100..=104 {
+            let n = if d % 2 == 0 {
+                format!("fusion-pg-d{d}.sql.gz.enc")
+            } else {
+                format!("fusion-pg-d{d}.sql.gz")
+            };
+            std::fs::File::create(target.join(n)).unwrap();
+        }
+        let native: NativeExecFn = Arc::new(|_bin: &str, _args: &[&str]| bail!("no docker"));
+        let runner = BackupRunner::new_native_with_exec(native, Some(target.to_path_buf()), 2);
+        runner.prune_old(target).unwrap();
+        assert!(target.join("fusion-pg-d104.sql.gz.enc").exists());
+        assert!(target.join("fusion-pg-d103.sql.gz").exists());
+        let left = std::fs::read_dir(target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(left, 2, "got {left}");
+    }
+
+    // issue #132: openssl 静态加密往返 (环境缺 openssl 则跳过)
+    #[test]
+    fn test_encrypt_file_roundtrip() {
+        let has = std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has {
+            eprintln!("openssl unavailable, skip");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("plain.bin");
+        let dst = tmp.path().join("enc.bin");
+        std::fs::write(&src, b"secret-pg-dump-content").unwrap();
+        let n = encrypt_file(&src, &dst, "test-key-123").unwrap();
+        assert!(n > 0);
+        let enc = std::fs::read(&dst).unwrap();
+        assert_ne!(enc, b"secret-pg-dump-content");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in {} -pass env:FUSION_BACKUP_ENC_KEY",
+                dst.display()
+            ))
+            .env("FUSION_BACKUP_ENC_KEY", "test-key-123")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"secret-pg-dump-content");
     }
 
     // test_backup_schedule_triggers: 调度到期 → 触发一次 backup。

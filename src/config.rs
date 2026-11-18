@@ -43,6 +43,10 @@ pub struct Config {
     // issue #10: 备份保留份数。新备份后裁剪超出 N 份的旧备份, 默认 7。
     #[serde(default = "default_backup_retention")]
     pub backup_retention: u32,
+    // issue #132: 周备份保留份数 — 日保留 (backup_retention) 之外, 裁剪候选中按
+    // 自然周再留最新 N 份。0 = 关闭 (旧平铺行为)。默认 0。
+    #[serde(default)]
+    pub backup_weekly_retention: u32,
     // issue #37: history.db 健康史/事件保留天数。daemon 周期 sweep 清除过期行。
     #[serde(default = "default_history_retention_days")]
     pub history_retention_days: u32,
@@ -235,6 +239,7 @@ impl Default for Config {
             rollout_prewarm_timeout_sec: 60,
             backup_schedule_sec: 86400,
             backup_retention: 7,
+            backup_weekly_retention: 0,
             history_retention_days: 7,
             prune_schedule_sec: 3600,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),

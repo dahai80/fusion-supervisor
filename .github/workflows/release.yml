@@ -1,0 +1,68 @@
+name: Release
+
+# issue #132: tagged release builds. VPS (fusion-vps) has no cargo — deploy path
+# is the linux x86_64 artifact from this workflow, not a local build.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin fusion-sv
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/fusion-sv dist/
+          sha256sum dist/fusion-sv > dist/fusion-sv.sha256
+          tar czf fusion-sv-linux-x86_64.tar.gz -C dist fusion-sv fusion-sv.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion-sv-linux-x86_64
+          path: fusion-sv-linux-x86_64.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin fusion-sv
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/fusion-sv dist/
+          shasum -a 256 dist/fusion-sv > dist/fusion-sv.sha256
+          tar czf fusion-sv-macos-aarch64.tar.gz -C dist fusion-sv fusion-sv.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion-sv-macos-aarch64
+          path: fusion-sv-macos-aarch64.tar.gz
+
+  github-release:
+    # Only tag pushes create a GitHub Release; manual dispatch builds artifacts only.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fusion-sv-linux-x86_64.tar.gz
+            fusion-sv-macos-aarch64.tar.gz
+          generate_release_notes: true
