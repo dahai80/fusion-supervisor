@@ -59,7 +59,7 @@ fn cfg(db_path: &std::path::Path) -> fusion_supervisor::config::Config {
 // spawn 出的 detached 任务在锁内读它; tokio 单线程测试内无并发争锁。
 #[allow(clippy::await_holding_lock)]
 async fn test_spawn_backup_detached_and_persisted() {
-    let _g = env_lock().lock().unwrap();
+    let _g = env_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _e = EnvGuard::set("FUSION_BACKUP_TARGET", target_dir.path().to_str().unwrap());
@@ -97,7 +97,7 @@ async fn test_spawn_backup_detached_and_persisted() {
 
 #[tokio::test]
 async fn test_last_backup_ts_loaded_from_meta() {
-    let _g = env_lock().lock().unwrap();
+    let _g = env_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let db = tmp.path().join("history.db");
     // new_with_fns 构造器用独立临时库 (不接 cfg.db_path), 构造器 meta 恢复行为
@@ -120,7 +120,7 @@ async fn test_last_backup_ts_loaded_from_meta() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn test_check_backup_schedule_triggers_spawn() {
-    let _g = env_lock().lock().unwrap();
+    let _g = env_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let target_dir = tempfile::TempDir::new().unwrap();
     let _e = EnvGuard::set("FUSION_BACKUP_TARGET", target_dir.path().to_str().unwrap());

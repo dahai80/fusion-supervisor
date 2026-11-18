@@ -1925,7 +1925,7 @@ mod tests {
     // 其它服务照常继承。
     #[test]
     fn test_exec_bash_script_strips_pinned_env() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock();
         let prev = std::env::var("FUSION_MLX_API_KEY").ok();
         unsafe { std::env::set_var("FUSION_MLX_API_KEY", "stale-snapshot-key") };
         // 脚本: env 存在即 fail
@@ -2443,7 +2443,7 @@ mod tests {
                 }
             }
         }
-        let _g0 = env_lock().lock().unwrap();
+        let _g0 = env_lock();
         let home = std::env::temp_dir().join(format!("fusion-sv-111-home-{}", std::process::id()));
         std::fs::create_dir_all(home.join(".fusion-sv/pids")).unwrap();
         let _g1 = HomeGuard::set(&home);
@@ -3138,7 +3138,7 @@ mod tests {
         // made these tests environment-dependent. Same fix as the trainer-bridge
         // tests in env_map.rs.
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let env_f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(env_f.path(), "FUSION_PG_PASSWORD=pw78\n").unwrap();
@@ -3183,7 +3183,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_issue125_overlay_env_reaches_start_fn() {
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-ovl-test");
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let home = tempfile::tempdir().unwrap();
         let ovl_dir = home.path().join(".fusion-sv/env");
         std::fs::create_dir_all(&ovl_dir).unwrap();
@@ -3225,7 +3225,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_up_native_fail_closed_when_pg_password_missing() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         // .env 只有 USER 无 PASSWORD → DATABASE_URL 构造不出
         let env_f = tempfile::NamedTempFile::new().unwrap();
