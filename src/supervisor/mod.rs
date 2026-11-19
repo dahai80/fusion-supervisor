@@ -107,6 +107,9 @@ pub struct SupervisorCore {
     // issue #137: 定时任务游标 (job name → 上次触发 ts)。内存镜像 meta job_last:<name>,
     // spawn 即推进 (失败不重试到下个到期, 同 backup 语义)。
     job_last: std::collections::HashMap<String, u64>,
+    // issue #139: 外部告警摄入 dedup 闸门 (调用方 dedup_key → 上次放行 ts)。
+    // pub: http_server 摄入路由直接操作 (与 store/alerter 同级暴露)。
+    pub ingest_gate: crate::ingest::IngestGate,
 }
 
 impl SupervisorCore {
@@ -200,6 +203,8 @@ impl SupervisorCore {
             events_pruned_total: 0,
             boot_pins,
             job_last,
+            // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
+            ingest_gate: crate::ingest::IngestGate::default(),
         })
     }
 
@@ -280,6 +285,8 @@ impl SupervisorCore {
             events_pruned_total: 0,
             boot_pins,
             job_last,
+            // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
+            ingest_gate: crate::ingest::IngestGate::default(),
         }
     }
 

@@ -390,19 +390,8 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             ],
             env_file: None,
         }),
-        // issue #137: fusion-ops API 服务 (Go, FUSION_OPS_LISTEN 默认 :11400,
-        // /healthz 无鉴权)。上游无 start.sh, 前台二进制走 Daemon 接管; bin 含
-        // '/' 相对 FUSION_ROOT 解析 (issue #33), 由 fusion-ops 仓库自行构建。
-        // DSN 走 ~/.fusion-sv/env/fusion-ops.env overlay (#125, FUSION_OPS_DATABASE_URL)。
-        "fusion-ops" => Some(StartSpec::Daemon {
-            bin: "fusion-ops/fusion-ops".into(),
-            args: Vec::new(),
-            // 迁移目录相对 repo 根 (上游 "open migrations: no such file or
-            // directory" 实证) — cwd 落 fusion-ops
-            cwd: Some("fusion-ops".into()),
-            env: Vec::new(),
-            env_file: None,
-        }),
+        // issue #140: fusion-ops Mac 侧注册已移除 (服务迁 VPS systemd, fusion-ops#5) —
+        // 此处不再接管, 避免状态表常驻 Stopped 假象。
         _ => None,
     }
 }

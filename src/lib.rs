@@ -7,6 +7,7 @@ pub mod config;
 pub mod dep_map;
 pub mod env_map;
 pub mod http_server;
+pub mod ingest;
 pub mod jobs;
 pub mod manifest;
 pub mod metrics;

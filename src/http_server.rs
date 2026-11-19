@@ -11,6 +11,8 @@
 //   POST /api/v1/{up,down,restart,drain,rollout,backup,shutdown}
 //                                编排操作 — 复用 UDS dispatch, 同一 token 语义
 //                                (issue #25; Authorization: Bearer / x-token)
+//   POST /api/v1/alerts/ingest   外部告警摄入 (issue #139, token; 事件落库 +
+//                                可选 webhook 转发, dedup_key 可选)
 //   GET  其余路径                web 控制台静态文件 (web_dir 配置, issue #25)
 // 安全边界: listener 绑 loopback (metrics_addr, 默认 127.0.0.1:9100);
 // 变更操作 token 校验与 UDS 完全一致 (FUSION_SV_TOKEN)。
@@ -288,6 +290,89 @@ async fn route(
                 }
             };
             http_text("200 OK", "application/json", &body)
+        }
+        // issue #139: 外部告警摄入 — token 语义与编排操作一致 (配置了则必须匹配,
+        // 401 不落事件); 事件直接落 history.db (plane="external"), 可选经 Alerter
+        // webhook 转发 (独立实例无 sink, 事件不重复记)。锁内只做 dedup + 落库。
+        ("POST", "/api/v1/alerts/ingest") => {
+            if let Some(expected) = token
+                && expected != &req.token
+            {
+                return http_text(
+                    "401 Unauthorized",
+                    "application/json",
+                    "{\"error\":\"invalid token\"}",
+                );
+            }
+            let payload = match crate::ingest::IngestPayload::parse(&req.body) {
+                Ok(p) => p,
+                Err(e) => {
+                    return http_text(
+                        "400 Bad Request",
+                        "application/json",
+                        &json!({"error": e}).to_string(),
+                    );
+                }
+            };
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let (passed, alert_url, dedup_sec) = {
+                let mut c = core.lock().await;
+                let window = c.cfg.alert_dedup_sec;
+                let ok = c
+                    .ingest_gate
+                    .observe(payload.dedup_key.as_deref(), ts, window);
+                if ok
+                    && let Err(e) = c.store.record_event(
+                        &payload.source,
+                        &payload.kind,
+                        &payload.detail,
+                        ts,
+                        "external",
+                        &payload.severity,
+                    )
+                {
+                    tracing::warn!(err = %e, "ingest event record fail");
+                    return http_text(
+                        "500 Internal Server Error",
+                        "application/json",
+                        "{\"error\":\"record fail\"}",
+                    );
+                }
+                (ok, c.cfg.alert_url.clone(), c.cfg.alert_dedup_sec)
+            };
+            tracing::info!(
+                source = %payload.source,
+                kind = %payload.kind,
+                severity = %payload.severity,
+                passed,
+                "external alert ingested"
+            );
+            if !passed {
+                return http_text(
+                    "200 OK",
+                    "application/json",
+                    "{\"ok\":true,\"deduped\":true}",
+                );
+            }
+            // webhook 转发锁外 fire-and-forget (网络 I/O 不持锁)
+            if !alert_url.is_empty() {
+                let alert = crate::alert::Alert {
+                    service: payload.source.clone(),
+                    kind: crate::alert::AlertKind::External,
+                    detail: format!("[{}] {}", payload.kind, payload.detail),
+                    ts,
+                };
+                tokio::spawn(async move {
+                    let mut alerter = crate::alert::Alerter::new(dedup_sec, alert_url);
+                    if let Err(e) = alerter.alert(alert).await {
+                        tracing::warn!(err = %e, "ingest webhook forward fail");
+                    }
+                });
+            }
+            http_text("200 OK", "application/json", "{\"ok\":true}")
         }
         // 编排操作 (POST) 与日志 (GET): 复用 UDS dispatch, token 语义一致。
         (m, p) if p.starts_with("/api/v1/") => {
