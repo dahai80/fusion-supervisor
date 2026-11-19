@@ -191,6 +191,26 @@ native_extra_path = "/opt/homebrew/bin:/usr/local/bin"
 # history.db retention (issue #37) — sweep prunes health_check/event rows older than N days
 history_retention_days = 7
 prune_schedule_sec = 3600          # how often the sweep runs
+
+# Scheduled jobs (issue #137) — one-shot binaries on a supervisor-driven schedule.
+# Exactly one of daily_at (local HH:MM) / every_sec per entry; validation is
+# fail-closed (bad job config refuses daemon start). Cursor persists in the
+# meta table (job_last:<name>) so a daemon reload never re-fires a job.
+# stdout/stderr append to ~/.fusion-sv/logs/job-<name>.log; env overlay from
+# ~/.fusion-sv/env/<name>.env; outcome recorded as a `Job` event (success=info,
+# failure=error + JobFailed escalation alert). Timeout kills at timeout_sec.
+[[jobs]]
+name = "fusion-ops-retention"
+bin = "fusion-ops/fusion-ops-job"  # contains '/' → resolved relative to FUSION_ROOT
+args = ["-job=retention"]
+daily_at = "03:30"
+timeout_sec = 900
+
+[[jobs]]
+name = "fusion-ops-cluster"
+bin = "fusion-ops/fusion-ops-job"
+args = ["-job=cluster"]
+every_sec = 3600
 ```
 
 Every field is optional in the file — write only the keys you want to override (all have serde defaults since v0.1.1; partial configs used to fail with `missing field socket_path`).
