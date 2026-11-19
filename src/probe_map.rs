@@ -98,9 +98,9 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     // issue #55: 批量登记条目 — 有鉴权豁免 /health 的走 HTTP, 其余 (ads_vb /
     // operabase 未见公开健康口, 静态 http.server 恒 404) 退 TCP
     m.insert("ai-doc-automation", ProbeSpec::http(11550, "/health"));
-    // issue #88: fleet 审计收编的两条 business 条目 — assistant /health
-    // (api/system.py), lead-qualifier /api/v1/system/health (app.py)
-    m.insert("ai-assistant-agent", ProbeSpec::http(11511, "/health"));
+    // issue #88: fleet 审计收编的另两条 business 条目 — lead-qualifier
+    // /api/v1/system/health (app.py)
+    // issue #143: ai-assistant-agent 条目已移除 (自愈型服务不再托管)
     // issue #94: booking_agent/main.py:233 GET /health
     m.insert("ai-booking-agent", ProbeSpec::http(11516, "/health"));
     m.insert(
@@ -218,9 +218,11 @@ mod tests {
     #[test]
     fn test_issue88_business_audit_probes() {
         // issue #88: fleet 审计收编的两条 business 条目健康口
-        let a = probe_spec_for("ai-assistant-agent", 11511);
-        assert!(matches!(a.kind, ProbeKind::Http));
-        assert_eq!(a.path.as_deref(), Some("/health"));
+        // issue #143: ai-assistant-agent 已移除 (自愈型服务不再托管) — 落 TCP 兜底
+        assert!(matches!(
+            probe_spec_for("ai-assistant-agent", 11511).kind,
+            ProbeKind::Tcp
+        ));
         let l = probe_spec_for("ai-lead-qualifier", 11552);
         assert!(matches!(l.kind, ProbeKind::Http));
         assert_eq!(l.path.as_deref(), Some("/api/v1/system/health"));
