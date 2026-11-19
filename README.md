@@ -171,6 +171,20 @@ registry_path = "architecture/port-registry.yaml"
 # Leave unset on hosts where start.sh owns the lifecycle (e.g. the Mac).
 [systemd_units]
 # "fusion-identity" = "fusion-identity.service"
+# Prerequisite: the daemon user must be allowed to run `systemctl start/stop`
+# on the declared units. If the daemon does not run as root, grant it via a
+# polkit rule, e.g. /etc/polkit-1/rules.d/50-fusion-sv.rules:
+#   polkit.addRule(function(action, subject) {
+#       if (subject.user == "ops" &&
+#           action.id == "org.freedesktop.systemd1.manage-units") {
+#           var allowed = ["fusion-identity.service" /*, ... */];
+#           if (allowed.indexOf(action.lookup("unit")) >= 0) {
+#               return polkit.Result.YES;
+#           }
+#       }
+#   });
+# Without it, systemctl fails with "Interactive authentication required" and
+# restart falls back to the port-occupied abort (fail-visible, not a fake stop).
 metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22) + /api/v1/* face + web console (issue #25); "" = disable all
 web_dir = "~/fusion/fusion-supervisor/web/dist"  # optional: serve the built web console from the same listener; "" = off
 auto_up_on_start = true            # issue #29/#62: daemon boot runs up_boot_set once — T0 (fixed core) + pin=auto services (probe-skips already-healthy); host-reboot self-healing when the daemon itself is launched at boot. Default false. BEHAVIOR CHANGE in #62: was up_all (everything).
