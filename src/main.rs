@@ -137,6 +137,15 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         Some(f) => f,
         None => anyhow::bail!("fusion-sv daemon already running (instance lock held)"),
     };
+    // issue #145: config 声明的 systemd 托管表灌入 start_map (OnceLock 一次;
+    // CLI one-shot 不注册 — 生命周期命令全部经 daemon RPC 执行)。
+    fusion_supervisor::start_map::register_systemd_units(cfg.systemd_units.clone());
+    if !cfg.systemd_units.is_empty() {
+        tracing::info!(
+            units = cfg.systemd_units.len(),
+            "systemd-managed services registered (start/stop/restart via systemctl)"
+        );
+    }
     // issue #80: launchd 默认 PATH 不含 Homebrew bin — node/brew 系 start.sh 在
     // daemon 拉起时 `command -v node` 全挂。启动时把 native_extra_path 中缺失的
     // 项追加到 daemon 自身 PATH 尾部; 所有子进程 (exec_bash_script /

@@ -164,6 +164,13 @@ backoff_max_sec = 30
 alert_url = ""        # empty = log only
 alert_dedup_sec = 300
 registry_path = "architecture/port-registry.yaml"
+# issue #145: systemd-managed services (VPS deploys where systemd owns the
+# lifecycle). Declared services are started/stopped via `systemctl` instead of
+# start.sh — start.sh pidfiles cannot control systemd-spawned processes, so a
+# plain restart there fakes a stop and then aborts on port-occupied.
+# Leave unset on hosts where start.sh owns the lifecycle (e.g. the Mac).
+[systemd_units]
+# "fusion-identity" = "fusion-identity.service"
 metrics_addr = "127.0.0.1:9100"   # Prometheus /metrics (issue #22) + /api/v1/* face + web console (issue #25); "" = disable all
 web_dir = "~/fusion/fusion-supervisor/web/dist"  # optional: serve the built web console from the same listener; "" = off
 auto_up_on_start = true            # issue #29/#62: daemon boot runs up_boot_set once — T0 (fixed core) + pin=auto services (probe-skips already-healthy); host-reboot self-healing when the daemon itself is launched at boot. Default false. BEHAVIOR CHANGE in #62: was up_all (everything).

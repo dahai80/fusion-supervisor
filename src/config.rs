@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +57,13 @@ pub struct Config {
     pub prune_schedule_sec: u64,
     #[serde(default = "default_registry_path")]
     pub registry_path: PathBuf,
+    // issue #145: systemd 托管服务表 (service name → systemd unit)。
+    // VPS 部署 systemd 是生命周期权威 — supervisor 的 start/stop/restart 经
+    // systemctl 驱动该 unit 而非 start.sh (start.sh 的 pidfile 对 systemd 拉起
+    // 的进程失效, stop 杀不到真进程 → 假停止 + 端口占用 bail)。Mac 不配置
+    // (缺省空表, 全走 start.sh / start_map)。unit 名 fail-closed 字符校验。
+    #[serde(default)]
+    pub systemd_units: HashMap<String, String>,
     #[serde(default)]
     pub compose: ComposeConfig,
     // issue #22: Prometheus /metrics HTTP 端点监听地址。
@@ -298,6 +306,7 @@ impl Default for Config {
             history_retention_days: 7,
             prune_schedule_sec: 3600,
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
+            systemd_units: HashMap::new(),
             compose: ComposeConfig::default(),
             metrics_addr: default_metrics_addr(),
             web_dir: None,
@@ -397,6 +406,18 @@ impl Config {
             cfg.web_dir = None;
         }
         validate_jobs(&cfg.jobs)?;
+        // issue #145: systemd unit 名 fail-closed 校验 (防 shell 元字符注入 systemctl 参数)
+        for (svc, unit) in &cfg.systemd_units {
+            anyhow::ensure!(
+                !svc.trim().is_empty() && !unit.trim().is_empty(),
+                "systemd_units entries must be non-empty (got {svc:?} -> {unit:?})"
+            );
+            anyhow::ensure!(
+                unit.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._@".contains(c)),
+                "systemd unit {unit:?} for {svc} has invalid characters (allowed: alnum - . _ @)"
+            );
+        }
         Ok(cfg)
     }
 }
@@ -493,6 +514,27 @@ mod tests {
             cfg.registry_path
         );
         let _ = std::fs::remove_file(&nonexistent);
+    }
+
+    // issue #145: systemd_units 校验 — 合法 unit 通过, shell 元字符 fail-closed
+    #[test]
+    fn test_issue145_systemd_units_validation() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let _g =
+            crate::env_map::tests::EnvGuard::set("FUSION_SV_CONFIG", tmp.path().to_str().unwrap());
+        std::fs::write(
+            tmp.path(),
+            "[systemd_units]\n\"fusion-identity\" = \"fusion-identity.service\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load().unwrap();
+        assert_eq!(
+            cfg.systemd_units.get("fusion-identity").map(String::as_str),
+            Some("fusion-identity.service")
+        );
+        // shell 元字符注入拒绝
+        std::fs::write(tmp.path(), "[systemd_units]\n\"svc\" = \"evil; reboot\"\n").unwrap();
+        assert!(Config::load().is_err());
     }
 
     // issue #136: 配置路径解析纯函数 — explicit 恒优先。

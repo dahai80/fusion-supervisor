@@ -2041,16 +2041,29 @@ fn exec_start_spec(
 ) -> Result<()> {
     match spec {
         crate::start_map::StartSpec::Script(sh) => exec_bash_script(svc, sh, cmd, env_overrides),
-        crate::start_map::StartSpec::Daemon { .. } => {
-            let shell_cmd = match cmd {
-                "start" => crate::start_map::daemon_start_cmd(spec, svc)
-                    .ok_or_else(|| anyhow::anyhow!("daemon spec 缺 start 命令: {svc}"))?,
-                "stop" => {
-                    crate::start_map::daemon_stop_cmd(svc, crate::manifest::registered_port(svc))
+        crate::start_map::StartSpec::Daemon { .. }
+        | crate::start_map::StartSpec::Systemd { .. } => {
+            // issue #145: Systemd spec 与 Daemon 共用同一 spawn/退出码路径 —
+            // 差异只在命令构造 (systemctl 同步返回, unit 停稳才退出, 端口随
+            // 之释放; start.sh pidfile 路径对 systemd 进程失效见 config 注释)。
+            let shell_cmd = match spec {
+                crate::start_map::StartSpec::Daemon { .. } => match cmd {
+                    "start" => crate::start_map::daemon_start_cmd(spec, svc)
+                        .ok_or_else(|| anyhow::anyhow!("daemon spec 缺 start 命令: {svc}"))?,
+                    "stop" => crate::start_map::daemon_stop_cmd(
+                        svc,
+                        crate::manifest::registered_port(svc),
+                    ),
+                    other => {
+                        anyhow::bail!(
+                            "daemon spec 不支持 {other} (restart 应为 stop+start): {svc}"
+                        );
+                    }
+                },
+                crate::start_map::StartSpec::Systemd { unit } => {
+                    crate::start_map::systemd_shell_cmd(unit, cmd)?
                 }
-                other => {
-                    anyhow::bail!("daemon spec 不支持 {other} (restart 应为 stop+start): {svc}");
-                }
+                _ => unreachable!("外层 match 已排除 Script"),
             };
             tracing::info!(svc, cmd, shell = %shell_cmd, env_n = env_overrides.len(), "exec start_map daemon cmd");
             let mut command = std::process::Command::new("bash");
@@ -2335,6 +2348,48 @@ mod tests {
     #[test]
     fn test_spawn_caffeinate_skips_bad_pidfile() {
         spawn_caffeinate("ut-caffeinate", "/nonexistent-ut-xyz/run.pid");
+    }
+
+    // issue #145: Systemd spec exec — systemctl 替身 (shim) 验证命令透传 +
+    // 非零退出码浮出 (stop 失败不再被吞成假停止)。
+    #[test]
+    fn test_issue145_systemd_exec_start_stop_and_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("systemctl");
+        std::fs::write(
+            &shim,
+            "#!/bin/bash\necho \"$1 $2\" >> \"$FUSION_TEST_SHIM_LOG\"\nexit ${FUSION_TEST_SHIM_RC:-0}\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = tmp.path().join("shim.log");
+        let _g1 = crate::env_map::tests::EnvGuard::set(
+            "PATH",
+            &format!(
+                "{}:{}",
+                tmp.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        );
+        let _g2 =
+            crate::env_map::tests::EnvGuard::set("FUSION_TEST_SHIM_LOG", log.to_str().unwrap());
+        let spec = crate::start_map::StartSpec::Systemd {
+            unit: "ut-svc.service".to_string(),
+        };
+        // start / stop 均透传 systemctl
+        exec_start_spec("ut-svc", &spec, "start", &[]).unwrap();
+        exec_start_spec("ut-svc", &spec, "stop", &[]).unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls, "start ut-svc.service\nstop ut-svc.service\n");
+        // systemctl 失败 → Err 携带退出码 (runner.exit_code_of 约定格式)
+        let _g3 = crate::env_map::tests::EnvGuard::set("FUSION_TEST_SHIM_RC", "1");
+        let err = exec_start_spec("ut-svc", &spec, "stop", &[]).unwrap_err();
+        assert!(err.to_string().contains("exit code=1"), "{err}");
+        // 未知 verb 拒绝
+        let _g4 = crate::env_map::tests::EnvGuard::set("FUSION_TEST_SHIM_RC", "0");
+        assert!(exec_start_spec("ut-svc", &spec, "restart", &[]).is_err());
+        let _ = std::fs::remove_file(crate::start_map::log_path("ut-svc"));
     }
 
     // issue #60 回归: exec 启动的子进程必须落在独立进程组 — launchd bootout 按
