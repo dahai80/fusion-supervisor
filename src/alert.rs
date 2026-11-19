@@ -32,6 +32,9 @@ pub enum AlertKind {
     AutoRestart,
     // issue #137: 定时任务执行失败 (非零退出 / 超时被杀 / spawn 失败)。不去抖。
     JobFailed,
+    // issue #139: 外部摄入告警经 webhook 转发时的 kind 标签 (事件本身由
+    // ingest 路径直接落库, 此处仅 re-emit, sink 恒空 — 不重复记事件)。
+    External,
 }
 
 impl AlertKind {
@@ -50,6 +53,7 @@ impl AlertKind {
             AlertKind::FastFailLoop => "FastFailLoop",
             AlertKind::AutoRestart => "AutoRestart",
             AlertKind::JobFailed => "JobFailed",
+            AlertKind::External => "External",
         }
     }
 }

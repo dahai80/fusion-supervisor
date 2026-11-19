@@ -364,3 +364,74 @@ async fn test_static_serving_and_traversal_rejected() {
     handle.abort();
     std::fs::remove_dir_all(&dist).unwrap();
 }
+
+// issue #139: 外部告警摄入 — token 校验 + 事件落库 + dedup_key 窗口去重,
+// 事件经 /api/v1/events 可读 (plane="external")。
+#[tokio::test]
+async fn test_alert_ingest_token_record_and_dedup() {
+    let core = SupervisorCore::new_with_fns(
+        vec![def("fusion-mlx", 11434)],
+        cfg(),
+        |_| ProbeResult::Healthy { latency_ms: 1 },
+        |_, _, _| Ok(()),
+    );
+    let core_arc = Arc::new(tokio::sync::Mutex::new(core));
+    let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
+    let body = r#"{"source":"fusion-ops","kind":"fail","severity":"error","detail":"probe down","dedup_key":"ops:11400"}"#;
+
+    // 无 token → 401, 不落事件
+    let no_auth = http_req(
+        &addr,
+        &format!(
+            "POST /api/v1/alerts/ingest HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{body}"
+        ),
+    )
+    .await;
+    assert!(no_auth.starts_with("HTTP/1.1 401"));
+    // 错 token → 401
+    let bad_auth = http_req(
+        &addr,
+        &format!("POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: wrong\r\n\r\n{body}"),
+    )
+    .await;
+    assert!(bad_auth.starts_with("HTTP/1.1 401"));
+
+    // 合法 token → 200 记事件; 同 dedup_key 窗口内再发 → deduped:true 不重复
+    let ok = http_req(
+        &addr,
+        &format!("POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: sekret\r\n\r\n{body}"),
+    )
+    .await;
+    assert!(ok.starts_with("HTTP/1.1 200"));
+    assert!(ok.contains("\"ok\":true"));
+    let dup = http_req(
+        &addr,
+        &format!(
+            "POST /api/v1/alerts/ingest HTTP/1.1\r\nAuthorization: Bearer sekret\r\n\r\n{body}"
+        ),
+    )
+    .await;
+    assert!(dup.starts_with("HTTP/1.1 200"));
+    assert!(dup.contains("\"deduped\":true"));
+
+    // 坏 body → 400
+    let bad = http_req(
+        &addr,
+        "POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: sekret\r\n\r\n{\"kind\":\"k\"}",
+    )
+    .await;
+    assert!(bad.starts_with("HTTP/1.1 400"));
+
+    // 事件流恰好一条, plane=external, severity 透传
+    let e = http_get(&addr, "/api/v1/events?limit=10").await;
+    let v: serde_json::Value =
+        serde_json::from_str(e.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+    let evs = v["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["service"], "fusion-ops");
+    assert_eq!(evs[0]["kind"], "fail");
+    assert_eq!(evs[0]["severity"], "error");
+    assert_eq!(evs[0]["plane"], "external");
+    assert_eq!(evs[0]["detail"], "probe down");
+    handle.abort();
+}

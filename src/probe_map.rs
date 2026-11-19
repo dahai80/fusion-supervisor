@@ -74,8 +74,6 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     );
     // issue #31: MCP server (sse) 无 /health 端点, TCP 端口探活
     m.insert("fusion-plugins-ecosystem", ProbeSpec::tcp(8765));
-    // issue #137: fusion-ops API 服务 /healthz 无鉴权 (:11400, 上游 cmd/fusion-ops)
-    m.insert("fusion-ops", ProbeSpec::http(11400, "/healthz"));
     // issue #33: fs-serve /health (deploy/start.sh, :11463)
     m.insert("fusion-store", ProbeSpec::http(11463, "/health"));
     // osagent issue#6: Prometheus 抓取口, /metrics 无鉴权恒 200 (:11571)
