@@ -5,6 +5,7 @@
 //   - fusion-plugins-ecosystem-console: `fusion-plugin-console --port 8795` (同上)
 // 上游 repo 的 start.sh 归属各自项目, supervisor 只封装不改写 (治理边界)。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // 启动方式
@@ -26,6 +27,34 @@ pub enum StartSpec {
         env: Vec<(String, String)>,
         env_file: Option<String>,
     },
+    // issue #145: systemd 托管服务 (config systemd_units 表声明, VPS 部署) —
+    // 生命周期经 systemctl start/stop 驱动, unit 本身就是进程权威 (start.sh
+    // 的 pidfile 对 systemd 拉起的进程失效)。restart = stop+start 流不变。
+    Systemd {
+        unit: String,
+    },
+}
+
+// issue #145: config 注入的 systemd 托管表 (OnceLock, PORT_MAP 同款模式 —
+// daemon 启动时灌入一次, 运行期只读)。
+static SYSTEMD_UNITS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
+// daemon 启动时注册 (Config::load 校验已保证 unit 名字符白名单)。
+pub fn register_systemd_units(map: HashMap<String, String>) {
+    let _ = SYSTEMD_UNITS.set(map);
+}
+
+fn systemd_unit_for(name: &str) -> Option<String> {
+    SYSTEMD_UNITS.get()?.get(name).cloned()
+}
+
+// issue #145: systemctl 命令构造 (纯函数可测)。仅 start/stop — restart 由
+// restart_one 的 stop+start 流承载, 与 Daemon spec 同语义。
+pub fn systemd_shell_cmd(unit: &str, verb: &str) -> anyhow::Result<String> {
+    match verb {
+        "start" | "stop" => Ok(format!("systemctl {verb} {unit}")),
+        other => anyhow::bail!("systemd spec 不支持 {other} (restart 应为 stop+start): {unit}"),
+    }
 }
 
 // 无 cwd/env 的便捷构造 (既有覆盖服务全用此形态)
@@ -48,6 +77,10 @@ fn fusion_root() -> PathBuf {
 
 // 服务名 → 启动方式。不在表内 → None (走默认 start.sh 路径)。
 pub fn start_spec_for(name: &str) -> Option<StartSpec> {
+    // issue #145: config 声明的 systemd 托管优先 (VPS 部署 systemd 是权威)
+    if let Some(unit) = systemd_unit_for(name) {
+        return Some(StartSpec::Systemd { unit });
+    }
     match name {
         "fusion-trainer-bridge" => Some(StartSpec::Script(
             fusion_root().join("fusion-trainer/scripts/trainer-bridge.sh"),
@@ -556,6 +589,34 @@ mod tests {
         );
         assert_eq!(caffeinate_pidfile("fusion-mlx"), None);
         assert_eq!(caffeinate_pidfile("unknown-svc"), None);
+    }
+
+    // issue #145: config systemd 托管表 — 注册后 start_spec_for 返回 Systemd,
+    // 命令构造仅 start/stop, restart 语义留给 stop+start 流
+    #[test]
+    fn test_issue145_systemd_spec_and_cmd() {
+        assert!(start_spec_for("svc-not-registered").is_none());
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "fusion-identity".to_string(),
+            "fusion-identity.service".to_string(),
+        );
+        register_systemd_units(m);
+        match start_spec_for("fusion-identity") {
+            Some(StartSpec::Systemd { unit }) => {
+                assert_eq!(unit, "fusion-identity.service");
+            }
+            other => panic!("应为 Systemd spec: {other:?}"),
+        }
+        assert_eq!(
+            systemd_shell_cmd("fusion-identity.service", "start").unwrap(),
+            "systemctl start fusion-identity.service"
+        );
+        assert_eq!(
+            systemd_shell_cmd("fusion-identity.service", "stop").unwrap(),
+            "systemctl stop fusion-identity.service"
+        );
+        assert!(systemd_shell_cmd("u", "restart").is_err());
     }
 
     #[test]
