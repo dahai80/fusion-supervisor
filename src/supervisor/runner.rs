@@ -288,6 +288,11 @@ pub struct ServiceRunner {
     // streak 不排重启 (慢启动 daemon 绑定口需 30-60s, 不能在启动窗口烧完
     // crash cap 杀掉正在启动的进程)。Healthy 恢复时清除。
     boot_grace_until: Option<u64>,
+    // issue #142: 陈旧 pidfile episode latch — probe 通过但 pidfile 进程已死的
+    // 情况只翻转一次状态。自愈型服务 (自身调度器换 PID 重启) 的 pidfile 恒陈旧,
+    // 无 latch 时每 tick: Healthy+pid死 → Unhealthy (ServiceDown 被去抖) →
+    // 次 tick 探活恢复 → ServiceBack (不去抖) → 无限翻转告警风暴。
+    stale_pid_active: bool,
 }
 
 impl ServiceRunner {
@@ -319,6 +324,7 @@ impl ServiceRunner {
             exec_in_flight: false,
             startup_grace_secs: 0,
             boot_grace_until: None,
+            stale_pid_active: false,
             probe_fn: std::sync::Arc::new(probe_fn),
             start_fn: std::sync::Arc::new(start_fn),
         }
@@ -371,15 +377,30 @@ impl ServiceRunner {
                 // 重启 (#96 port 兜底 + #110 归属校验负责清掉陈旧监听)。
                 // issue #124: Failed 态 + 探活恢复健康 (外部实例接管了端口) →
                 // 同走恢复路径摘掉 Failed — 服务明明健康, 状态表不该永久红。
-                if matches!(self.state, State::Healthy | State::Failed)
-                    && let Some(reason) = self.process_exit_if_dead()
-                {
-                    tracing::warn!(
-                        svc = %self.def.name,
-                        "probe passed but pidfile process is dead (stale port holder suspected)"
-                    );
-                    self.handle_unhealthy(reason, now_ts, alerter).await;
-                    return Ok(());
+                if matches!(self.state, State::Healthy | State::Failed) {
+                    if let Some(reason) = self.process_exit_if_dead() {
+                        // issue #142: 同一 episode 只翻转一次。latch 已置 = 已报过
+                        // ProcessExit 且随后探活恢复过 — 自愈型服务 (自身调度器
+                        // 换 PID) 的 pidfile 恒陈旧, 再翻转只会制造 Down/Back
+                        // 翻转风暴 (ServiceDown 有去抖, ServiceBack 没有)。
+                        // 真正的陈旧监听器清理依赖探活失败走正常重启流, 不受影响。
+                        if self.stale_pid_active {
+                            tracing::debug!(
+                                svc = %self.def.name,
+                                "stale pidfile episode already reported, keep healthy"
+                            );
+                        } else {
+                            self.stale_pid_active = true;
+                            tracing::warn!(
+                                svc = %self.def.name,
+                                "probe passed but pidfile process is dead (stale port holder suspected)"
+                            );
+                            self.handle_unhealthy(reason, now_ts, alerter).await;
+                        }
+                        return Ok(());
+                    }
+                    // pidfile 进程活着 — 陈旧 episode 结束, 清 latch
+                    self.stale_pid_active = false;
                 }
                 // issue #124: Failed + 探活 Healthy = 外部实例已接管 (操作员手工
                 // restart 拉起的新进程), 状态翻回 Healthy + 全套复位 — 不再永久
@@ -968,6 +989,60 @@ mod tests {
         let _ = std::fs::remove_file(&pidfile);
         assert_eq!(dead_pid_at(&pidfile), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // issue #142: 陈旧 pidfile episode latch — probe 恒通过 + pidfile 进程恒死
+    // (自愈型服务自身调度器换 PID) 时, 10 次连续健康探针只产生 1 次 ServiceBack
+    // (1 Down + 1 Back), 不再每 tick 翻转制造告警风暴。
+    #[tokio::test]
+    async fn test_issue142_stale_pidfile_single_back_per_episode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::env_map::tests::EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        let pids = tmp.path().join(".fusion-sv/pids");
+        std::fs::create_dir_all(&pids).unwrap();
+        // Daemon spec 服务才有 PID 复核 (fusion-cowork-web 在 start_map 表内);
+        // pid 用 i32::MAX — macOS pid 上限内永不存在, 免竞态 (同 test_dead_pid_at)
+        let pidfile = pids.join("fusion-cowork-web.pid");
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+
+        let (_, _, pf, sf) = harness(ProbeResult::Healthy { latency_ms: 5 });
+        let mut d = def();
+        d.name = "fusion-cowork-web".into();
+        let mut r = ServiceRunner::new(d, "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Healthy;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+
+        // tick1: Healthy + pid 死 → ProcessExit 翻 Unhealthy (Down, 无重启)
+        r.tick(1000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy));
+        // tick2: probe 恢复 → 1 次 ServiceBack
+        r.tick(1005, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Healthy));
+        // tick3..12: pidfile 仍死但 latch 已置 — 保持 Healthy, 零新增告警
+        for i in 0..10u64 {
+            r.tick(1010 + i * 5, &s, &mut al).await.unwrap();
+            assert!(matches!(r.state, State::Healthy), "tick {}", i);
+        }
+        assert_eq!(al.alerts_emitted(), 2, "恰好 1 Down + 1 Back");
+
+        // pid 恢复存活 → episode 结束, latch 清除; 再死 → 新 episode 再翻转一次
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        r.tick(2000, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Healthy));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
+        r.tick(2005, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Unhealthy), "新 episode 再次翻转");
+        r.tick(2010, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Healthy));
+        // 累计: 2 Down (去抖窗内第二条被抑制? 1000→2005 间隔 >300s 去抖已释放) + 2 Back
+        assert_eq!(al.alerts_emitted(), 4);
     }
 
     // issue #90: 启动重试曲线 — 前两次快速补拉 (5/15s), 之后 60/300 升级

@@ -66,14 +66,24 @@ pub struct Alert {
     pub ts: u64,
 }
 
+// issue #142: 每 (service, kind) 滑动窗口限流 — 同 key 60s 内最多 10 条, 超出
+// 抑制。防御纵深: 状态机 bug 时不让 webhook / event 表被风暴打满
+// (ServiceDown 去抖只护一种 kind, 其余 kind 依赖源头边沿触发正确)。
+const RATE_WINDOW_SEC: u64 = 60;
+const RATE_MAX_PER_WINDOW: usize = 10;
+
 pub struct Alerter {
     dedup_sec: u64,
     last_down: HashMap<String, u64>,
+    // issue #142: (service, kind) → 窗口内已发时间戳 (升序)
+    rate_window: HashMap<(String, &'static str), Vec<u64>>,
     webhook_url: String,
     // issue #37: 告警 → event 表的落库 sink (可选; 未设置则不落库, 测试用)
     event_sink: Option<EventSink>,
     // issue #37: 真实发出 (去抖后) 的告警累计数 (/metrics fusion_sv_alerts_total)
     alerts_emitted: u64,
+    // issue #142: 被限流抑制的告警累计数 (排障可见性)
+    alerts_rate_limited: u64,
 }
 
 impl Alerter {
@@ -81,9 +91,11 @@ impl Alerter {
         Self {
             dedup_sec,
             last_down: HashMap::new(),
+            rate_window: HashMap::new(),
             webhook_url,
             event_sink: None,
             alerts_emitted: 0,
+            alerts_rate_limited: 0,
         }
     }
 
@@ -95,6 +107,25 @@ impl Alerter {
 
     pub fn alerts_emitted(&self) -> u64 {
         self.alerts_emitted
+    }
+
+    // issue #142: 被限流抑制的告警累计数
+    pub fn alerts_rate_limited(&self) -> u64 {
+        self.alerts_rate_limited
+    }
+
+    // issue #142: 纯判定 — 同 (service, kind) 窗口内已发条数未达上限
+    fn rate_ok(&self, service: &str, kind: &AlertKind, ts: u64) -> bool {
+        match self.rate_window.get(&(service.to_string(), kind.label())) {
+            None => true,
+            Some(stamps) => {
+                stamps
+                    .iter()
+                    .filter(|&&t| ts.saturating_sub(t) < RATE_WINDOW_SEC)
+                    .count()
+                    < RATE_MAX_PER_WINDOW
+            }
+        }
     }
 
     // issue #37: kind → severity 映射 (crash-loop 升级=error, 恢复/正常事件=info, 其余 warn)
@@ -110,15 +141,18 @@ impl Alerter {
         }
     }
 
-    // 纯判定: ServiceDown 在去抖窗内 = 抑制, 其余恒放行。
+    // 纯判定: ServiceDown 在去抖窗内 = 抑制; 再叠加每 (service, kind) 限流窗。
     pub fn should_emit(&self, service: &str, kind: &AlertKind, ts: u64) -> bool {
-        if *kind != AlertKind::ServiceDown {
-            return true;
+        if *kind == AlertKind::ServiceDown {
+            let dedup_passed = match self.last_down.get(service) {
+                None => true,
+                Some(&last) => ts.saturating_sub(last) > self.dedup_sec,
+            };
+            if !dedup_passed {
+                return false;
+            }
         }
-        match self.last_down.get(service) {
-            None => true,
-            Some(&last) => ts.saturating_sub(last) > self.dedup_sec,
-        }
+        self.rate_ok(service, kind, ts)
     }
 
     // 记录已发 (供测试与 alert() 内部调用)。
@@ -126,11 +160,29 @@ impl Alerter {
         if *kind == AlertKind::ServiceDown {
             self.last_down.insert(service.to_string(), ts);
         }
+        let stamps = self
+            .rate_window
+            .entry((service.to_string(), kind.label()))
+            .or_default();
+        stamps.push(ts);
+        stamps.retain(|&t| ts.saturating_sub(t) < RATE_WINDOW_SEC);
     }
 
     pub async fn alert(&mut self, alert: Alert) -> anyhow::Result<()> {
         if !self.should_emit(&alert.service, &alert.kind, alert.ts) {
-            tracing::debug!(svc = %alert.service, kind = alert.kind.label(), "alert dedup skip");
+            if self.rate_ok(&alert.service, &alert.kind, alert.ts) {
+                tracing::debug!(svc = %alert.service, kind = alert.kind.label(), "alert dedup skip");
+            } else {
+                // issue #142: 限流抑制 — WARN 一次可见 (排障线索), 不进 webhook/事件表
+                self.alerts_rate_limited += 1;
+                tracing::warn!(
+                    svc = %alert.service,
+                    kind = alert.kind.label(),
+                    "alert rate limited ({} per {}s window cap)",
+                    RATE_MAX_PER_WINDOW,
+                    RATE_WINDOW_SEC
+                );
+            }
             return Ok(());
         }
         // CrashLoop / config-fatal / 快速失败熔断升级用 ERROR, 其余 WARN (便于运维筛升级事件)
@@ -241,6 +293,23 @@ mod tests {
 
         assert!(a.should_emit("fusion-rag", &AlertKind::RestartFailed, 1000));
         assert!(a.should_emit("fusion-rag", &AlertKind::RestartCapHit, 1000));
+    }
+
+    // issue #142: 每 (service, kind) 限流窗 — 同 key 60s 内超 10 条抑制
+    #[test]
+    fn test_issue142_rate_limit_per_service_kind() {
+        let mut a = Alerter::new(300, String::new());
+        for i in 0..10u64 {
+            assert!(a.should_emit("svc", &AlertKind::ServiceBack, 1000 + i));
+            a.record_emitted("svc", &AlertKind::ServiceBack, 1000 + i);
+        }
+        // 第 11 条 (60s 窗内) 抑制
+        assert!(!a.should_emit("svc", &AlertKind::ServiceBack, 1009));
+        // 其他 kind / 其他服务不受影响
+        assert!(a.should_emit("svc", &AlertKind::ServiceDown, 1009));
+        assert!(a.should_emit("svc2", &AlertKind::ServiceBack, 1009));
+        // 窗口滑出后释放
+        assert!(a.should_emit("svc", &AlertKind::ServiceBack, 1000 + RATE_WINDOW_SEC));
     }
 
     #[test]

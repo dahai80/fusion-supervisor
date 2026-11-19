@@ -321,24 +321,13 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // issue #88: venv 重建后 fleet 审计发现的两条 — start.sh 前台 exec 且
+        // issue #88: venv 重建后 fleet 审计发现的另两条 — start.sh 前台 exec 且
         // 忽略子命令 (bash start.sh stop 会 START), 同款 Daemon 接管。
         // 端口钉 registry 值 (start.sh 默认同值, 防上游 config 漂移)
-        "ai-assistant-agent" => Some(StartSpec::Daemon {
-            bin: ".venv/bin/python".into(),
-            args: vec![
-                "-m".into(),
-                "uvicorn".into(),
-                "ai_assistant_agent.main:app".into(),
-                "--host".into(),
-                "127.0.0.1".into(),
-                "--port".into(),
-                "11511".into(),
-            ],
-            cwd: Some("business/ai-assistant-agent".into()),
-            env: Vec::new(),
-            env_file: None,
-        }),
+        // issue #143: ai-assistant-agent 条目已移除 — 服务自身调度器有意周期性
+        // 自愈重启 (~5m10s 优雅退出换 PID, 上游 dahai80-business/ai-assistant-agent#5),
+        // supervisor 托管会把它当宕机自动复活并制造 Down/Back 告警风暴 (#142 实证)。
+        // registry 已标 supervise: false, 生命周期交还其自有工具。
         // issue #94: 同 #88 类 — start.sh `start` case 前台 exec uvicorn,
         // 默认脚本路径会挂住 exec; Daemon 接管, 端口钉 registry 11516
         "ai-booking-agent" => Some(StartSpec::Daemon {
@@ -935,27 +924,10 @@ mod tests {
             }
         }
 
-        // issue #88: fleet 审计收编的两条 business 条目 (start.sh 前台 exec
+        // issue #88: fleet 审计收编的另两条 business 条目 (start.sh 前台 exec
         // 且忽略子命令), 端口钉 registry 值
-        let spec = start_spec_for("ai-assistant-agent").unwrap();
-        match &spec {
-            StartSpec::Daemon { args, cwd, .. } => {
-                assert_eq!(
-                    args,
-                    &[
-                        "-m".to_string(),
-                        "uvicorn".to_string(),
-                        "ai_assistant_agent.main:app".to_string(),
-                        "--host".to_string(),
-                        "127.0.0.1".to_string(),
-                        "--port".to_string(),
-                        "11511".to_string(),
-                    ]
-                );
-                assert_eq!(cwd.as_deref(), Some("business/ai-assistant-agent"));
-            }
-            _ => panic!("ai-assistant-agent 应为 Daemon spec"),
-        }
+        // issue #143: ai-assistant-agent 已移除 (自愈型服务不再托管) — 断言注销
+        assert!(start_spec_for("ai-assistant-agent").is_none());
         let spec = start_spec_for("ai-lead-qualifier").unwrap();
         match &spec {
             StartSpec::Daemon { args, cwd, .. } => {
