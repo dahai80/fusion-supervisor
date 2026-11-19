@@ -4,7 +4,7 @@ members = [".", "tray"]
 
 [package]
 name = "fusion-supervisor"
-version = "0.1.67"
+version = "0.1.68"
 edition = "2024"
 license = "Apache-2.0"
 description = "Local-first fusion service supervisor and monitor"
@@ -33,6 +33,8 @@ toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 # issue #10: 备份 gzip 压缩 pg_dumpall 输出
 flate2 = "1"
+# issue #137: daily_at 本地时刻换算 (localtime_r), 不为此引入 chrono
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

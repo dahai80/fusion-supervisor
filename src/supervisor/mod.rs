@@ -104,6 +104,9 @@ pub struct SupervisorCore {
     pub events_pruned_total: u64,
     // PRD app-tiering: pin 覆盖内存缓存 (boot_auto 零查询); 真源在 store.boot_pin 表
     boot_pins: std::collections::HashMap<String, PinMode>,
+    // issue #137: 定时任务游标 (job name → 上次触发 ts)。内存镜像 meta job_last:<name>,
+    // spawn 即推进 (失败不重试到下个到期, 同 backup 语义)。
+    job_last: std::collections::HashMap<String, u64>,
 }
 
 impl SupervisorCore {
@@ -179,6 +182,8 @@ impl SupervisorCore {
         );
         // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
         let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
+        // issue #137: 恢复定时任务游标 — reload 不重触发所有 job
+        let job_last = load_job_last(&store, &cfg.jobs);
         Ok(Self {
             runners,
             store,
@@ -194,6 +199,7 @@ impl SupervisorCore {
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
+            job_last,
         })
     }
 
@@ -256,6 +262,8 @@ impl SupervisorCore {
         );
         // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
         let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
+        // issue #137: 恢复定时任务游标 (测试构造同款, 行为一致)
+        let job_last = load_job_last(&store, &cfg.jobs);
         Self {
             runners,
             store,
@@ -271,6 +279,7 @@ impl SupervisorCore {
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
+            job_last,
         }
     }
 
@@ -1546,6 +1555,255 @@ impl SupervisorCore {
         }
         self.last_prune_ts = now_ts;
         true
+    }
+
+    // issue #137: 定时任务调度 (daemon tick 循环内, 核心锁内调用 — 便宜操作:
+    // 到期判定 + 游标推进 + detached spawn, 无 exec)。
+    // 返回本 tick 触发的 job 数 (测试可观测)。
+    pub fn dispatch_due_jobs(&mut self, now_ts: u64) -> usize {
+        if self.cfg.jobs.is_empty() {
+            return 0;
+        }
+        let mut fired = 0;
+        for job in self.cfg.jobs.clone() {
+            let last = self.job_last.get(&job.name).copied().unwrap_or(0);
+            if !crate::jobs::job_due(now_ts, last, &job) {
+                continue;
+            }
+            tracing::info!(job = %job.name, now_ts, "job 调度到期, 触发");
+            // 游标即时推进 + 持久化 — spawn 即算跑过, 失败不重试到下个到期
+            // (同 backup 语义, 防失败风暴)
+            self.job_last.insert(job.name.clone(), now_ts);
+            self.store
+                .set_meta(&format!("job_last:{}", job.name), now_ts);
+            spawn_job_task(
+                job,
+                self.store.clone(),
+                self.cfg.alert_dedup_sec,
+                self.cfg.alert_url.clone(),
+                now_ts,
+            );
+            fired += 1;
+        }
+        fired
+    }
+}
+
+// issue #137: job 游标从 meta 恢复 (配置在但 meta 缺 → 0, 首启即到期)。
+fn load_job_last(
+    store: &Arc<HistoryStore>,
+    jobs: &[crate::config::JobConfig],
+) -> std::collections::HashMap<String, u64> {
+    jobs.iter()
+        .map(|j| {
+            let last = store.get_meta(&format!("job_last:{}", j.name)).unwrap_or(0);
+            (j.name.clone(), last)
+        })
+        .collect()
+}
+
+// issue #137: job 执行 detached — exec 是同步阻塞 (std::process + 轮询 try_wait,
+// 可达 timeout 分钟级), 与 spawn_backup_task 同款: blocking 池 + 内嵌
+// current_thread runtime 跑 async 段 (告警 webhook), tokio worker 零占用。
+// 事件落库: 成功 info / 失败 error + JobFailed 告警 (独立 Alerter, 不去抖)。
+// stdout/stderr 追加 ~/.fusion-sv/logs/<job>.log (任务日志与服务日志同目录)。
+fn spawn_job_task(
+    job: crate::config::JobConfig,
+    store: Arc<HistoryStore>,
+    alert_dedup_sec: u64,
+    alert_url: String,
+    now_ts: u64,
+) {
+    tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(job = %job.name, err = %e, "job 内嵌 runtime 构建失败 (任务未运行)");
+                return;
+            }
+        };
+        rt.block_on(async move { run_job(job, store, alert_dedup_sec, alert_url, now_ts).await });
+    });
+}
+
+async fn run_job(
+    job: crate::config::JobConfig,
+    store: Arc<HistoryStore>,
+    alert_dedup_sec: u64,
+    alert_url: String,
+    now_ts: u64,
+) {
+    // bin 解析: 含 '/' 相对 FUSION_ROOT (同 start_map::resolve_bin 语义);
+    // 裸名优先共享 venv bin, 退回 PATH。
+    let bin = crate::start_map::resolve_bin(&job.bin);
+    let log = crate::start_map::log_path(&format!("job-{}", job.name));
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // per-job env overlay (#125 复用) — FUSION_OPS_DATABASE_URL 等走
+    // ~/.fusion-sv/env/<job>.env; 值绝不落日志。
+    let overlay = crate::env_map::overlay_env_for(&job.name);
+    tracing::info!(
+        job = %job.name,
+        timeout_sec = job.timeout_sec,
+        env_n = overlay.len(),
+        log = %log.display(),
+        "job 开始"
+    );
+    let log_f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log);
+    let (stdout_f, stderr_f) = match log_f {
+        Ok(f) => {
+            let out = f.try_clone();
+            match out {
+                Ok(o) => (Some(f), Some(o)),
+                Err(e) => {
+                    tracing::warn!(job = %job.name, err = %e, "job 日志句柄 clone 失败, 退 null");
+                    (None, None)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(job = %job.name, err = %e, "job 日志打开失败, 退 null");
+            (None, None)
+        }
+    };
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(&job.args)
+        .stdout(stdout_f.map_or_else(std::process::Stdio::null, std::process::Stdio::from))
+        .stderr(stderr_f.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
+    for (k, v) in overlay {
+        cmd.env(k, v);
+    }
+    let spawn = cmd.spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            let detail = format!("spawn fail: {e}");
+            tracing::error!(job = %job.name, "{}", detail);
+            record_job_outcome(
+                &store,
+                alert_dedup_sec,
+                alert_url,
+                &job,
+                &detail,
+                now_ts,
+                false,
+            )
+            .await;
+            return;
+        }
+    };
+    // 轮询 try_wait 至 timeout → kill (500ms 粒度, 分钟级任务轮询开销可忽略)
+    let deadline = now_ts + job.timeout_sec;
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => {
+                let now = now_unix();
+                if now >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                let detail = format!("wait fail: {e}");
+                tracing::error!(job = %job.name, "{}", detail);
+                record_job_outcome(
+                    &store,
+                    alert_dedup_sec,
+                    alert_url,
+                    &job,
+                    &detail,
+                    now_ts,
+                    false,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    let ok = !timed_out && status.map(|s| s.success()).unwrap_or(false);
+    let detail = if timed_out {
+        format!(
+            "timeout after {}s, killed (log: {})",
+            job.timeout_sec,
+            log.display()
+        )
+    } else {
+        format!(
+            "exit code={} (log: {})",
+            status
+                .map(|s| s.code().unwrap_or(-1).to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            log.display()
+        )
+    };
+    if ok {
+        tracing::info!(job = %job.name, "{}", detail);
+    } else {
+        tracing::error!(job = %job.name, "{}", detail);
+    }
+    record_job_outcome(
+        &store,
+        alert_dedup_sec,
+        alert_url,
+        &job,
+        &detail,
+        now_ts,
+        ok,
+    )
+    .await;
+}
+
+// 任务结果落 event 表 (kind=Job) + 失败走 JobFailed 告警 (升级 ERROR, 不去抖)。
+async fn record_job_outcome(
+    store: &Arc<HistoryStore>,
+    alert_dedup_sec: u64,
+    alert_url: String,
+    job: &crate::config::JobConfig,
+    detail: &str,
+    ts: u64,
+    ok: bool,
+) {
+    if let Err(e) = store.record_event(
+        &job.name,
+        "Job",
+        detail,
+        ts,
+        "native",
+        if ok { "info" } else { "error" },
+    ) {
+        tracing::warn!(job = %job.name, err = %e, "job event write fail (非致命)");
+    }
+    if ok {
+        return;
+    }
+    let mut alerter = crate::alert::Alerter::new(alert_dedup_sec, alert_url)
+        .with_event_sink(make_event_sink(store.clone()));
+    if let Err(e) = alerter
+        .alert(crate::alert::Alert {
+            service: job.name.clone(),
+            kind: crate::alert::AlertKind::JobFailed,
+            detail: detail.to_string(),
+            ts,
+        })
+        .await
+    {
+        tracing::warn!(job = %job.name, err = %e, "JobFailed alert emit fail (非致命)");
     }
 }
 
@@ -3308,9 +3566,13 @@ mod tests {
     }
 
     // 重试封顶: start_fail_streak 达 START_FAIL_CAP → Failed + RestartCapHit 告警
+    // repo_dir 用 scaffold (同 #86 测试约定) — 真实 "fusion-mlx" 会撞本机在跑的
+    // start.sh 进程 (pgrep 阶段1 命中), 操作员竞态闸门误跳过重启致测试环境 flake
     #[tokio::test]
     async fn test_issue90_start_fail_cap_marks_failed() {
-        let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
+        let mut d = def("fusion-mlx", Layer::Core, 11434);
+        d.repo_dir = "scaffold-issue90-cap".into();
+        let defs = vec![d];
         let mut core = SupervisorCore::new_with_fns(
             defs,
             fake_cfg(),

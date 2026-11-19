@@ -30,6 +30,8 @@ pub enum AlertKind {
     // issue #112: 自动恢复 (crash/start-retry 退避流) 实际拉起成功 — 审计事件,
     // 不去抖。detail 携带 old/new pid; 触发原因见紧邻的 ServiceDown 行。
     AutoRestart,
+    // issue #137: 定时任务执行失败 (非零退出 / 超时被杀 / spawn 失败)。不去抖。
+    JobFailed,
 }
 
 impl AlertKind {
@@ -47,6 +49,7 @@ impl AlertKind {
             AlertKind::ServiceConfigFatal => "ServiceConfigFatal",
             AlertKind::FastFailLoop => "FastFailLoop",
             AlertKind::AutoRestart => "AutoRestart",
+            AlertKind::JobFailed => "JobFailed",
         }
     }
 }
@@ -94,8 +97,10 @@ impl Alerter {
     fn severity_of(kind: &AlertKind) -> &'static str {
         match kind {
             AlertKind::ContainerCrashLoop => "error",
-            // issue #47: 配置致命/快速失败熔断均为升级事件
-            AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop => "error",
+            // issue #47: 配置致命/快速失败熔断均为升级事件; #137 任务失败同升级
+            AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop | AlertKind::JobFailed => {
+                "error"
+            }
             AlertKind::ServiceBack | AlertKind::ServiceDrained | AlertKind::AutoRestart => "info",
             _ => "warn",
         }
@@ -127,7 +132,10 @@ impl Alerter {
         // CrashLoop / config-fatal / 快速失败熔断升级用 ERROR, 其余 WARN (便于运维筛升级事件)
         let is_escalation = matches!(
             alert.kind,
-            AlertKind::ContainerCrashLoop | AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop
+            AlertKind::ContainerCrashLoop
+                | AlertKind::ServiceConfigFatal
+                | AlertKind::FastFailLoop
+                | AlertKind::JobFailed
         );
         if is_escalation {
             tracing::error!(

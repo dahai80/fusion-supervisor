@@ -94,6 +94,61 @@ pub struct Config {
     // 内就烧完连续失败计数 → 到点重启杀掉正在启动的健康进程)。0 = 禁用。
     #[serde(default = "default_startup_grace_secs")]
     pub startup_grace_secs: u64,
+    // issue #137: 定时任务表 (fusion-ops retention/cluster 等一次性作业)。
+    // daemon tick 循环判定到期, detached 执行; 游标持久化 meta job_last:<name>。
+    #[serde(default)]
+    pub jobs: Vec<JobConfig>,
+}
+
+// issue #137: 单条定时任务。daily_at 与 every_sec 必须恰好设一个 (load 校验)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobConfig {
+    pub name: String,
+    pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    // 每日本地 HH:MM 跑一次 (retention 类夜间任务)
+    #[serde(default)]
+    pub daily_at: Option<String>,
+    // 固定间隔秒 (cluster 类周期任务)
+    #[serde(default)]
+    pub every_sec: Option<u64>,
+    // 执行超时, 到点 kill。默认 900 (上游 job 二进制自带 10min ctx)。
+    #[serde(default = "default_job_timeout_sec")]
+    pub timeout_sec: u64,
+}
+
+fn default_job_timeout_sec() -> u64 {
+    900
+}
+
+// issue #137: jobs 配置校验 — name 非空且唯一; daily_at / every_sec 恰好设一个;
+// daily_at 格式 HH:MM (0-23:0-59)。失败 = 配置致命 (daemon 拒启动, fail-closed)。
+fn validate_jobs(jobs: &[JobConfig]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for j in jobs {
+        anyhow::ensure!(!j.name.trim().is_empty(), "job name must not be empty");
+        anyhow::ensure!(
+            seen.insert(j.name.clone()),
+            "duplicate job name: {}",
+            j.name
+        );
+        anyhow::ensure!(
+            j.daily_at.is_some() ^ j.every_sec.is_some(),
+            "job {} must set exactly one of daily_at / every_sec",
+            j.name
+        );
+        if let Some(hm) = &j.daily_at {
+            let bad = hm
+                .split_once(':')
+                .and_then(|(h, m)| {
+                    Some(h.trim().parse::<u32>().ok()? <= 23 && m.trim().parse::<u32>().ok()? <= 59)
+                })
+                .unwrap_or(false);
+            anyhow::ensure!(bad, "job {} daily_at must be HH:MM (00:00-23:59)", j.name);
+        }
+    }
+    Ok(())
 }
 
 fn default_startup_grace_secs() -> u64 {
@@ -252,6 +307,7 @@ impl Default for Config {
             native_pg_port: default_native_pg_port(),
             native_extra_path: default_native_extra_path(),
             startup_grace_secs: default_startup_grace_secs(),
+            jobs: Vec::new(),
         }
     }
 }
@@ -340,6 +396,7 @@ impl Config {
         {
             cfg.web_dir = None;
         }
+        validate_jobs(&cfg.jobs)?;
         Ok(cfg)
     }
 }

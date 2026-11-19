@@ -250,6 +250,8 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                     c.check_backup_schedule(now).await;
                     // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
                     c.check_retention(now);
+                    // issue #137: 定时任务调度 (到期触发 detached exec, 游标持久化)
+                    c.dispatch_due_jobs(now);
                     c.collect_pending_execs()
                 };
                 if !execs.is_empty() {
