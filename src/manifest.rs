@@ -157,6 +157,11 @@ pub fn name_to_dir(name: &str) -> &str {
         // (启动走 start_map Script spec), name_to_dir 默认映射指向不存在的
         // fusion-office-api/ 目录 (logs/start_sh_path 兜底路径 fail-closed)
         ("fusion-office", "fusion-office"),
+        // issue #147: fusion-drama-backend 子服务 → 父 repo fusion-drama。
+        // registry key 是子服务 (fusion-drama#14 打开 supervise), 磁盘 repo 是
+        // fusion-drama (根 start.sh start|stop|restart|status|log + pidfile +
+        // /api/v1/health wait), 默认映射指向不存在的 fusion-drama-backend/ 目录
+        ("fusion-drama", "fusion-drama"),
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
             return dir;
@@ -489,6 +494,13 @@ external_tools: []
     #[test]
     fn test_name_to_dir_osagent_metrics_parent() {
         assert_eq!(name_to_dir("fusion-osagent-metrics"), "fusion-osagent");
+    }
+
+    // issue #147: fusion-drama-backend 子服务 key → 父 repo fusion-drama
+    // (start 路径不再指向不存在的 fusion-drama-backend/ 目录)
+    #[test]
+    fn test_name_to_dir_drama_backend_parent() {
+        assert_eq!(name_to_dir("fusion-drama-backend"), "fusion-drama");
     }
 
     // issue #29: 四个 shell 模块服务应落 App 层 (gateway 在 Core 层先起,
