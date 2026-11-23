@@ -278,7 +278,7 @@ pub struct ServiceRunner {
     // (记 old_pid + 动作模式), collect_pending_execs 取走锁外执行, finish 回填。
     // Some(true)=restart 命令, Some(false)=stop+start; exec_in_flight 防执行窗口
     // 内 tick 重入再拉起。
-    pending_exec: Option<bool>,
+    pub(crate) pending_exec: Option<bool>,
     pending_old_pid: Option<i32>,
     pub(crate) exec_in_flight: bool,
     // issue #126: 启动宽限窗口时长 (秒)。0=禁用 (测试默认); 生产 new() 从
@@ -401,6 +401,18 @@ impl ServiceRunner {
                     }
                     // pidfile 进程活着 — 陈旧 episode 结束, 清 latch
                     self.stale_pid_active = false;
+                }
+                // issue #149: Stopped (操作员 down) + 探活通过 = down 的 stop
+                // 没杀干净的残留进程 (陈旧监听器), 绝不能翻回 Healthy — 否则
+                // 操作员的 down 被静默撤销, 下一次探活失败又走完整重启流
+                // (2026-11-23 fusion-site/cowork-web down 后 9 分钟复活实证)。
+                // 残留进程由操作员手动清理, 状态保持 Stopped。
+                if matches!(self.state, State::Stopped) {
+                    tracing::info!(
+                        svc = %self.def.name,
+                        "probe passed but service is Stopped (operator downed) — leftover listener, keep Stopped"
+                    );
+                    return Ok(());
                 }
                 // issue #124: Failed + 探活 Healthy = 外部实例已接管 (操作员手工
                 // restart 拉起的新进程), 状态翻回 Healthy + 全套复位 — 不再永久
@@ -874,9 +886,14 @@ impl ServiceRunner {
 
     // issue #90: 手动停止清掉待执行的重试排期与启动失败计数,
     // 否则 down 后残留 restart_after 会在下次 up 前的空窗里触发陈旧重启。
+    // issue #149: 同时丢弃尚未收走的 pending_exec — 操作员 down 后,
+    // 风暴期排入的到点重启作业不得再执行 (否则 down 被静默撤销)。
+    // 已收走 (exec_in_flight) 的在飞作业由 finish_pending_execs 的
+    // Stopped 守卫拒绝落账。
     pub(crate) fn mark_stopped(&mut self) {
         self.state = State::Stopped;
         self.restart_after = None;
+        self.pending_exec = None;
         self.start_fail_streak = 0;
         self.start_retry = false;
     }
@@ -1137,6 +1154,21 @@ mod tests {
         r.tick(1000, &s, &mut al).await.unwrap();
         r.tick(1002, &s, &mut al).await.unwrap();
         assert!(matches!(r.state, State::Stopped));
+    }
+
+    #[tokio::test]
+    async fn test_issue149_stopped_stays_stopped_on_probe_success() {
+        // issue #149: Stopped + 探活通过 = down 未杀净的残留监听器,
+        // 绝不能翻回 Healthy (否则操作员 down 被静默撤销, 风暴重启复活)
+        let (_, _, pf, sf) = harness(ProbeResult::Healthy { latency_ms: 5 });
+        let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
+        r.state = State::Stopped;
+        let s = store();
+        let mut al = Alerter::new(300, String::new());
+        r.tick(1000, &s, &mut al).await.unwrap();
+        r.tick(1002, &s, &mut al).await.unwrap();
+        assert!(matches!(r.state, State::Stopped));
+        assert_eq!(r.policy.crash_count(), 0);
     }
 
     #[tokio::test]
