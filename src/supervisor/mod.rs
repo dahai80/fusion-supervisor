@@ -1115,6 +1115,17 @@ impl SupervisorCore {
     ) {
         for (name, outcome) in results {
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
+                // issue #149: exec 在飞期间操作员 down 了该服务 — 在飞结果必须
+                // 丢弃, 不得落账 (apply_adopted/apply_exec_result 会把 Stopped
+                // 翻回 Healthy/Starting, 静默撤销 ManualStop)。
+                if r.state == runner::State::Stopped {
+                    r.exec_in_flight = false;
+                    tracing::info!(
+                        svc = %name,
+                        "in-flight restart exec discarded: service was downed during exec"
+                    );
+                    continue;
+                }
                 match outcome {
                     runner::ExecOutcome::Adopted => {
                         r.apply_adopted(now_ts, &mut self.alerter).await
@@ -4231,6 +4242,35 @@ mod tests {
     // issue #110 验收: 管理的子进程被外部击杀后 daemon 重启 — 对账必须
     // adopt-or-retire 而不双启。探活拒连 (进程已死) → 保持 Stopped、不复位
     // 不排期重启 (tick 对 Stopped 不重启), 不会出现旧实例 + 新实例并存。
+    // issue #149: exec 在飞期间操作员 down — 在飞重启结果必须丢弃,
+    // 不得把 Stopped 翻回 Healthy/Starting (down 被静默撤销)。
+    #[tokio::test]
+    async fn test_issue149_down_during_inflight_exec_discards_result() {
+        let defs = vec![def("fusion-site", Layer::App, 11481)];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        // 风暴期到点重启作业已收走 (exec 锁外在飞)
+        core.runners[0].state = runner::State::Restarting;
+        core.runners[0].pending_exec = Some(true);
+        core.runners[0].exec_in_flight = true;
+        let execs = core.collect_pending_execs();
+        assert_eq!(execs.len(), 1);
+        // 操作员在 exec 在飞窗口 down (ManualStop)
+        core.runners[0].mark_stopped();
+        assert!(matches!(core.runners[0].state, runner::State::Stopped));
+        // exec 完成, 结果落账 — 必须被丢弃, 状态保持 Stopped
+        let results = vec![("fusion-site".to_string(), runner::ExecOutcome::Ran(Ok(())))];
+        core.finish_pending_execs(2000, results).await;
+        assert!(matches!(core.runners[0].state, runner::State::Stopped));
+        assert!(!core.runners[0].exec_in_flight);
+    }
+
     #[tokio::test]
     async fn test_issue110_reconcile_dead_service_retired_no_double_start() {
         let defs = vec![
