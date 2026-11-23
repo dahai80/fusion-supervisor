@@ -191,8 +191,13 @@ pub async fn probe(spec: &ProbeSpec) -> ProbeResult {
 async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
     let path = spec.path.as_deref().unwrap_or("/health");
     let url = format!("http://127.0.0.1:{}{}", spec.port, path);
+    // issue #150: loopback 探活绝不能走系统代理 — macOS 开启系统代理
+    // (clash :7897) 时 reqwest 默认读取 SystemConfiguration, 127.0.0.1 的
+    // /healthz 被 clash 截胡返回 502, 健康服务被误判宕机触发重启风暴。
+    // 强制 no_proxy, 与 curl 直连行为对齐。
     let client = reqwest::Client::builder()
         .timeout(spec.effective_timeout())
+        .no_proxy()
         .build()
         .unwrap_or_default();
     let start = std::time::Instant::now();
