@@ -36,6 +36,14 @@ for the current version.
 ### Added
 - #99: web console Ops page — backup trigger, boot groups, boot-pin editor.
 
+### Fixed
+- #153: probe Timeout no longer rides the 3-fail restart streak — timeouts
+  need 15 consecutive failures (TIMEOUT_RESTART_STREAK) before a restart is
+  scheduled, so a healthy fusion-mlx saturating the GIL during a 27B decode
+  is not killed mid-generation; ConnectionRefused/ProcessExit keep the fast
+  3-streak (real death signals), and the start-retry path keeps the fast
+  threshold (a not-yet-listening process is expected).
+
 ## v0.1.39 and earlier
 
 - #96: restart/rollout must actually replace the process PID (stop +

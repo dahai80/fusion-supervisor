@@ -2704,6 +2704,85 @@ mod tests {
         );
     }
 
+    // issue #153: Timeout 走更高重启阈值 — 连续超时 3 次不排重启 (高负载
+    // GIL 饱和期健康引擎被误杀), 达 TIMEOUT_RESTART_STREAK 才升级。
+    #[tokio::test]
+    async fn test_issue153_timeout_streak_gates_restart() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::Timeout,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Unhealthy;
+        core.runners[0].fail_streak = 2;
+        // streak 3..=TIMEOUT_RESTART_STREAK-1: 连续超时远超旧 3 连败阈值, 不排重启
+        for _ in 3..runner::TIMEOUT_RESTART_STREAK {
+            core.drive(2000).await;
+            assert!(
+                core.runners[0].restart_after.is_none(),
+                "Timeout 连败未达 {} 不应排重启",
+                runner::TIMEOUT_RESTART_STREAK
+            );
+            assert!(matches!(core.runners[0].state, runner::State::Unhealthy));
+        }
+        // 达阈值 → 排期; 到点 tick → 真正重启
+        core.drive(2000).await;
+        assert!(
+            core.runners[0].restart_after.is_some(),
+            "Timeout 达阈值应排重启"
+        );
+        core.drive(9_999_999).await;
+        assert!(matches!(core.runners[0].state, runner::State::Restarting));
+    }
+
+    // issue #153: ConnectionRefused 仍走 RESTART_FAIL_STREAK=3 快速重启
+    // (真死信号不因 Timeout 分流被拖慢)。
+    #[tokio::test]
+    async fn test_issue153_refused_keeps_fast_restart() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-rag", Layer::App, 11436)],
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Unhealthy;
+        core.runners[0].fail_streak = 2;
+        core.drive(1000).await;
+        assert!(
+            core.runners[0].restart_after.is_some(),
+            "ConnectionRefused 3 连败应排重启"
+        );
+        core.drive(999_999).await;
+        assert!(matches!(core.runners[0].state, runner::State::Restarting));
+    }
+
+    // issue #153: 启动重试期 (start_retry) Timeout 不升级阈值 — 进程尚未
+    // 监听属预期, 维持 3 连败快速补拉, 否则启动期重试被拖慢一个数量级。
+    #[tokio::test]
+    async fn test_issue153_timeout_during_start_retry_keeps_fast_threshold() {
+        let mut core = SupervisorCore::new_with_fns(
+            vec![def("fusion-mlx", Layer::Core, 11434)],
+            fake_cfg(),
+            |_| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::Timeout,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.runners[0].state = runner::State::Unhealthy;
+        core.runners[0].fail_streak = 2;
+        core.runners[0].start_retry = true;
+        core.drive(1000).await;
+        assert!(
+            core.runners[0].restart_after.is_some(),
+            "start_retry 期 Timeout 应维持快速阈值排重启"
+        );
+    }
+
     // issue #112: 自动恢复拉起成功后必须落 AutoRestart 审计事件 (带 old/new pid),
     // 且 status_all 的 last_restart 列能查到它 — 事后可答 "这服务谁拉起的"
     #[tokio::test]
