@@ -44,6 +44,15 @@ pub(crate) const START_FAIL_CAP: u32 = 10;
 // 中间任一次成功探活即复位计数, 抖动永不升级。真宕机 3 连败
 // (poll_unhealthy_sec=2 ≈ 6s) 后照常重启, 仍然及时。
 pub(crate) const RESTART_FAIL_STREAK: u32 = 3;
+// issue #153: Timeout 与 ConnectionRefused 分流 — 高负载推理 (fusion-mlx
+// 27B decode GIL 饱和) 下 /healthz 连续超时但进程健康, 3 连败阈值会把
+// 健康引擎杀掉 (SIGTERM 掉 in-flight 生成, 2026-11-24 三起实证)。Timeout
+// 是 "响应慢/暂不可达", 不是 "进程死了" (真死先给 ConnectionRefused);
+// 需 TIMEOUT_RESTART_STREAK 连续超时才排重启, 中间任一次成功即复位。
+// 15 连败 × (2s tick + ≤10s probe timeout) ≈ ≥2.5min 无间断饿死才升级,
+// 足够跨过整段长生成; 真挂死的服务也在分钟级被回收。启动重试期
+// (start_retry) 除外: 进程尚未监听属预期, 维持 RESTART_FAIL_STREAK 快速补拉。
+pub(crate) const TIMEOUT_RESTART_STREAK: u32 = 15;
 
 // issue #47: 熔断退避序列 10s → 60s → 300s (封顶)。区别于普通 crash 的 1→2→4→…:
 // config-fatal / 快速失败时快速重试只会空烧进程启动, 拉长间隔等人工修复。
@@ -547,10 +556,21 @@ impl ServiceRunner {
                 // issue #79: 连续失败未达阈值不排重启 — 繁忙服务 (fusion-mlx
                 // GIL 高负载) 探活抖动中间夹成功探活即复位, 永不升级;
                 // 真宕机 3 连败 (poll 2s ≈ 6s) 后排程, 仍然及时。
-                if self.fail_streak < RESTART_FAIL_STREAK {
+                // issue #153: Timeout 单独走更高阈值 — 超时是 "暂不可达"
+                // 不是 "进程死了" (真死先给 ConnectionRefused), 长生成
+                // GIL 饱和期 /healthz 可连续超时数十秒而引擎健康。
+                let streak_needed = if matches!(reason, crate::probe::UnhealthyReason::Timeout)
+                    && !self.start_retry
+                {
+                    TIMEOUT_RESTART_STREAK
+                } else {
+                    RESTART_FAIL_STREAK
+                };
+                if self.fail_streak < streak_needed {
                     tracing::info!(
                         svc = %self.def.name,
                         streak = self.fail_streak,
+                        needed = streak_needed,
                         "连续失败未达阈值, 暂不排重启"
                     );
                     return;
@@ -1517,11 +1537,13 @@ mod tests {
         let _ = probe_cell;
     }
 
-    // issue #79: 连续失败未达阈值 (3) 不排重启 — 繁忙服务探活抖动不升级
+    // issue #79: 连续失败未达阈值 (3) 不排重启 — 繁忙服务探活抖动不升级。
+    // issue #153: 用 ConnectionRefused (真死信号); Timeout 分流见
+    // mod.rs test_issue153_timeout_streak_gates_restart (阈值 15)。
     #[tokio::test]
     async fn test_issue79_streak_gate_no_restart_below_threshold() {
         let (calls, _, pf, sf) = harness(ProbeResult::Unhealthy {
-            reason: UnhealthyReason::Timeout,
+            reason: UnhealthyReason::ConnectionRefused,
         });
         let mut r = ServiceRunner::new(def(), "restart", pf, sf, RestartPolicy::new(300, 5, 30));
         r.state = State::Healthy;
