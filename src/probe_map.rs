@@ -135,6 +135,13 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
         "fusion-desigma",
         ProbeSpec::pidfile("fusion-desigma/.fusion-desigma.pid"),
     );
+    // issue #160: fusion-link 连接守护进程 — 无 HTTP/TCP 面 (纯出站 WSS
+    // 客户端), 存活 = start.sh 自管 pidfile 里的进程还活着。pidfile 在
+    // HOME 下 (~/..), probe_pidfile 支持 ~ 前缀展开。
+    m.insert(
+        "fusion-link",
+        ProbeSpec::pidfile("~/.fusion-link/fusion-link.pid"),
+    );
     // 其余服务兜底: ProbeSpec::tcp(port) 在 probe_spec_for 内补
     m
 }
@@ -341,6 +348,17 @@ mod tests {
             s.pidfile.as_deref(),
             Some("fusion-desigma/.fusion-desigma.pid")
         );
+    }
+
+    // issue #160: fusion-link 连接守护进程 PidFile 探活 (纯出站 WSS, 无 HTTP/TCP 面)
+    #[test]
+    fn test_issue160_fusion_link_pidfile_probe() {
+        let s = probe_spec_for("fusion-link", 0);
+        assert!(
+            matches!(s.kind, ProbeKind::PidFile),
+            "fusion-link 应 PidFile 探活"
+        );
+        assert_eq!(s.pidfile.as_deref(), Some("~/.fusion-link/fusion-link.pid"));
     }
 
     // issue #34: 探活路径对齐上游实况 — model-hub/health/finance 换真实路径,
