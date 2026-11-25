@@ -37,6 +37,10 @@ for the current version.
 - #99: web console Ops page — backup trigger, boot groups, boot-pin editor.
 
 ### Fixed
+- #155: fusion-site probe targets the module-plane health route
+  `/shell/fusion-site/api/experience/health` — the module-mode build
+  (basePath `/shell/fusion-site`, upstream fusion-site#151) intentionally
+  404s `/`, so the healthy process was stuck `Starting` forever.
 - #153: probe Timeout no longer rides the 3-fail restart streak — timeouts
   need 15 consecutive failures (TIMEOUT_RESTART_STREAK) before a restart is
   scheduled, so a healthy fusion-mlx saturating the GIL during a 27B decode
