@@ -133,11 +133,17 @@ pub fn classify_status(status: u16) -> ProbeResult {
 }
 
 // issue #120: PidFile 探活 — 读 pidfile, kill -0 判进程存活。相对路径按
-// FUSION_ROOT 解析 (无则 CWD)。pidfile 缺失/不可读/进程死 → ProcessExit
+// FUSION_ROOT 解析 (无则 CWD); `~/` 前缀按 HOME 展开 (issue #160: fusion-link
+// pidfile 在 $HOME/.fusion-link/ 下)。pidfile 缺失/不可读/进程死 → ProcessExit
 // (restart-eligible: GUI 应用崩了自动重拉, 熔断窗口兜底风暴)。
 async fn probe_pidfile(spec: &ProbeSpec) -> ProbeResult {
     let raw = spec.pidfile.as_deref().unwrap_or_default();
-    let path = if raw.starts_with('/') {
+    let path = if let Some(rest) = raw.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => std::path::PathBuf::from(home).join(rest),
+            _ => std::path::PathBuf::from(raw),
+        }
+    } else if raw.starts_with('/') {
         std::path::PathBuf::from(raw)
     } else {
         match std::env::var("FUSION_ROOT") {
@@ -399,5 +405,17 @@ mod tests {
             } => {}
             other => panic!("expect ProcessExit, got {other:?}"),
         }
+    }
+
+    // issue #160: `~/` 前缀 pidfile 按 HOME 展开 (fusion-link pidfile 在
+    // $HOME/.fusion-link/ 下, 字面 ~ 不展开则探活恒 ProcessExit)
+    #[tokio::test]
+    async fn test_issue160_pidfile_tilde_expansion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pf = tmp.path().join("fusion-link.pid");
+        std::fs::write(&pf, format!("{}", std::process::id())).unwrap();
+        let _guard = crate::env_map::tests::EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        let spec = ProbeSpec::pidfile("~/fusion-link.pid");
+        assert!(matches!(probe(&spec).await, ProbeResult::Healthy { .. }));
     }
 }
