@@ -1171,11 +1171,37 @@ impl SupervisorCore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // issue #157: 操作员意图跨 daemon 重启持久化 — runner 全部初始 Stopped,
+        // 事件表里最近一次 restart 类事件为 ManualStop 的服务是操作员刻意停的
+        // (core-only 政策常驻态), 不算 "死" — 不落 reconcile 告警, 活着的
+        // 残留监听器也不采纳翻 Healthy (#149 语义在对账路径同样成立)。
+        // 事件表为空 (新装机) 时视同非操作员停机, T0/T1 死亡照旧落审计事件。
+        let operator_stopped: std::collections::HashSet<String> = self
+            .store
+            .last_restart_map()
+            .into_iter()
+            .filter(|(_, v)| v.starts_with("ManualStop"))
+            .map(|(k, _)| k)
+            .collect();
         for r in &mut self.runners {
             if !matches!(r.probe_once(), crate::probe::ProbeResult::Healthy { .. }) {
-                if r.def.boot_tier != crate::manifest::BootTier::T2 {
+                if r.def.boot_tier != crate::manifest::BootTier::T2
+                    && !operator_stopped.contains(&r.def.name)
+                {
                     dead_resident.push(r.def.name.clone());
+                } else if r.def.boot_tier != crate::manifest::BootTier::T2 {
+                    tracing::info!(
+                        svc = %r.def.name,
+                        "boot reconcile: resident service dead but operator-downed, no alert"
+                    );
                 }
+                continue;
+            }
+            if operator_stopped.contains(&r.def.name) {
+                tracing::info!(
+                    svc = %r.def.name,
+                    "boot reconcile: live listener but operator-downed, keep Stopped"
+                );
                 continue;
             }
             if !matches!(r.state, S::Healthy) {
@@ -2952,6 +2978,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(svc, "fusion-cowork-web");
+    }
+
+    // issue #157: 操作员 down (事件表最近一次 restart 类事件 = ManualStop) 的
+    // 常驻档服务, daemon 重启后 reconcile 不再落 "found dead" 告警 — 刻意停的
+    // 不算死; 而无 ManualStop 记录的服务照旧落告警 (#111 语义不变)。
+    #[tokio::test]
+    async fn test_issue157_reconcile_skips_operator_stopped_alert() {
+        let defs = vec![
+            def_tier("fusion-rag", Layer::App, 11436, BootTier::T1),
+            def_tier("fusion-model-hub", Layer::Platform, 11444, BootTier::T1),
+        ];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_: &crate::probe::ProbeSpec| ProbeResult::Unhealthy {
+                reason: crate::probe::UnhealthyReason::ConnectionRefused,
+            },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        // fusion-rag: 操作员 down 过 (ManualStop 事件); fusion-model-hub: 无记录
+        core.store
+            .record_event(
+                "fusion-rag",
+                "ManualStop",
+                "cli pid=1 argv: fusion-sv down fusion-rag",
+                100,
+                "native",
+                "warn",
+            )
+            .unwrap();
+        core.reconcile_on_boot().await;
+        let svc: String = core
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT service FROM event WHERE kind='ServiceDown' AND detail LIKE 'boot reconcile%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            svc, "fusion-model-hub",
+            "只有非操作员停机 (无 ManualStop 记录) 的常驻档服务落 reconcile 告警"
+        );
+    }
+
+    // issue #157/#149: 操作员 down 的服务 daemon 重启后若残留活监听器,
+    // reconcile 不得采纳翻 Healthy — 保持 Stopped (#149 down-sticky 跨重启)。
+    #[tokio::test]
+    async fn test_issue157_reconcile_keeps_operator_stopped_service_down() {
+        let defs = vec![def_tier(
+            "fusion-cowork-web",
+            Layer::App,
+            11461,
+            BootTier::T1,
+        )];
+        let mut core = SupervisorCore::new_with_fns(
+            defs,
+            fake_cfg(),
+            |_: &crate::probe::ProbeSpec| ProbeResult::Healthy { latency_ms: 1 },
+            |_svc, _cmd, _env| Ok(()),
+        );
+        core.store
+            .record_event(
+                "fusion-cowork-web",
+                "ManualStop",
+                "cli pid=1 argv: fusion-sv down fusion-cowork-web",
+                100,
+                "native",
+                "warn",
+            )
+            .unwrap();
+        let adopted = core.reconcile_on_boot().await;
+        assert_eq!(adopted, 0, "操作员 down 的残留监听器不采纳");
+        assert!(matches!(core.runners[0].state, runner::State::Stopped));
     }
 
     // C1: poll_interval — 有 down 态返回 poll_unhealthy_sec, 否则 poll_healthy_sec
