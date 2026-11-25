@@ -118,13 +118,15 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     m.insert("customer-insight", ProbeSpec::tcp(11594));
     m.insert("customer-insight-api", ProbeSpec::tcp(11501));
     m.insert("ai-apparelmockup-web", ProbeSpec::tcp(11593));
-    // issue #155: fusion-site 模块化部署 (basePath /shell/fusion-site,
-    // 上游 fusion-site#151) 下 `/` 刻意 404 — 探活钉在模块面公开健康口
-    // /shell/fusion-site/api/experience/health (无鉴权, 双面均 200)。
-    // 旧探活 `/` 恒 404, 健康进程卡 Starting 不翻 Healthy。
+    // issue #155/#163: fusion-site 探活钉在站点原生健康口。#155 曾钉模块面
+    // /shell/fusion-site/api/experience/health, 但该路径 2026-11-25 起被上游
+    // shell session 中间件接管 (401 session_required, 健康站点被判 Unhealthy)。
+    // 站点 origin (node :11481 直连) 上非前缀 /api/experience/health 无鉴权且
+    // 返回真实健康 JSON — 探活钉这里。上游专用无鉴权 /healthz 已提 issue,
+    // 落地后可再迁移。
     m.insert(
         "fusion-site",
-        ProbeSpec::http(11481, "/shell/fusion-site/api/experience/health"),
+        ProbeSpec::http(11481, "/api/experience/health"),
     );
     // issue #81: office-api 自带健康口 (上游 start.sh 启动后同 curl 验证,
     // services/office-api, :11492)
@@ -255,13 +257,12 @@ mod tests {
     // issue #155: fusion-site 模块面 basePath 构建 `/` 刻意 404 —
     // 探活必须钉 /shell/fusion-site/api/experience/health
     #[test]
-    fn test_issue155_fusion_site_module_plane_probe() {
+    fn test_issue163_fusion_site_unauth_probe() {
         let s = probe_spec_for("fusion-site", 11481);
         assert!(matches!(s.kind, ProbeKind::Http));
-        assert_eq!(
-            s.path.as_deref(),
-            Some("/shell/fusion-site/api/experience/health")
-        );
+        // #155 钉的模块面路径已被上游 session 中间件接管 (401),
+        // 探活必须落在站点 origin 无鉴权健康口
+        assert_eq!(s.path.as_deref(), Some("/api/experience/health"));
         assert_eq!(s.port, 11481);
         // start_map 覆盖服务无 restart 语义
         assert_eq!(restart_cmd_for("fusion-site"), "stop+start");
