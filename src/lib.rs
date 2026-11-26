@@ -9,6 +9,7 @@ pub mod env_map;
 pub mod http_server;
 pub mod ingest;
 pub mod jobs;
+pub mod log_rotate;
 pub mod manifest;
 pub mod metrics;
 pub mod probe;

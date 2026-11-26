@@ -106,6 +106,32 @@ pub struct Config {
     // daemon tick 循环判定到期, detached 执行; 游标持久化 meta job_last:<name>。
     #[serde(default)]
     pub jobs: Vec<JobConfig>,
+    // issue #168: daemon 日志尺寸轮转 (copy-truncate)。
+    // log_rotate_max_mb: 单文件超过此 MB 数触发轮转, 0 = 禁用 (默认 100)。
+    // log_rotate_keep: 保留备份份数 <file>.1 .. <file>.N (默认 3)。
+    // log_rotate_paths: 轮转目标 — 默认 launchd StandardOut/ErrPath 两份 daemon
+    // 日志 (相对 FUSION_ROOT 解析, 见 log_rotate::resolve_rotate_path)。
+    #[serde(default = "default_log_rotate_max_mb")]
+    pub log_rotate_max_mb: u64,
+    #[serde(default = "default_log_rotate_keep")]
+    pub log_rotate_keep: u32,
+    #[serde(default = "default_log_rotate_paths")]
+    pub log_rotate_paths: Vec<String>,
+}
+
+fn default_log_rotate_max_mb() -> u64 {
+    100
+}
+
+fn default_log_rotate_keep() -> u32 {
+    3
+}
+
+fn default_log_rotate_paths() -> Vec<String> {
+    vec![
+        "fusion-supervisor/logs/daemon.launchd.log".to_string(),
+        "fusion-supervisor/logs/daemon.launchd.err.log".to_string(),
+    ]
 }
 
 // issue #137: 单条定时任务。daily_at 与 every_sec 必须恰好设一个 (load 校验)。
@@ -305,6 +331,9 @@ impl Default for Config {
             backup_weekly_retention: 0,
             history_retention_days: 7,
             prune_schedule_sec: 3600,
+            log_rotate_max_mb: default_log_rotate_max_mb(),
+            log_rotate_keep: default_log_rotate_keep(),
+            log_rotate_paths: default_log_rotate_paths(),
             registry_path: PathBuf::from("architecture/port-registry.yaml"),
             systemd_units: HashMap::new(),
             compose: ComposeConfig::default(),
@@ -422,7 +451,7 @@ impl Config {
     }
 }
 
-fn expand_tilde(p: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
     // 只展开 "~" 与 "~/.."; "~user"/"~suffix" 形如 ~backup 的路径不改写
     if let Some(s) = p.to_str()
         && (s == "~" || s.starts_with("~/"))

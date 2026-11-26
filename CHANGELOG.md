@@ -22,6 +22,11 @@ for the current version.
 
 ## Unreleased
 
+### Added
+- #168: size-based rotation for daemon logs (`log_rotate_max_mb`/`log_rotate_keep`/
+  `log_rotate_paths`) — copy-truncate of the launchd StandardOutPath files every
+  tick, keeping N `.N` snapshots (default 100MB / 3 backups).
+
 ### Changed
 - #108: safe tray reload path — codesign + bootout/bootstrap after upgrade.
 - #107: boot state reconciliation (surviving processes no longer misreported
