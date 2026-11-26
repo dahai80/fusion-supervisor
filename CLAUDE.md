@@ -190,7 +190,7 @@ React 18 + Vite 5 + TypeScript + Tailwind SPA (issue #25/#28), served by the dae
 
 ## Conventions
 
-- Comments are in Chinese (codebase convention); match this.
+- Comments and log messages are English-only (monorepo-wide hard constraint); match this. User-facing UI strings remain bilingual where the product requires them.
 - 4-space indentation, no docstrings, always include logging (`tracing`).
 - Tests inject fakes via `new_with_fns` / `harness` rather than spinning real services — the probe/start functions are `Arc`-ed closures. Deterministic timestamps injected as `u64` unix-sec, never `SystemTime::now()` in `RestartPolicy` logic.
 
