@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use fusion_supervisor::cli;
 use fusion_supervisor::config::{self, Config};
 use fusion_supervisor::manifest;
+#[cfg(unix)]
 use fusion_supervisor::rpc;
 use fusion_supervisor::rpc::client::RpcClient;
 use fusion_supervisor::rpc::schema::RpcRequest;
@@ -183,16 +184,14 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 与持锁 daemon 并跑形成双份监督)。
     // UDS 面仅 unix — windows 无 UnixStream, daemon 降级为纯 HTTP API 面 (CLI 走 HTTP)。
     #[cfg(unix)]
-    let uds_listener = Some(
-        rpc::server::bind_uds(&cfg.socket_path)
-            .map_err(|e| anyhow::anyhow!("uds bind fail (fatal) {}: {e}", cfg.socket_path))?,
-    );
+    let uds_listener = rpc::server::bind_uds(&cfg.socket_path)
+        .map_err(|e| anyhow::anyhow!("uds bind fail (fatal) {}: {e}", cfg.socket_path))?;
     #[cfg(not(unix))]
     let uds_listener = {
         tracing::warn!(
             "uds face unavailable on this platform; CLI subcommands must use the HTTP API"
         );
-        None
+        ()
     };
     let tcp_listener = match &cfg.metrics_addr {
         Some(addr) => Some(
@@ -220,13 +219,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     #[cfg(unix)]
     tokio::spawn(async move {
         // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
-        if let Err(e) = rpc::server::serve_with_shutdown_on(
-            core_rpc,
-            uds_listener.expect("unix uds listener"),
-            token,
-            shutdown_for_rpc,
-        )
-        .await
+        if let Err(e) =
+            rpc::server::serve_with_shutdown_on(core_rpc, uds_listener, token, shutdown_for_rpc)
+                .await
         {
             tracing::error!(err = %e, "rpc serve exit");
         }
@@ -351,13 +346,20 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
     // issue #107 D1: SIGTERM (launchd bootout) 也走优雅退出并留痕 — 睡眠中
     // 的静默死亡若非信号所致, 日志里缺 shutdown 行即可排除正常终止路径。
+    // SIGTERM 面仅 unix — windows 下该臂退化为永不就绪的 pending (select 只剩 ctrl-c + rpc)。
+    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow::anyhow!("SIGTERM handler install fail: {e}"))?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("daemon shutdown (ctrl-c)");
         }
-        _ = sigterm.recv() => {
+        _ = async {
+            #[cfg(unix)]
+            { sigterm.recv().await }
+            #[cfg(not(unix))]
+            { std::future::pending::<()>().await }
+        } => {
             tracing::info!("daemon shutdown (SIGTERM)");
         }
         _ = &mut shutdown_rx => {
