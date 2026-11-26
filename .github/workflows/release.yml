@@ -26,8 +26,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/fusion-sv dist/
-          sha256sum dist/fusion-sv > dist/fusion-sv.sha256
-          tar czf fusion-sv-linux-x86_64.tar.gz -C dist fusion-sv fusion-sv.sha256
+          # sha 文件与二进制同目录 (cd 后校验路径自洽, sha256sum -c 开箱即用)
+          cd dist && sha256sum fusion-sv > fusion-sv.sha256
+          tar czf ../fusion-sv-linux-x86_64.tar.gz fusion-sv fusion-sv.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: fusion-sv-linux-x86_64
@@ -44,17 +45,37 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/fusion-sv dist/
-          shasum -a 256 dist/fusion-sv > dist/fusion-sv.sha256
-          tar czf fusion-sv-macos-aarch64.tar.gz -C dist fusion-sv fusion-sv.sha256
+          cd dist && shasum -a 256 fusion-sv > fusion-sv.sha256
+          tar czf ../fusion-sv-macos-aarch64.tar.gz fusion-sv fusion-sv.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: fusion-sv-macos-aarch64
           path: fusion-sv-macos-aarch64.tar.gz
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin fusion-sv
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/fusion-sv.exe dist/
+          $h = (Get-FileHash dist/fusion-sv.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  fusion-sv.exe" | Out-File -Encoding ascii dist/fusion-sv.exe.sha256
+          Compress-Archive -Path dist/fusion-sv.exe,dist/fusion-sv.exe.sha256 -DestinationPath fusion-sv-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion-sv-windows-x86_64
+          path: fusion-sv-windows-x86_64.zip
+
   github-release:
     # Only tag pushes create a GitHub Release; manual dispatch builds artifacts only.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -65,4 +86,5 @@ jobs:
           files: |
             fusion-sv-linux-x86_64.tar.gz
             fusion-sv-macos-aarch64.tar.gz
+            fusion-sv-windows-x86_64.zip
           generate_release_notes: true

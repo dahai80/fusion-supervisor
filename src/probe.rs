@@ -243,6 +243,22 @@ async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
 }
 
 async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
+    #[cfg(unix)]
+    {
+        probe_uds_unix(spec).await
+    }
+    // windows 无 UnixStream — UDS 探活恒不可达 (不重启型)
+    #[cfg(not(unix))]
+    {
+        let _ = spec;
+        ProbeResult::Unhealthy {
+            reason: UnhealthyReason::UdsConnectFailed,
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn probe_uds_unix(spec: &ProbeSpec) -> ProbeResult {
     let sock = spec.socket.as_deref().unwrap_or("/tmp/fusion-sv.sock");
     let conn = tokio::time::timeout(
         spec.effective_timeout(),

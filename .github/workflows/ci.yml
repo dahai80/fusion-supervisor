@@ -66,3 +66,15 @@ jobs:
         with:
           name: fusion-tray
           path: target/release/fusion-tray
+
+  # Windows 编译门 — release.yml 现默认打包 windows/linux/macos 三平台,
+  # cfg 门 (UDS/flock/process_group/localtime) 漂移在每个 PR 上就要暴露,
+  # 不能等到 tag push 的 release build 才炸。
+  # 范围只 check 主二进制 (tray 是 eframe 桌面应用, 不发布 windows)。
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --bin fusion-sv

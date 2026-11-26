@@ -1,30 +1,54 @@
 use crate::rpc::schema::{RpcRequest, RpcResponse};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
+// UDS JSON-RPC 客户端 (daemon 同机 CLI 面)。windows 无 UnixStream —
+// 连接即时报错, 引导走 HTTP API 面 (daemon HTTP 端口跨平台可用)。
 pub struct RpcClient {
-    stream: UnixStream,
+    #[cfg(unix)]
+    stream: tokio::net::UnixStream,
+    #[cfg(not(unix))]
+    _priv: (),
 }
 
 impl RpcClient {
     pub async fn connect(socket_path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| anyhow!("daemon 未运行, 用 `fusion-sv daemon` 启动: {e}"))?;
-        Ok(Self { stream })
+        #[cfg(unix)]
+        {
+            let stream = tokio::net::UnixStream::connect(socket_path)
+                .await
+                .map_err(|e| anyhow!("daemon 未运行, 用 `fusion-sv daemon` 启动: {e}"))?;
+            Ok(Self { stream })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket_path;
+            Err(anyhow!(
+                "uds RPC not supported on this platform; use the daemon HTTP API instead"
+            ))
+        }
     }
 
     pub async fn call(&mut self, req: RpcRequest) -> Result<RpcResponse> {
-        let mut s = serde_json::to_string(&req)?;
-        s.push('\n');
-        self.stream.write_all(s.as_bytes()).await?;
-        let mut reader = BufReader::new(&mut self.stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let resp: RpcResponse = serde_json::from_str(line.trim())?;
-        Ok(resp)
+        #[cfg(unix)]
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut s = serde_json::to_string(&req)?;
+            s.push('\n');
+            self.stream.write_all(s.as_bytes()).await?;
+            let mut reader = BufReader::new(&mut self.stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            let resp: RpcResponse = serde_json::from_str(line.trim())?;
+            Ok(resp)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = req;
+            Err(anyhow!(
+                "uds RPC not supported on this platform; use the daemon HTTP API instead"
+            ))
+        }
     }
 
     pub async fn ping(&mut self) -> Result<bool> {
