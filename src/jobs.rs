@@ -39,17 +39,38 @@ fn parse_hm(s: &str) -> Option<(u32, u32)> {
 
 // 今日本地时区 HH:MM 对应的 unix 秒。now 本地秒内偏移去掉得本地零点, 再加偏移。
 // DST 偏差可接受 (一小时级, 每天 auto 补跑语义不受影响)。
-// libc localtime_r: daemon 无 chrono 依赖, 不为此引入。
+// libc localtime_r (unix) / localtime_s (windows): daemon 无 chrono 依赖, 不为此引入。
+// 其他目标无本地时区 libc 面 → None (daily_at 不可用, every_sec 不受影响)。
 pub fn daily_run_ts(now_ts: u64, hour: u32, minute: u32) -> Option<u64> {
     let secs = now_ts as i64;
-    let t = secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return None;
+    #[cfg(unix)]
+    {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return None;
+        }
+        let sec_of_day = (tm.tm_hour as i64) * 3600 + (tm.tm_min as i64) * 60 + tm.tm_sec as i64;
+        let local_midnight = secs - sec_of_day;
+        Some((local_midnight + (hour as i64) * 3600 + (minute as i64) * 60) as u64)
     }
-    let sec_of_day = (tm.tm_hour as i64) * 3600 + (tm.tm_min as i64) * 60 + tm.tm_sec as i64;
-    let local_midnight = secs - sec_of_day;
-    Some((local_midnight + (hour as i64) * 3600 + (minute as i64) * 60) as u64)
+    #[cfg(windows)]
+    {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // windows libc 签名: localtime_s(tmDest, sourceTime) — 参数序与 unix 相反
+        if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+            return None;
+        }
+        let sec_of_day = (tm.tm_hour as i64) * 3600 + (tm.tm_min as i64) * 60 + tm.tm_sec as i64;
+        let local_midnight = secs - sec_of_day;
+        Some((local_midnight + (hour as i64) * 3600 + (minute as i64) * 60) as u64)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (hour, minute);
+        None
+    }
 }
 
 #[cfg(test)]

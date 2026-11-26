@@ -2,10 +2,14 @@ use crate::rpc::schema::{Method, RpcRequest, RpcResponse, make_error, make_resul
 use crate::supervisor::SupervisorCore;
 use anyhow::Result;
 use serde_json::json;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 // issue #20: shutdown 信号 (RPC Shutdown arm 触发 → run_daemon select 接收 → 优雅退出)。
+// UDS 面仅 unix — windows 无 UnixStream (daemon 走 HTTP API 面, main.rs 已 gate)。
+#[cfg(unix)]
 pub async fn serve(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     socket_path: &str,
@@ -24,6 +28,7 @@ pub async fn serve(
 // issue #25: tx 改为共享 Arc — HTTP 面 (http_server) 与 UDS 面共用同一信号。
 // issue #114: bind 提前到 run_daemon 入口 — bind 失败 = fatal (exit 1,
 // launchd KeepAlive 重试), 不再 faceless 空转 tick (孤儿 daemon 并跑实证)。
+#[cfg(unix)]
 pub fn bind_uds(socket_path: &str) -> Result<UnixListener> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -34,6 +39,7 @@ pub fn bind_uds(socket_path: &str) -> Result<UnixListener> {
     Ok(listener)
 }
 
+#[cfg(unix)]
 pub async fn serve_with_shutdown(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     socket_path: &str,
@@ -44,6 +50,7 @@ pub async fn serve_with_shutdown(
     serve_with_shutdown_on(core, listener, token, shutdown_tx).await
 }
 
+#[cfg(unix)]
 pub async fn serve_with_shutdown_on(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
     listener: UnixListener,
@@ -60,6 +67,7 @@ pub async fn serve_with_shutdown_on(
     }
 }
 
+#[cfg(unix)]
 async fn handle_conn(
     stream: tokio::net::UnixStream,
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use fusion_supervisor::cli;
 use fusion_supervisor::config::{self, Config};
 use fusion_supervisor::manifest;
+#[cfg(unix)]
 use fusion_supervisor::rpc;
 use fusion_supervisor::rpc::client::RpcClient;
 use fusion_supervisor::rpc::schema::RpcRequest;
@@ -93,12 +94,11 @@ async fn main() -> anyhow::Result<()> {
 // 崩溃无残留)。锁文件路径 ~/.fusion-sv/daemon.lock。
 // 双 daemon 并跑 = 双份 tick/备份/告警 (2026-11-09 实证: 孤儿 daemon 覆写当日备份)。
 fn acquire_daemon_lock() -> Option<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
     // FUSION_SV_LOCK_PATH 覆盖锁路径 (测试隔离, 不碰真实 daemon.lock)
     let path = match std::env::var("FUSION_SV_LOCK_PATH") {
         Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
         _ => {
-            let home = std::env::var("HOME").ok()?;
+            let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok()?;
             let dir = std::path::Path::new(&home).join(".fusion-sv");
             if !dir.exists() {
                 std::fs::create_dir_all(&dir).ok();
@@ -106,11 +106,14 @@ fn acquire_daemon_lock() -> Option<std::fs::File> {
             dir.join("daemon.lock")
         }
     };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
         .open(&path)
         .map_err(|e| {
             tracing::error!(path = %path.display(), err = %e, "daemon lock file create fail");
@@ -179,8 +182,17 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // issue #114: bind 面先行 — UDS/HTTP bind 失败 = fatal (exit 1), 不再
     // faceless 空转 tick (旧路径 serve task 内 bind 失败只记日志, daemon 假活,
     // 与持锁 daemon 并跑形成双份监督)。
+    // UDS 面仅 unix — windows 无 UnixStream, daemon 降级为纯 HTTP API 面 (CLI 走 HTTP)。
+    #[cfg(unix)]
     let uds_listener = rpc::server::bind_uds(&cfg.socket_path)
         .map_err(|e| anyhow::anyhow!("uds bind fail (fatal) {}: {e}", cfg.socket_path))?;
+    #[cfg(not(unix))]
+    let uds_listener = {
+        tracing::warn!(
+            "uds face unavailable on this platform; CLI subcommands must use the HTTP API"
+        );
+        ()
+    };
     let tcp_listener = match &cfg.metrics_addr {
         Some(addr) => Some(
             fusion_supervisor::http_server::bind_tcp(addr)
@@ -204,6 +216,7 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_shared = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let shutdown_for_rpc = shutdown_shared.clone();
+    #[cfg(unix)]
     tokio::spawn(async move {
         // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
         if let Err(e) =
@@ -213,6 +226,10 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             tracing::error!(err = %e, "rpc serve exit");
         }
     });
+    #[cfg(not(unix))]
+    {
+        let _ = (core_rpc, uds_listener, shutdown_for_rpc, token);
+    }
     tracing::info!("daemon ready (socket {})", cfg.socket_path);
     // 监督 tick 循环: 周期探活 + 宕机自动重启 (C1 修复)
     // 锁纪律: 取锁读 poll_interval → 释放 → sleep → 再取锁 tick_all。
@@ -329,13 +346,20 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
     // issue #107 D1: SIGTERM (launchd bootout) 也走优雅退出并留痕 — 睡眠中
     // 的静默死亡若非信号所致, 日志里缺 shutdown 行即可排除正常终止路径。
+    // SIGTERM 面仅 unix — windows 下该臂退化为永不就绪的 pending (select 只剩 ctrl-c + rpc)。
+    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow::anyhow!("SIGTERM handler install fail: {e}"))?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("daemon shutdown (ctrl-c)");
         }
-        _ = sigterm.recv() => {
+        _ = async {
+            #[cfg(unix)]
+            { sigterm.recv().await }
+            #[cfg(not(unix))]
+            { std::future::pending::<()>().await }
+        } => {
             tracing::info!("daemon shutdown (SIGTERM)");
         }
         _ = &mut shutdown_rx => {

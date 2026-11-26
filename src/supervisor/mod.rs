@@ -11,6 +11,8 @@ use crate::probe_map;
 use crate::store::{HistoryStore, PinMode};
 use anyhow::Result;
 // issue #60: CommandExt::process_group — 服务子进程独立进程组, 隔离 daemon 重载的组信号
+// (unix 专属; windows 目标编译无此 API, 隔离交给 CREATE_NEW_PROCESS_GROUP 语义默认即可, 直接跳过)。
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -2093,6 +2095,14 @@ fn read_log_tail(log_path: &std::path::Path) -> String {
     lines[start..].join("\n")
 }
 
+// issue #60: 服务子进程独立进程组 (unix)。windows 无此 API, 子进程保持默认组。
+#[cfg(unix)]
+fn set_service_process_group(command: &mut std::process::Command) {
+    command.process_group(0);
+}
+#[cfg(not(unix))]
+fn set_service_process_group(_command: &mut std::process::Command) {}
+
 // issue #29: 覆盖服务的启动分派。
 // Script: bash <script> <cmd> (trainer-bridge 自带 start/stop)。
 // Daemon: start → nohup 后台 + pidfile; stop → pidfile kill; restart 上游已退化为 stop+start。
@@ -2141,7 +2151,7 @@ fn exec_start_spec(
             }
             // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
             // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
-            command.process_group(0);
+            set_service_process_group(&mut command);
             // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join,
             // 后台化孙进程持有 fd 不再阻塞 exec — 见 open_svc_stderr 注释)。
             let log_path = crate::start_map::log_path(svc);
@@ -2193,7 +2203,7 @@ fn exec_bash_script(
     }
     // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
     // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
-    command.process_group(0);
+    set_service_process_group(&mut command);
     // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join —
     // 后台化孙进程持有 pipe 写端曾把 exec 永久挂死, 见 open_svc_stderr 注释)。
     let mut child = command
