@@ -218,6 +218,10 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // 锁纪律: 取锁读 poll_interval → 释放 → sleep → 再取锁 tick_all。
     // 绝不持锁跨 sleep (否则阻塞 RPC status/up/down)。
     let core_tick = core.clone();
+    // issue #168: 日志轮转参数快照 (tick 内只读, 配置 reload 才变)
+    let rotate_paths = cfg.log_rotate_paths.clone();
+    let rotate_max_mb = cfg.log_rotate_max_mb;
+    let rotate_keep = cfg.log_rotate_keep;
     let tick_handle = tokio::spawn(async move {
         // issue #107 D1: 睡眠/挂起诊断 — 两轮 tick 间隔远超 poll_interval 即视为
         // 系统睡眠唤醒 (daemon 若在睡眠中死亡, 此日志缺席可佐证 SIGKILL 类硬杀)。
@@ -249,6 +253,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             // 隔离 (JoinError 捕获 panic), 崩了记 ERROR 下一 tick 续跑。
             // 锁纪律不变: tick 体内取锁, 外层 sleep 无锁。
             let core_inner = core_tick.clone();
+            // issue #168: 轮转参数快照克隆进 'static tick task (Vec 不可 Copy,
+            // 两元素字符串每 tick 克隆一次可忽略)
+            let rotate_paths = rotate_paths.clone();
             let tick_round = tokio::spawn(async move {
                 // issue #122 phase-2: tick 挂起的到点重启 exec 在核心锁外并发执行 —
                 // start.sh (go build 等) 可达数分钟, 持锁执行会堵死 RPC/HTTP status。
@@ -268,6 +275,13 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                     let mut c = core_inner.lock().await;
                     c.finish_pending_execs(now, results).await;
                 }
+                // issue #168: 日志尺寸轮转检查 (锁外 — 到阈值才付拷贝成本,
+                // 平时只付 metadata stat; check_paths 内部单文件失败 WARN 续跑)
+                fusion_supervisor::log_rotate::check_paths(
+                    &rotate_paths,
+                    rotate_max_mb,
+                    rotate_keep,
+                );
             });
             if let Err(e) = tick_round.await {
                 tracing::error!(err = %e, "tick 单轮 panic (自愈续跑)");

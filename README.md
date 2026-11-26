@@ -214,6 +214,18 @@ native_extra_path = "/opt/homebrew/bin:/usr/local/bin"
 history_retention_days = 7
 prune_schedule_sec = 3600          # how often the sweep runs
 
+# Daemon log rotation (issue #168) — size-based copy-truncate, checked every tick.
+# The launchd StandardOutPath file (logs/daemon.launchd.log) grows unbounded:
+# launchd holds the fd, so rotation is copy-to-.N + truncate-in-place (rename
+# would leave launchd writing into the rotated inode). Relative paths resolve
+# against FUSION_ROOT (fallback CWD); `~` is expanded. 0 = disabled.
+log_rotate_max_mb = 100            # rotate when a file exceeds this size in MB
+log_rotate_keep = 3                # keep <file>.1 .. <file>.N backup snapshots
+# log_rotate_paths = [             # defaults cover both launchd redirect targets
+#   "fusion-supervisor/logs/daemon.launchd.log",
+#   "fusion-supervisor/logs/daemon.launchd.err.log",
+# ]
+
 # Scheduled jobs (issue #137) — one-shot binaries on a supervisor-driven schedule.
 # Exactly one of daily_at (local HH:MM) / every_sec per entry; validation is
 # fail-closed (bad job config refuses daemon start). Cursor persists in the
