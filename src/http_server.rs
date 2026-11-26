@@ -422,6 +422,8 @@ async fn route(
                 params["token"] = json!(req.token);
             }
             // issue #82: HTTP 编排操作来源可追溯 (方法+路径+对端地址);
+            // issue #173: 对端加调用者身份 (lsof 反查临时端口的属主 pid+进程名,
+            // best-effort — 事后只有端口号不可归因, 两次误杀 fusion-mlx bench 实证)。
             // 请求体自带 origin 时不覆盖
             if params
                 .get("origin")
@@ -429,7 +431,8 @@ async fn route(
                 .unwrap_or("")
                 .is_empty()
             {
-                params["origin"] = json!(format!("http {} {} from {}", m, p, peer));
+                params["origin"] =
+                    json!(format!("http {} {} from {}", m, p, caller_identity(peer)));
             }
             let resp =
                 crate::rpc::server::dispatch_http(method, params, core, token, shutdown_tx).await;
@@ -458,6 +461,46 @@ fn http_text(status: &str, content_type: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+// issue #173: 对端端口 → 调用者身份 (pid + 进程名)。lsof 反查该 TCP 端口
+// (本机连接的临时端口足够唯一), 失败/超时/查不到 = 只回对端地址 (best-effort,
+// 绝不因归因失败拒绝请求)。仅 unix; windows 无 lsof 直接回对端地址。
+fn caller_identity(peer: &str) -> String {
+    #[cfg(unix)]
+    {
+        let port = match peer.rsplit(':').next().unwrap_or("").parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => return peer.to_string(),
+        };
+        let lsof = std::process::Command::new("lsof")
+            .args(["-t", &format!("-iTCP:{port}")])
+            .output();
+        let Ok(out) = lsof else {
+            return peer.to_string();
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let pid_str = stdout.lines().next().unwrap_or("").trim();
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            return peer.to_string();
+        };
+        let comm = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if comm.is_empty() {
+            format!("{peer} (pid {pid})")
+        } else {
+            format!("{peer} (pid {pid} {comm})")
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = peer;
+        peer.to_string()
+    }
 }
 
 // boot POST 端点参数: JSON body + Bearer/x-token → params.token (与 catch-all 同语义)。
@@ -515,6 +558,33 @@ fn content_type_for(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // issue #173: 归因 best-effort — 本进程自己的监听 socket 一定能被 lsof 反查
+    // 到自身 pid; 查不到时回退纯 peer 地址 (不拒绝请求)。
+    #[cfg(unix)]
+    #[test]
+    fn test_caller_identity_resolves_own_pid() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let id = caller_identity(&format!("127.0.0.1:{port}"));
+        assert!(
+            id.contains(&format!("(pid {}", std::process::id())),
+            "unexpected identity: {id}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_caller_identity_falls_back_without_socket() {
+        // 没有任何进程持有该端口时 (大概率), lsof 空 → 原样返回 peer
+        let id = caller_identity("127.0.0.1:63999");
+        assert!(id == "127.0.0.1:63999" || id.contains("(pid"));
+    }
+
+    #[test]
+    fn test_caller_identity_malformed_peer() {
+        assert_eq!(caller_identity("garbage"), "garbage");
+    }
 
     #[test]
     fn test_parse_request_bearer_token_and_body() {
