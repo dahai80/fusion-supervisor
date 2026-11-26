@@ -72,15 +72,30 @@ pub fn real_dump_fn() -> DumpFn {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {bin}: {e}"))?;
         let Some(stdout) = child.stdout.take() else {
+            // 错误路径也要收尸 — 不 wait 会留僵尸进程
+            let _ = child.kill();
+            let _ = child.wait();
             bail!("{bin} stdout 不可读");
         };
         let f = std::fs::File::create(out_path)
             .with_context(|| format!("create backup file {}", out_path.display()))?;
         let mut enc = GzEncoder::new(f, Compression::default());
         let mut rdr = std::io::BufReader::new(stdout);
-        let n =
-            std::io::copy(&mut rdr, &mut enc).with_context(|| format!("stream {bin} → gzip"))?;
-        enc.finish().with_context(|| format!("gzip finish {bin}"))?;
+        let streamed = (|| -> anyhow::Result<u64> {
+            let n = std::io::copy(&mut rdr, &mut enc)
+                .with_context(|| format!("stream {bin} → gzip"))?;
+            enc.finish().with_context(|| format!("gzip finish {bin}"))?;
+            Ok(n)
+        })();
+        let n = match streamed {
+            Ok(n) => n,
+            Err(e) => {
+                // 流式段失败: 杀掉并收尸 pg_dumpall 子进程再返回
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         let out = child.wait().with_context(|| format!("wait {bin}"))?;
         if !out.success() {
             // 失败时把 stderr 尾部带进错误 (告警/event 可见根因)
@@ -435,8 +450,11 @@ impl BackupRunner {
             let tar = qd_dir.join("storage.tar");
             if tar.exists() {
                 let tar_enc = qd_dir.join("storage.tar.enc");
-                encrypt_file(&tar, &tar_enc, key).context("qdrant snapshot 静态加密失败")?;
-                let _ = std::fs::remove_file(&tar);
+                if let Err(e) = encrypt_file(&tar, &tar_enc, key) {
+                    // fail-closed: 加密失败绝不留明文 tar 落 target (与 pg 分支同语义)
+                    let _ = std::fs::remove_file(&tar);
+                    return Err(e.context("qdrant snapshot 静态加密失败"));
+                }
                 tracing::info!(file = %tar_enc.display(), "qdrant 快照已加密");
             }
         }

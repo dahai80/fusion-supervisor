@@ -423,8 +423,9 @@ impl Config {
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
+    // 只展开 "~" 与 "~/.."; "~user"/"~suffix" 形如 ~backup 的路径不改写
     if let Some(s) = p.to_str()
-        && s.starts_with("~")
+        && (s == "~" || s.starts_with("~/"))
         && let Some(home) = dirs_or_home()
     {
         return PathBuf::from(s.replacen("~", &home, 1));

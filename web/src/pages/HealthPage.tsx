@@ -6,7 +6,7 @@ import {
     SelectInput,
     SkeletonLines,
 } from "@fusion/web-ui";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { type HealthRow, fetchHistory, fetchStatus } from "../api";
 import { useT } from "../i18n";
 
@@ -32,14 +32,23 @@ export function HealthPage() {
             });
     }, []);
 
+    // stale-response guard: 服务切换后旧请求晚到不得覆盖新数据
+    const reqSeq = useRef(0);
+
     const load = useCallback(async (svc: string) => {
         if (!svc) return;
+        const seq = ++reqSeq.current;
         try {
-            setRows(await fetchHistory(svc));
-            setError(null);
+            const data = await fetchHistory(svc);
+            if (seq === reqSeq.current) {
+                setRows(data);
+                setError(null);
+            }
         } catch (e) {
-            console.error("[supervisor-web] history load fail:", e);
-            setError(e instanceof Error ? e.message : String(e));
+            if (seq === reqSeq.current) {
+                console.error("[supervisor-web] history load fail:", e);
+                setError(e instanceof Error ? e.message : String(e));
+            }
         }
     }, []);
 

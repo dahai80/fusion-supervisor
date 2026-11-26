@@ -121,7 +121,7 @@ export function AlertsPage() {
             <DataTable
                 columns={columns}
                 rows={[...events].reverse()}
-                rowKey={(r) => `${r.ts}-${r.service}-${r.kind}`}
+                rowKey={(r) => `${r.ts}-${r.service}-${r.kind}-${r.detail}`}
                 pageSize={20}
                 emptyState={
                     <EmptyState

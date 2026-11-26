@@ -80,6 +80,14 @@ impl IngestGate {
             }
         }
     }
+
+    // 事件落库失败时回退游标 — observe 先推进、record 后失败的话, 合法重发
+    // 会被白耗的窗口吞掉 (200 deduped 但事件从未落库)。
+    pub fn rollback(&mut self, key: Option<&str>) {
+        if let Some(key) = key {
+            self.last.remove(key);
+        }
+    }
 }
 
 #[cfg(test)]

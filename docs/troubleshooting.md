@@ -92,7 +92,7 @@ $SV restart <svc>        # 复位熔断与 Failed 状态
 
 ### 重启了但进程没换 / Restart ran but the process did not change
 
-v0.1.46 的 `restart` 走 stop → `stop_and_verify`（20×250ms 确认端口释放）→
+v0.1.46 的 `restart` 走 stop → `stop_and_verify`（30×250ms 确认端口释放, i=8/i=20 端口仍占时补发 stop）→
 start，返回旧/新 PID；若仍观察到 PID 不变，检查服务是否被上游脚本
 daemonize 到独立 pidfile 之外的进程。对比：
 

@@ -242,6 +242,10 @@ impl Alerter {
             .unwrap_or_default();
         let mut last_err = None;
         for attempt in 0..3u32 {
+            if attempt > 0 {
+                // 重试间加退避 — 旧实现 3 连发零间隔, 对端死亡时瞬时 3 连击
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
             match client.post(&self.webhook_url).json(&body).send().await {
                 Ok(r) if r.status().is_success() => {
                     tracing::debug!(attempt, "webhook sent");

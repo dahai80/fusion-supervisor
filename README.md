@@ -16,11 +16,11 @@ source_of_truth:
 
 # fusion-supervisor
 
-Local-first fusion service supervisor and monitor. Long-lived Rust daemon `fusion-sv` supervises all 53 fusion services registered in `architecture/port-registry.yaml`: start/stop/restart, health probing, crash auto-recovery (crash-window + exponential backoff), health history in SQLite, and alerting.
+Local-first fusion service supervisor and monitor. Long-lived Rust daemon `fusion-sv` supervises all fusion services registered in `architecture/port-registry.yaml`: start/stop/restart, health probing, crash auto-recovery (crash-window + exponential backoff), health history in SQLite, and alerting.
 
 ## Why
 
-The fusion monorepo had no persistent supervisor. Existing tools are one-shot or display-only: `fusion service status --watch` (6 services, no restart), `fusion doctor` (5 services), `fusion-autotest` (~20, exits on completion), `fusion-studio/Scripts/start.sh` (14, ends after start). 53 services with no continuous watcher, no crash restart, no health history aggregation, no unified liveness path (`/health` vs `/healthz` vs UDS-ping chaos). fusion-supervisor fills this gap.
+The fusion monorepo had no persistent supervisor. Existing tools are one-shot or display-only: `fusion service status --watch` (6 services, no restart), `fusion doctor` (5 services), `fusion-autotest` (~20, exits on completion), `fusion-studio/Scripts/start.sh` (14, ends after start). dozens of services with no continuous watcher, no crash restart, no health history aggregation, no unified liveness path (`/health` vs `/healthz` vs UDS-ping chaos). fusion-supervisor fills this gap.
 
 ## Install
 
@@ -115,11 +115,11 @@ Deploy note: `ai-speech-exam` reads `config/config.yaml` (git-ignored; only `con
 
 **Web console vendored SDK re-sync (issue #43).** `web/vendor/@fusion/web-sdk` is re-vendored from `fusion-web-shell` tag **v0.1.2**: picks up the host-bridge `isHttpErrorResult()` type-predicate fix (bare-string bridge results no longer throw `TypeError: Cannot use 'in' operator`, upstream #75) and the cached-sync `theme.get()` seeded by a background host pull (upstream #77). The local `?embedded=1`-without-parent-frame patch (top-level deep links) is re-applied on top — upstream never carried it.
 
-When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH the 53 native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
+When `compose.enabled = true`, `up`/`down`/`status`/`logs` span BOTH all native services AND the container planes (Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork business) in one command — true one-command bring-up with unified monitoring. Disabled by default (native-only, preserves single-node dev behavior).
 
 ## How it works
 
-- **Source of truth:** reads `architecture/port-registry.yaml` for the 53-service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
+- **Source of truth:** reads `architecture/port-registry.yaml` for the service manifest. Never rewrites `start.sh` scripts — orchestrates them (`bash <repo>/start.sh start|stop|restart`).
 - **Registry-key → repo-dir mapping (issue #57):** `name_to_dir` maps registry keys to local repo directories. Most keys equal their directory; known exceptions live in an explicit table (`fusion-code-modelization` → `fusion-code-modenization` spelling, business-plane keys → `business/<name>`, and `fusion-multi-node` → `fusion-multi-nodes` — the registry key is singular but the repo directory on disk is plural; before #57 the default mapping pointed at a nonexistent directory and the Cluster master failed closed on every boot; and `fusion-model-hub` → `fusion-models-hub` — same singular/plural class, fixed 2026-10-31: the repo was renamed on disk but not in the registry, so the default mapping pointed at a nonexistent `fusion-model-hub/` and the service could only ever be started by hand). Sub-service keys (`fusion-cowork-ws`, `fusion-multi-node-agent`, …) resolve to their parent repo via a `(prefix, dir)` table, so plural-directory parents resolve correctly too.
 - **Dual-mode binary:** `daemon` = long-lived supervisor loop + UDS JSON-RPC server (`/tmp/fusion-sv.sock`, perms 0600); CLI subcommands = one-shot client over the same UDS.
 - **Health probing:** per-service `probe_map` normalizes liveness paths (HTTP `/health`/`/healthz`, UDS `ping`→`pong`, TCP fallback). 2s default timeout; per-service override via `ProbeSpec.timeout` (issue #79: `fusion-mlx` probes `/healthz` at 10s — under GIL-heavy load a healthy-but-busy answer can exceed 2s, and the old global timeout escalated it to a destructive restart that killed in-flight inference traffic).
@@ -264,7 +264,7 @@ Implements `architecture/fusion-supervisor-app-tiering-prd-1029.md`: services sp
 - **T1 platform** (~20): everyday work services — started at boot only when pinned `auto` (per-user override, stored in `~/.fusion-sv/history.db` table `boot_pin`), otherwise on-demand.
 - **T2 app/domain** (rest): never started at boot; started on demand (tray / web console / CLI).
 
-The boot set = T0 ∪ {pinned=auto}. `auto_up_on_start = true` in `~/.fusion-sv/config.toml` now runs **`up_boot_set`** (T0 + pins) instead of `up_all` — **behavior change**: previously every one of the 53+ services was dragged up on daemon boot; now host-reboot recovery only restores the core + your pinned platform services, cutting boot memory footprint and start churn. `fusion-sv up` with no argument still means all services.
+The boot set = T0 ∪ {pinned=auto}. `auto_up_on_start = true` in `~/.fusion-sv/config.toml` now runs **`up_boot_set`** (T0 + pins) instead of `up_all` — **behavior change**: previously every managed service was dragged up on daemon boot; now host-reboot recovery only restores the core + your pinned platform services, cutting boot memory footprint and start churn. `fusion-sv up` with no argument still means all services.
 
 HTTP face additions (same token rules as other mutations):
 
@@ -308,7 +308,7 @@ launchctl load ~/Library/LaunchAgents/com.fusion.tray.plist
 
 ## Boundary with existing supervisors
 
-- **fusion-gateway** stays the inference routing entry. Its `auto_start` only starts fusion-mlx; supervisor manages all 53 (including mlx). Double-start avoided: supervisor probes first, skips if already healthy. (Boundary tracked in fusion-gateway issue.)
+- **fusion-gateway** stays the inference routing entry. Its `auto_start` only starts fusion-mlx; supervisor manages all managed services (including mlx). Double-start avoided: supervisor probes first, skips if already healthy. (Boundary tracked in fusion-gateway issue.)
 - **fusion-studio/Scripts/start.sh** → legacy. Supervisor uses registry truth, does not inherit the script's stale values. (Studio migration tracked in fusion-studio issue.)
 - **fusion-cli** `service`/`rag`/`doc` start/stop remain for interactive convenience; supervisor is authoritative. (Optional thin `fusion net` subcommand tracked in fusion-cli issue, v1.1.)
 
@@ -324,7 +324,7 @@ cargo fmt --all --check
 
 - [x] `cargo build --release` → `fusion-sv`, 0 warnings (clippy -D warnings)
 - [x] `cargo test` layer 1+2 all pass (49 tests)
-- [ ] `fusion-sv daemon` then `fusion-sv status` lists all 53 services (real registry)
+- [ ] `fusion-sv daemon` then `fusion-sv status` lists all managed services (real registry)
 - [ ] `fusion-sv up` starts core (mlx+gateway), skips already-running (no double-start)
 - [ ] Manually kill a non-core service → recovers within 30s, history recorded
 - [ ] Kill same service 5x → `Failed` state, stops restart, `RestartCapHit` alert
@@ -425,7 +425,7 @@ DB in containers.
 | qdrant | qdrant/qdrant:v1.12.4 | 6333/6334 | fusion-rag vector DB, tenant-prefix isolation |
 
 Ports respect `architecture/port-registry.yaml` — sidecar middleware uses the
-reserved standard ports, none collide with the 53 fusion service ports (11xxx).
+reserved standard ports, none collide with the fusion service ports (11xxx).
 
 ### One-command bring-up
 

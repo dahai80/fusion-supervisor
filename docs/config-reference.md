@@ -7,8 +7,8 @@ doc_type: config-reference
 title: { zh: "fusion-supervisor 配置参考", en: "fusion-supervisor configuration reference" }
 audience: engineer
 status: draft
-version: 0.1.46
-updated: 2026-11-07
+version: 0.1.79
+updated: 2026-11-26
 owner: "@dahai"
 source_of_truth:
   - src/config.rs
@@ -31,14 +31,17 @@ overrides.
 
 | 环境变量 / Env var | 默认 / Default | 说明 / Description |
 |---|---|---|
-| `FUSION_SV_CONFIG` | `~/.fusion-sv/config.toml` | daemon 主配置；文件不存在时全默认启动（仅 INFO 日志） |
+| `FUSION_SV_CONFIG` | `~/.fusion-sv/config.toml` | daemon 主配置；文件不存在时全默认启动（WARN 日志）；默认路径缺失而 `/opt/fusion-sv/config.toml` 存在时采纳部署路径（CLI 与 daemon 配置分歧时 WARN 点名两路径） |
 | `FUSION_ROOT` | 无（回退 cwd） | 默认 `start.sh` 路径解析根 + 相对 `env_file` 解析根；实践上必设 |
 | `FUSION_SV_TOKEN` | 无 | 设置后 UDS/HTTP 编排操作需 token |
 | `RUST_LOG` | `info` | tracing 过滤（未设时默认 info，启动告警可见） |
 
-主配置路径不存在时 daemon 用默认值启动，不会失败。
+主配置路径不存在时 daemon 用默认值启动（WARN），不会失败；部署约定路径
+`/opt/fusion-sv/config.toml` 在默认路径缺失时被采纳（issue #136）。
 
-If the config file is missing the daemon boots with defaults (INFO log only).
+If the config file is missing the daemon boots with defaults (WARN log);
+the deploy convention path `/opt/fusion-sv/config.toml` is adopted when the
+default path is absent (issue #136).
 
 ## `~/.fusion-sv/config.toml` 字段 / Fields
 
@@ -61,7 +64,8 @@ If the config file is missing the daemon boots with defaults (INFO log only).
 | `drain_grace_sec` | `30` | drain 宽限，到期强制 Stopped |
 | `rollout_prewarm_timeout_sec` | `60` | rollout 预热探活超时，超时告警并留 Stopped |
 | `backup_schedule_sec` | `86400` | 备份调度间隔（daemon tick 检查） |
-| `backup_retention` | `7` | 保留最近 N 份备份集 |
+| `backup_retention` | `7` | 保留最近 N 份日备份额 |
+| `backup_weekly_retention` | `0` | 两层保留的周备份额（issue #132）；`0` = 旧平铺保留 |
 | `history_retention_days` | `7` | 健康历史/事件保留天数 |
 | `prune_schedule_sec` | `3600` | retention sweep 周期 |
 | `registry_path` | `architecture/port-registry.yaml` | 服务清单来源（相对 FUSION_ROOT/cwd 展开 `~`） |
@@ -72,6 +76,9 @@ If the config file is missing the daemon boots with defaults (INFO log only).
 | `native_pg_host` | `127.0.0.1` | native 平面备份目标 PG |
 | `native_pg_port` | `5432` | 同上 |
 | `native_extra_path` | `/opt/homebrew/bin:/usr/local/bin` | 追加到 daemon PATH（仅缺失项，子进程继承）；`""` = 关闭 |
+| `startup_grace_secs` | `90` | 启动宽限窗口（issue #126）：窗口内探活失败不计失败不排重启（慢绑口 daemon）；`0` = 关闭 |
+| `systemd_units` | 空 map | 服务名 → systemd unit（issue #145，VPS 部署）；声明后该服务 start/stop/restart 经 systemctl 驱动；Mac 不配置全走 start.sh |
+| `jobs` | 空 vec | 定时任务表（issue #137）`[[jobs]]`：`name`/`bin`/`args`/`daily_at`（HH:MM）或 `every_sec`/`timeout_sec`（默认 900）；坏配置拒 daemon 启动 |
 
 可选 `[compose]` 段（默认 `enabled = false`，native-only）：
 
