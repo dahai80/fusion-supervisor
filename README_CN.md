@@ -115,7 +115,7 @@ Issue #55 将业务平面扩展到 2026-10-27/28 端口治理批次（全部 `St
 
 部署注意：`ai-speech-exam` 读取 `config/config.yaml`（git 忽略；仅提交了不含机密的 `config.example.yaml`）。复制示例文件是认可的部署步骤。
 
-**Web 控制台 vendored SDK 重新同步（issue #43）。** `web/vendor/@fusion/web-sdk` 从 `fusion-web-shell` tag **v0.1.2** 重新 vendored：吸收了 host-bridge 的 `isHttpErrorResult()` 类型谓词修复（裸字符串 bridge 结果不再抛 `TypeError: Cannot use 'in' operator`，上游 #75）和由后台 host 拉取播种的缓存式 `theme.get()`（上游 #77）。本地的 `?embedded=1` 无父帧补丁（顶级深链）在其上重新套用——上游从未携带该补丁。
+**Web 控制台 vendored SDK 重新同步（issue #43）。** `web/vendor/@fusion/web-sdk` 从 `fusion-web-shell` tag **v0.1.2** 重新 vendored：吸收了 host-bridge 的 `isHttpErrorResult()` 类型谓词修复（裸字符串 bridge 结果不再抛 `TypeError: Cannot use 'in' operator`，上游 #75）和由后台 host 拉取播种的缓存式 `theme.get()`（上游 #77）。本地的 `?embedded=1` 无父帧补丁（根级深链）在其上重新套用——上游从未携带该补丁。
 
 当 `compose.enabled = true` 时，`up`/`down`/`status`/`logs` 一条命令同时覆盖全部 native 服务和容器平面（Traefik+Redis+Postgres+Qdrant sidecar + model-hub/cowork 业务）——真正的单命令拉起加统一监控。默认关闭（仅 native，保持单节点 dev 行为）。
 
