@@ -7,8 +7,8 @@ doc_type: api-reference
 title: { zh: "fusion-supervisor API 参考（CLI + HTTP）", en: "fusion-supervisor API reference (CLI + HTTP)" }
 audience: engineer
 status: draft
-version: 0.1.46
-updated: 2026-11-07
+version: 0.1.79
+updated: 2026-11-26
 owner: "@dahai"
 source_of_truth:
   - src/main.rs
@@ -70,11 +70,12 @@ console together).
 |---|---|---|
 | GET | `/health` | `{"ok":true}`；lock-free，daemon 忙时也可达 |
 | GET | `/metrics` | Prometheus 文本格式 v0.0.4 |
-| GET | `/api/v1/status` | 镜像 UDS status：`{"ok":true,"services":[{name,state,port,plane}]}` |
+| GET | `/api/v1/status` | 镜像 UDS status：`{"ok":true,"services":[{name,state,port,plane,last_restart}]}` |
 | GET | `/api/v1/history?service=&limit=` | 单服务健康历史（SQLite） |
 | GET | `/api/v1/events?limit=` | 全局事件流（告警数据源，含 severity） |
 | GET | `/api/v1/logs?service=` | 日志尾部（复用 RPC dispatch） |
 | GET | `/api/v1/boot` | 每服务一行 `{name,tier,pinned,state,port}`；tray 唯一轮询面 |
+| POST | `/api/v1/alerts/ingest` | 外部告警摄入（issue #139，需 token）：`{"source","kind"}` 必填，可选 `severity`(info\|warn\|error)/`detail`/`dedup_key`；窗口内同 key 返回 `{"ok":true,"deduped":true}` |
 
 ### 编排端点（需 token）/ Orchestration endpoints (token required)
 
@@ -118,12 +119,13 @@ still prints the origin banner first; `restart` returns old/new PIDs;
 - `fusion_sv_service_state{service,port,plane,state}` — 当前状态为 1
 - `fusion_sv_crash_count{service}` — 滑动窗口崩溃计数（仅 native）
 - `fusion_sv_alerts_total` — 去重后发出的告警数
+- `fusion_sv_alerts_rate_limited_total` — 限流窗抑制的告警数（issue #142）
 - `fusion_sv_events_pruned_total` — retention sweep 清理的历史行数
 
 ## UDS JSON-RPC（内部面）/ UDS JSON-RPC (internal surface)
 
 `/tmp/fusion-sv.sock`（0600），JSON-RPC 2.0 envelope，方法集与 CLI/HTTP
-一一映射：`status/top/up/down/restart/logs/ping/drain/rollout/backup/shutdown`
+一一映射：`status/top/up/down/restart/logs/ping/drain/rollout/backup/shutdown/boot/boot.pin/boot.group`
 （`top` 无服务端臂）。第三方集成建议优先用 HTTP 只读面 + token 化 POST，
 不要直连 UDS（权限与生命周期都跟着 daemon 走）。
 

@@ -191,7 +191,13 @@ async fn route(
         }
         ("POST", "/api/v1/boot/pin") => {
             // issue #82: boot 面请求同带来源
-            let mut params = boot_post_params(&req.body, &req.token);
+            let Some(mut params) = boot_post_params(&req.body, &req.token) else {
+                return http_text(
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"body must be JSON\"}",
+                );
+            };
             params["origin"] = json!(format!("http POST /api/v1/boot/pin from {peer}"));
             let resp =
                 crate::rpc::server::dispatch_http("boot.pin", params, core, token, shutdown_tx)
@@ -209,7 +215,13 @@ async fn route(
         }
         ("POST", "/api/v1/boot/group") => {
             // issue #82: 分组停止波也是操作员意图, 来源可追溯
-            let mut params = boot_post_params(&req.body, &req.token);
+            let Some(mut params) = boot_post_params(&req.body, &req.token) else {
+                return http_text(
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"body must be JSON\"}",
+                );
+            };
             params["origin"] = json!(format!("http POST /api/v1/boot/group from {peer}"));
             let resp =
                 crate::rpc::server::dispatch_http("boot.group", params, core, token, shutdown_tx)
@@ -334,6 +346,8 @@ async fn route(
                         &payload.severity,
                     )
                 {
+                    // 回退 dedup 游标 — 白耗窗口会吞掉合法重发
+                    c.ingest_gate.rollback(payload.dedup_key.as_deref());
                     tracing::warn!(err = %e, "ingest event record fail");
                     return http_text(
                         "500 Internal Server Error",
@@ -447,16 +461,17 @@ fn http_text(status: &str, content_type: &str, body: &str) -> String {
 }
 
 // boot POST 端点参数: JSON body + Bearer/x-token → params.token (与 catch-all 同语义)。
-fn boot_post_params(body: &str, token: &str) -> serde_json::Value {
+// 非 JSON body 返回 None → 调用方 400 (与 catch-all POST 校验一致, 不静默当空参)。
+fn boot_post_params(body: &str, token: &str) -> Option<serde_json::Value> {
     let mut params: serde_json::Value = if body.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str(body).unwrap_or(json!({}))
+        serde_json::from_str(body).ok()?
     };
     if !token.is_empty() {
         params["token"] = json!(token);
     }
-    params
+    Some(params)
 }
 
 // 静态文件: "/" → index.html; 其余按路径取 (拒绝 ..); 未配置目录 → 404。

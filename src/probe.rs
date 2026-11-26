@@ -264,15 +264,24 @@ async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
             };
         }
     };
-    // 发 repo 既有 envelope ping
-    let req = r#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
-    use tokio::io::AsyncWriteExt;
+    // 发 repo 既有 envelope ping。协议是 newline-delimited (server 端
+    // lines()/readline() 读), 不带 \n 对端 parse 不了; 且必须读到应答才算活 —
+    // 只验 write 会放过 dispatch 卡死的 daemon (假 Healthy)。
+    let req = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n";
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if stream.write_all(req.as_bytes()).await.is_err() {
         return ProbeResult::Unhealthy {
             reason: UnhealthyReason::UdsBadReply,
         };
     }
-    ProbeResult::Healthy { latency_ms: 0 }
+    let mut buf = [0u8; 512];
+    match tokio::time::timeout(spec.effective_timeout(), stream.read(&mut buf)).await {
+        // 任何非空应答 (result/error 都算) = daemon dispatch 活着
+        Ok(Ok(n)) if n > 0 => ProbeResult::Healthy { latency_ms: 0 },
+        _ => ProbeResult::Unhealthy {
+            reason: UnhealthyReason::UdsBadReply,
+        },
+    }
 }
 
 async fn probe_tcp(spec: &ProbeSpec) -> ProbeResult {

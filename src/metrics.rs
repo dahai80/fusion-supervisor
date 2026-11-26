@@ -52,15 +52,17 @@ pub fn render(core: &SupervisorCore) -> String {
         "fusion_sv_services_total{{plane=\"native\"}} {native_n}\n"
     ));
 
-    // compose 容器总数 (若启用, 从 ps 快照; 失败则 0)
-    let compose_n = if core.compose_enabled() {
+    // compose 行一次取齐 — status_all 每次调用都是一次阻塞 docker ps 子进程,
+    // 不得重复调用 (调用方持核心锁, 双倍子进程会加倍锁占用时长)。
+    let compose_rows: Vec<_> = if core.compose_enabled() {
         core.status_all()
-            .iter()
+            .into_iter()
             .filter(|e| e.plane == "compose")
-            .count()
+            .collect()
     } else {
-        0
+        Vec::new()
     };
+    let compose_n = compose_rows.len();
     out.push_str(&format!(
         "fusion_sv_services_total{{plane=\"compose\"}} {compose_n}\n"
     ));
@@ -73,6 +75,15 @@ pub fn render(core: &SupervisorCore) -> String {
     out.push_str(&format!(
         "fusion_sv_alerts_total {}\n",
         core.alerter.alerts_emitted()
+    ));
+    // issue #142: 限流抑制计数 — 此前 getter 无消费方, 排障不可见
+    out.push_str(
+        "# HELP fusion_sv_alerts_rate_limited_total Alerts suppressed by the per (service, kind) rate window, cumulative.\n",
+    );
+    out.push_str("# TYPE fusion_sv_alerts_rate_limited_total counter\n");
+    out.push_str(&format!(
+        "fusion_sv_alerts_rate_limited_total {}\n",
+        core.alerter.alerts_rate_limited()
     ));
     out.push_str("# HELP fusion_sv_events_pruned_total History rows pruned by retention sweeps, cumulative.\n");
     out.push_str("# TYPE fusion_sv_events_pruned_total counter\n");
@@ -110,19 +121,17 @@ pub fn render(core: &SupervisorCore) -> String {
     }
 
     // compose 容器: 仅 healthy + state gauge (compose 容器无 crash_count)
-    if core.compose_enabled() {
-        for e in core.status_all().iter().filter(|e| e.plane == "compose") {
-            let name = &e.name;
-            let port = e.port;
-            let stl = e.state.to_lowercase();
-            let h = if e.state == "Healthy" { 1 } else { 0 };
-            out.push_str(&format!(
+    for e in &compose_rows {
+        let name = &e.name;
+        let port = e.port;
+        let stl = e.state.to_lowercase();
+        let h = if e.state == "Healthy" { 1 } else { 0 };
+        out.push_str(&format!(
                 "fusion_sv_service_healthy{{service=\"{name}\",port=\"{port}\",plane=\"compose\"}} {h}\n"
             ));
-            out.push_str(&format!(
+        out.push_str(&format!(
                 "fusion_sv_service_state{{service=\"{name}\",port=\"{port}\",plane=\"compose\",state=\"{stl}\"}} 1\n"
             ));
-        }
     }
 
     out

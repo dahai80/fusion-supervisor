@@ -74,7 +74,7 @@ source_of_truth:
 
 ## 关键设计决策 / Key design decisions
 
-1. **注册表是唯一真源**：53 个受管服务全部来自
+1. **注册表是唯一真源**：全部受管服务来自
    `architecture/port-registry.yaml`，supervisor 不维护第二份服务清单。
    每个注册项要么可监督要么显式豁免——boot 错误必然是真故障。
 2. **编排而非改写**：`start.sh` 是服务作者的生命周期契约，supervisor

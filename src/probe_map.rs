@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-// 服务名 → ProbeSpec。路径由扫描 41 服务确探活路径得 (spec §4.3)。
-// 默认 HTTP GET /health; 例外覆盖。UDS 服务 (speech/memory) 用 uds。
+// 服务名 → ProbeSpec。路径由扫描各服务实况确探活路径得 (spec §4.3)。
+// 默认 HTTP GET /health; 例外覆盖。UDS 仅剩 fusion-projects (speech/memory
+// 已迁 HTTP); 未确路径的服务退化 TCP (per-svc 一次 info, issue #104)。
 fn build_table() -> HashMap<&'static str, ProbeSpec> {
     let mut m = HashMap::new();
     // core
@@ -90,7 +91,10 @@ fn build_table() -> HashMap<&'static str, ProbeSpec> {
     // 与 apparelmockup (静态 http.server 无 /health, 恒 404=BadPath 不重启) 退 TCP
     m.insert("ai-fit", ProbeSpec::http(11510, "/api/v1/system/health"));
     m.insert("ai-speech-exam", ProbeSpec::http(11560, "/health"));
-    m.insert("ai-family", ProbeSpec::tcp(11483));
+    // 2026-11-11 ai-family 自 11483 迁入 11583 (registry 同步, dahai80-business/
+    // ai-family#1) — 钉旧口探活恒 ConnectionRefused (restart-eligible), 健康
+    // 服务会被重启风暴误杀
+    m.insert("ai-family", ProbeSpec::tcp(11583));
     // issue #55: apparelmockup 上游已改 FastAPI 但未见公开健康口 → 保守 TCP
     m.insert("ai-apparelmockup", ProbeSpec::tcp(11520));
     // issue #84: ai-trysuite 公开健康口 /healthz (无鉴权), 优于 TCP 兜底
@@ -413,7 +417,7 @@ mod tests {
         assert!(matches!(s.kind, ProbeKind::Http));
         assert_eq!(s.path.as_deref(), Some("/health"));
 
-        for (name, port) in [("ai-family", 11483), ("ai-apparelmockup", 11520)] {
+        for (name, port) in [("ai-family", 11583), ("ai-apparelmockup", 11520)] {
             let s = probe_spec_for(name, port);
             assert!(matches!(s.kind, ProbeKind::Tcp), "{name} 应 TCP 探活");
         }

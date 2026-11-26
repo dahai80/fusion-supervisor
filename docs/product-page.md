@@ -21,7 +21,7 @@ source_of_truth:
 ## 它是什么 / What it is
 
 fusion-supervisor 是 fusion monorepo 的常驻守护层：Rust 守护进程 `fusion-sv`
-读取 `architecture/port-registry.yaml`（53 个受管服务），对每个服务执行
+读取 `architecture/port-registry.yaml`（受管服务清单），对每个服务执行
 start/stop/restart、健康探活、崩溃自动恢复（crash 窗口 + 指数退避）、
 SQLite 健康历史与告警。它只编排既有的 `start.sh` 生命周期脚本，从不改写它们。
 

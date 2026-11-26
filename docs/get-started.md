@@ -71,12 +71,12 @@ $SV top               # 1s 刷新实时表
 
 约束 / Constraints:
 
-- `up`/`down` 不带参数作用于全部 53 个服务；带参数为单服务操作。
+- `up`/`down` 不带参数作用于全部受管服务；带参数为单服务操作。
 - `down <svc>` 记录操作来源（pid + argv），手动停止的服务不参与自动恢复。
 - 监控读面默认 `127.0.0.1:9100`：`GET /metrics`、`GET /api/v1/status` 无需 token；
   编排类 POST 需要 `FUSION_SV_TOKEN`。
 
-- `up`/`down` without an argument act on all 53 services; with an argument
+- `up`/`down` without an argument act on all managed services; with an argument
   they are single-service operations.
 - `down <svc>` records the operator origin (pid + argv); manually stopped
   services take no part in auto-recovery.

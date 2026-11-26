@@ -110,6 +110,10 @@ pub struct SupervisorCore {
     // issue #139: 外部告警摄入 dedup 闸门 (调用方 dedup_key → 上次放行 ts)。
     // pub: http_server 摄入路由直接操作 (与 store/alerter 同级暴露)。
     pub ingest_gate: crate::ingest::IngestGate,
+    // compose 容器上轮 tick 是否有 Failed (poll_interval 用)。ps() 是阻塞
+    // docker 子进程, poll_interval 每 tick 现场重查会在持锁下双倍 spawn
+    // (tick_compose 已查过一次) — 复用上轮结果, 一 tick 陈旧可接受。
+    compose_any_failed: bool,
 }
 
 impl SupervisorCore {
@@ -205,6 +209,7 @@ impl SupervisorCore {
             job_last,
             // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
             ingest_gate: crate::ingest::IngestGate::default(),
+            compose_any_failed: false,
         })
     }
 
@@ -287,6 +292,7 @@ impl SupervisorCore {
             job_last,
             // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
             ingest_gate: crate::ingest::IngestGate::default(),
+            compose_any_failed: false,
         }
     }
 
@@ -409,7 +415,15 @@ impl SupervisorCore {
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
                     if skipped_healthy {
+                        // 已健康采纳: 全套计数复位 (与 runner #124 恢复路径同语义) —
+                        // 只翻 state 不复位会让 Failed/带熔断计数的 runner 带
+                        // 陈旧 crash 窗口, 下一次宕机瞬间再触发封顶
                         r.state = runner::State::Healthy;
+                        r.fail_streak = 0;
+                        r.restart_after = None;
+                        r.start_retry = false;
+                        r.start_fail_streak = 0;
+                        r.policy.reset();
                     } else if start_res.is_ok() {
                         r.state = runner::State::Starting;
                         // issue #126: 拉起成功记启动宽限截止
@@ -589,6 +603,11 @@ impl SupervisorCore {
         match res {
             Ok(()) => {
                 r.state = runner::State::Starting;
+                // 拉起成功清残留重启排期/熔断 — 不清的话此前 start-fail/crash
+                // 流留下的 restart_after 会在下次宕机时绕过退避立即重启
+                r.restart_after = None;
+                r.start_retry = false;
+                r.start_fail_streak = 0;
                 // issue #126: 拉起成功记启动宽限截止 — 窗口内探活失败不计失败
                 // 不排重启 (慢启动 daemon 绑定口需 30-60s)
                 r.set_boot_grace(now_unix());
@@ -1090,11 +1109,24 @@ impl SupervisorCore {
         let mut set = tokio::task::JoinSet::new();
         for (name, is_restart, f, probe) in execs {
             set.spawn_blocking(move || {
-                if matches!(probe(), crate::probe::ProbeResult::Healthy { .. }) {
-                    return (name, runner::ExecOutcome::Adopted);
+                // panic 隔离 — start 闭包 panic 若冒泡成 JoinError, 服务名丢失,
+                // exec_in_flight 永远清不掉 → 该服务监督永久停摆 (tick 早退)。
+                // 捕获转 Ran(Err), finish 落账正常复位闸门。
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if matches!(probe(), crate::probe::ProbeResult::Healthy { .. }) {
+                        return (name.clone(), runner::ExecOutcome::Adopted);
+                    }
+                    let res = runner::run_start_verbs(&f, is_restart);
+                    (name.clone(), runner::ExecOutcome::Ran(res))
+                })) {
+                    Ok(pair) => pair,
+                    Err(_) => (
+                        name,
+                        runner::ExecOutcome::Ran(Err(anyhow::anyhow!(
+                            "start exec panicked (caught)"
+                        ))),
+                    ),
                 }
-                let res = runner::run_start_verbs(&f, is_restart);
-                (name, runner::ExecOutcome::Ran(res))
             });
         }
         let mut out = Vec::new();
@@ -1245,6 +1277,7 @@ impl SupervisorCore {
                 return;
             }
         };
+        self.compose_any_failed = cs.iter().any(|c| c.supervisor_state() == "Failed");
         let live: Vec<String> = cs.iter().map(|c| c.service.clone()).collect();
         for c in &cs {
             let st = c.supervisor_state();
@@ -1259,14 +1292,13 @@ impl SupervisorCore {
                 .compose_tracker
                 .observe(&c.service, &c.state, st, now_ts);
             for d in decisions {
-                let (kind, detail, event_kind) = match d {
+                let (kind, detail) = match d {
                     crate::compose_tracker::ComposeAlert::Down => (
                         crate::alert::AlertKind::ServiceDown,
                         format!(
                             "compose container {} state={} health={}",
                             c.name, c.state, c.health
                         ),
-                        "ServiceDown",
                     ),
                     crate::compose_tracker::ComposeAlert::StateChange => (
                         crate::alert::AlertKind::ContainerStateChange,
@@ -1274,7 +1306,6 @@ impl SupervisorCore {
                             "compose container {} state changed to {} health={}",
                             c.name, c.state, c.health
                         ),
-                        "ContainerStateChange",
                     ),
                     crate::compose_tracker::ComposeAlert::CrashLoop => (
                         crate::alert::AlertKind::ContainerCrashLoop,
@@ -1282,16 +1313,13 @@ impl SupervisorCore {
                             "compose container {} crash-loop (consecutive failures >= threshold)",
                             c.name
                         ),
-                        "ContainerCrashLoop",
                     ),
                     crate::compose_tracker::ComposeAlert::Back => (
                         crate::alert::AlertKind::ServiceBack,
                         format!("compose container {} recovered", c.name),
-                        "ServiceBack",
                     ),
                 };
                 tracing::info!(svc = %c.service, kind = kind.label(), "compose tick 告警决策");
-                let _ = event_kind; // 落库统一走 Alerter 事件 sink (issue #37), 此处仅告警
                 let _ = self
                     .alerter
                     .alert(crate::alert::Alert {
@@ -1318,11 +1346,9 @@ impl SupervisorCore {
         if any_down {
             return self.cfg.poll_unhealthy_sec;
         }
-        // compose 容器有 Failed 也算 down
-        if let Some(cb) = &self.compose
-            && let Ok(cs) = cb.ps()
-            && cs.iter().any(|c| c.supervisor_state() == "Failed")
-        {
+        // compose 容器有 Failed 也算 down (复用上轮 tick_compose 的 ps 快照 —
+        // 现场重查是阻塞 docker 子进程, 且每 tick 已在 tick_compose 查过一次)
+        if self.compose_any_failed {
             return self.cfg.poll_unhealthy_sec;
         }
         self.cfg.poll_healthy_sec
@@ -2742,6 +2768,9 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
+        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
+        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         // streak 3..=TIMEOUT_RESTART_STREAK-1: 连续超时远超旧 3 连败阈值, 不排重启
@@ -2776,6 +2805,9 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
+        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
+        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         core.drive(1000).await;
@@ -2799,6 +2831,9 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
+        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
+        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         core.runners[0].start_retry = true;
@@ -2823,6 +2858,9 @@ mod tests {
             move |_: &ProbeSpec| pc.lock().unwrap().clone(),
             |_svc, _cmd, _env| Ok(()),
         );
+        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
+        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         core.drive(1000).await;
@@ -3253,8 +3291,8 @@ mod tests {
     }
 
     // poll_interval: compose 容器 Failed → poll_unhealthy_sec
-    #[test]
-    fn test_poll_interval_compose_failed() {
+    #[tokio::test]
+    async fn test_poll_interval_compose_failed() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
         let fake = Box::new(FakeCompose::new());
         fake.set_containers(vec![mk_container("postgres", "exited", "", 5432)]);
@@ -3266,6 +3304,9 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
+        // poll_interval 复用上轮 tick_compose 的 ps 快照 (不再现场重查)
+        core.tick_compose(1000).await;
+        assert!(core.compose_any_failed);
         // native 全 Healthy 但 compose 容器 Failed → poll_unhealthy_sec
         assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
     }
