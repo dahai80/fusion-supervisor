@@ -1,8 +1,11 @@
-// compose 容器告警节流 (issue #6): 防止 flapping 容器每 tick 刷 ServiceDown 告警。
-// 纯逻辑, 注入 u64 时间戳 (确定性测试, 同 policy.rs 模式)。tick_compose 调 observe() 取决策再发告警。
+// Compose container alert throttling (issue #6): keeps flapping containers from
+// re-emitting ServiceDown alerts every tick. Pure logic with injected u64 timestamps
+// (deterministic tests, same pattern as policy.rs). tick_compose calls observe() and
+// emits the returned decisions as alerts.
 use std::collections::HashMap;
 
-// 单容器上一轮快照: supervisor_state + docker 原始 state + 上次告警 ts + 连续失败计数 + 已升级标记。
+// Per-container snapshot from the previous round: supervisor_state + raw docker state +
+// last alert ts + consecutive failure count + escalation latch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerRecord {
     pub state: &'static str,
@@ -12,16 +15,16 @@ pub struct ContainerRecord {
     pub escalated: bool,
 }
 
-// observe() 返回的本轮应发告警决策 (0..2)。tick_compose 据此调 alerter.alert。
+// Alert decisions observe() returns for this round (0..2). tick_compose calls alerter.alert with them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeAlert {
-    // 首次失败 / 去抖窗外复发
+    // First failure / recurrence outside the dedup window
     Down,
-    // 失败期间 docker state 变化 (restarting→exited 等) = 新事件
+    // Docker state changed while failing (restarting→exited etc.) = new event
     StateChange,
-    // 连续失败达阈值, 升级告警 (仅一次, 恢复后重置)
+    // Consecutive failures reached the threshold; escalate (once, reset on recovery)
     CrashLoop,
-    // 失败→健康 恢复
+    // Failed → Healthy recovery
     Back,
 }
 
@@ -40,8 +43,9 @@ impl ComposeTracker {
         }
     }
 
-    // 观察一容器当前状态, 返回本轮应发告警决策 + 更新内部快照。
-    // state = supervisor_state() ("Healthy"/"Failed"/...), raw_state = docker state。
+    // Observe a container's current state; returns this round's alert decisions and
+    // updates the internal snapshot.
+    // state = supervisor_state() ("Healthy"/"Failed"/...), raw_state = docker state.
     pub fn observe(
         &mut self,
         name: &str,
@@ -53,7 +57,7 @@ impl ComposeTracker {
         let prev = self.records.get(name).cloned();
         match (prev.as_ref(), state) {
             (None, "Failed") => {
-                // 首见即失败
+                // first sighting is already failing
                 out.push(ComposeAlert::Down);
                 let fail_count = 1;
                 let mut escalated = false;
@@ -73,7 +77,7 @@ impl ComposeTracker {
                 );
             }
             (None, "Healthy") | (None, _) => {
-                // 首见非失败, 仅记快照, 不告警
+                // first sighting not failing; record snapshot only, no alert
                 self.records.insert(
                     name.to_string(),
                     ContainerRecord {
@@ -89,11 +93,11 @@ impl ComposeTracker {
                 let fail_count = p.fail_count + 1;
                 let state_changed = p.raw_state != raw_state;
                 let window_elapsed = now_ts.saturating_sub(p.last_alert_ts) > self.dedup_sec;
-                // 发 ServiceDown 条件: docker state 变化 (新事件) 或 去抖窗外复发
+                // Emit ServiceDown when: docker state changed (new event) or recurrence outside the dedup window
                 if state_changed || window_elapsed {
                     out.push(ComposeAlert::Down);
                 }
-                // 升级: 连续失败达阈值且未升级过
+                // Escalate: consecutive failures reached the threshold and not escalated yet
                 let mut escalated = p.escalated;
                 if fail_count >= self.escalation && !escalated {
                     out.push(ComposeAlert::CrashLoop);
@@ -116,7 +120,7 @@ impl ComposeTracker {
                 );
             }
             (Some(p), "Healthy") => {
-                // 失败→健康: 发 ServiceBack 一次, 重置计数
+                // Failed → Healthy: emit ServiceBack once, reset counters
                 if p.state == "Failed" {
                     out.push(ComposeAlert::Back);
                 }
@@ -132,7 +136,7 @@ impl ComposeTracker {
                 );
             }
             (Some(_), _) => {
-                // 其他态 (Starting/Restarting) 仅更新快照, 不告警
+                // Other states (Starting/Restarting): update snapshot only, no alert
                 self.records.insert(
                     name.to_string(),
                     ContainerRecord {
@@ -148,12 +152,12 @@ impl ComposeTracker {
         out
     }
 
-    // 移除 ps 中已消失的容器 (容器被删/重命名), 避免陈旧快照干扰。
+    // Drop snapshots for containers gone from ps (deleted/renamed) so stale records don't interfere.
     pub fn reap(&mut self, live: &[String]) {
         self.records.retain(|k, _| live.iter().any(|l| l == k));
     }
 
-    // 测试/诊断: 取一容器快照。
+    // Test/diagnostic: fetch one container's snapshot.
     pub fn record(&self, name: &str) -> Option<&ContainerRecord> {
         self.records.get(name)
     }
@@ -163,10 +167,10 @@ impl ComposeTracker {
 mod tests {
     use super::*;
 
-    // 同容器 exited 连续 5 tick (去抖窗内) → 仅首发 Down, 其余抑制
+    // Same container exited for 5 consecutive ticks (within the dedup window) → only the first Down, rest suppressed
     #[test]
     fn test_dedup_repeated_failed_within_window() {
-        // escalation 设高, 此测试只验证去抖 (不混入 CrashLoop)
+        // escalation set high; this test only exercises dedup (no CrashLoop mixed in)
         let mut t = ComposeTracker::new(300, 50);
         let d0 = t.observe("redis", "exited", "Failed", 1000);
         assert_eq!(d0, vec![ComposeAlert::Down]);
@@ -174,14 +178,14 @@ mod tests {
             let d = t.observe("redis", "exited", "Failed", ts);
             assert!(
                 d.is_empty(),
-                "去抖窗内同 state 重复失败应抑制, ts={ts} 得 {:?}",
+                "repeated failure with same state within dedup window should be suppressed, ts={ts} got {:?}",
                 d
             );
         }
         assert_eq!(t.record("redis").unwrap().fail_count, 5);
     }
 
-    // docker state 变化 (restarting→exited) → 新告警, 即使在去抖窗内
+    // Docker state change (restarting→exited) → new alert, even within the dedup window
     #[test]
     fn test_state_change_re_alerts_within_window() {
         let mut t = ComposeTracker::new(300, 10);
@@ -189,67 +193,71 @@ mod tests {
         let d = t.observe("redis", "exited", "Failed", 1002);
         assert!(
             d.contains(&ComposeAlert::Down),
-            "state 变化应重新告警, 得 {:?}",
+            "state change should re-alert, got {:?}",
             d
         );
     }
 
-    // 失败→健康 → ServiceBack 一次
+    // Failed → Healthy → ServiceBack once
     #[test]
     fn test_service_back_on_recovery() {
         let mut t = ComposeTracker::new(300, 10);
         t.observe("redis", "exited", "Failed", 1000);
         let d = t.observe("redis", "running", "Healthy", 1010);
         assert_eq!(d, vec![ComposeAlert::Back]);
-        // 再 tick 健康 → 不再发 Back
+        // another healthy tick → no more Back
         let d2 = t.observe("redis", "running", "Healthy", 1020);
-        assert!(d2.is_empty(), "持续健康不应再发 Back");
+        assert!(d2.is_empty(), "sustained health should not re-emit Back");
         assert_eq!(t.record("redis").unwrap().fail_count, 0);
     }
 
-    // 连续失败达阈值 → CrashLoop 升级 (仅一次), 恢复后重置可再升级
+    // Consecutive failures reach the threshold → CrashLoop escalation (once), reset on recovery allows re-escalation
     #[test]
     fn test_escalation_after_threshold() {
         let mut t = ComposeTracker::new(300, 3);
         // tick1: Down, fail_count=1
         let d1 = t.observe("redis", "exited", "Failed", 1000);
         assert_eq!(d1, vec![ComposeAlert::Down]);
-        // tick2: fail_count=2, 未达阈值
+        // tick2: fail_count=2, below threshold
         let d2 = t.observe("redis", "exited", "Failed", 1002);
         assert!(d2.is_empty());
-        // tick3: fail_count=3 达阈值 → CrashLoop
+        // tick3: fail_count=3 reaches threshold → CrashLoop
         let d3 = t.observe("redis", "exited", "Failed", 1004);
         assert!(
             d3.contains(&ComposeAlert::CrashLoop),
-            "达阈值应升级, 得 {:?}",
+            "reaching threshold should escalate, got {:?}",
             d3
         );
         assert!(t.record("redis").unwrap().escalated);
-        // tick4: 仍失败, 不再升级
+        // tick4: still failing, no re-escalation
         let d4 = t.observe("redis", "exited", "Failed", 1006);
         assert!(
             !d4.contains(&ComposeAlert::CrashLoop),
-            "已升级不应重复, 得 {:?}",
+            "already escalated should not repeat, got {:?}",
             d4
         );
-        // 恢复 → 重置
+        // recovery → reset
         t.observe("redis", "running", "Healthy", 1010);
         assert!(!t.record("redis").unwrap().escalated);
     }
 
-    // 去抖窗外复发 → 重新发 Down
+    // Recurrence outside the dedup window → Down again
     #[test]
     fn test_re_alert_after_window() {
         let mut t = ComposeTracker::new(300, 50);
         t.observe("redis", "exited", "Failed", 1000);
-        // 窗内抑制
+        // within window suppressed
         assert!(t.observe("redis", "exited", "Failed", 1100).is_empty());
-        // 窗外复发 → Down
+        // outside window recurs → Down
         let d = t.observe("redis", "exited", "Failed", 1400);
-        assert!(d.contains(&ComposeAlert::Down), "窗外应复发, 得 {:?}", d);
+        assert!(
+            d.contains(&ComposeAlert::Down),
+            "should recur outside the window, got {:?}",
+            d
+        );
     }
 
-    // 容器消失 → reap 清除快照
+    // Container vanishes → reap clears its snapshot
     #[test]
     fn test_reap_removes_vanished() {
         let mut t = ComposeTracker::new(300, 5);
@@ -257,6 +265,9 @@ mod tests {
         t.observe("postgres", "running", "Healthy", 1000);
         t.reap(&["redis".to_string()]);
         assert!(t.record("redis").is_some());
-        assert!(t.record("postgres").is_none(), "消失容器应被 reap");
+        assert!(
+            t.record("postgres").is_none(),
+            "vanished container should be reaped"
+        );
     }
 }

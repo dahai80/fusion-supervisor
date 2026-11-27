@@ -1,11 +1,11 @@
-// issue #113: spawn_backup detached — 调度/RPC 不再持核心锁 await 全程 dump;
-// last_backup_ts 即时推进 + meta 持久化; 失败事件经独立 Alerter 落 event 表。
+// issue #113: spawn_backup detached — scheduling/RPC no longer hold the core lock across the whole dump await;
+// last_backup_ts advances immediately + meta persisted; failure events land in the event table via an independent Alerter.
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::supervisor::SupervisorCore;
 use std::sync::{Mutex, OnceLock};
 
-// 可重入 env 测试锁 (同 #134: 线程本地深度 + 最外层持 std Mutex),
-// EnvGuard 与测试体同锁域, set/恢复窗口对其他 env 测试原子。
+// Reentrant env test lock (same as #134: thread-local depth + outermost layer holds a std Mutex),
+// EnvGuard and test body share one lock domain, set/restore windows are atomic vs other env tests.
 thread_local! {
     static ENV_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -72,8 +72,8 @@ fn def(name: &str, port: u16) -> ServiceDef {
     }
 }
 
-// dump bin 指向不存在路径 → spawn fail → BackupFailed 事件 (fail-closed 路径
-// 正好用来证明 detached 任务确实跑完并落库)。
+// dump bin points at a nonexistent path → spawn fail → BackupFailed event (the fail-closed
+// path conveniently proves the detached task actually ran and persisted).
 fn cfg(db_path: &std::path::Path) -> fusion_supervisor::config::Config {
     fusion_supervisor::config::Config {
         db_path: db_path.to_path_buf(),
@@ -83,8 +83,8 @@ fn cfg(db_path: &std::path::Path) -> fusion_supervisor::config::Config {
 }
 
 #[tokio::test]
-// env_lock (std Mutex) 须跨 await 持有 — FUSION_BACKUP_TARGET 是全局 env,
-// spawn 出的 detached 任务在锁内读它; tokio 单线程测试内无并发争锁。
+// env_lock (std Mutex) must be held across await — FUSION_BACKUP_TARGET is a global env var,
+// read by the spawned detached task while we hold the lock; no concurrent contention in a single-threaded tokio test.
 #[allow(clippy::await_holding_lock)]
 async fn test_spawn_backup_detached_and_persisted() {
     let _g = env_lock();
@@ -98,17 +98,17 @@ async fn test_spawn_backup_detached_and_persisted() {
         |_, _, _| Ok(()),
     );
     let mut core = core;
-    assert_eq!(core.last_backup_ts, 0, "新库无 meta → 0");
+    assert_eq!(core.last_backup_ts, 0, "fresh db has no meta → 0");
     let now: u64 = 1_700_000_000;
     core.spawn_backup(now);
-    // 锁内只构造 + spawn — 调用方立即返回, 时间戳已推进
-    assert_eq!(core.last_backup_ts, now, "spawn 后立即推进");
+    // Under the lock only construct + spawn — caller returns immediately, timestamp already advanced
+    assert_eq!(core.last_backup_ts, now, "advanced immediately after spawn");
     assert_eq!(
         core.store.get_meta("last_backup_ts"),
         Some(now),
-        "meta 已持久化 (reload 不重触发)"
+        "meta persisted (reload does not re-trigger)"
     );
-    // detached 任务跑完 → BackupFailed 事件落 event 表 (fake fail 路径)
+    // detached task finished → BackupFailed event lands in the event table (fake fail path)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let evs = core.store.recent_events("backup", 10).unwrap();
@@ -117,7 +117,7 @@ async fn test_spawn_backup_detached_and_persisted() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "BackupFailed 事件未在 10s 内落库"
+            "BackupFailed event not persisted within 10s"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -128,23 +128,24 @@ async fn test_last_backup_ts_loaded_from_meta() {
     let _g = env_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let db = tmp.path().join("history.db");
-    // new_with_fns 构造器用独立临时库 (不接 cfg.db_path), 构造器 meta 恢复行为
-    // 在 store 层验证: 同一 db 重开, set 的值必须可读 (构造器一行 get_meta 即依赖此语义)
+    // new_with_fns constructor uses its own temp db (not cfg.db_path); the constructor's meta-restore
+    // behavior is verified at the store layer: reopening the same db must read back the set value
+    // (the constructor's single get_meta line depends on this semantics)
     {
         let store = fusion_supervisor::store::HistoryStore::open(&db).unwrap();
         store.set_meta("last_backup_ts", 1_700_000_100);
     }
-    // 重开 (模拟 reload) → meta 持久化
+    // Reopen (simulating reload) → meta persisted
     let store = fusion_supervisor::store::HistoryStore::open(&db).unwrap();
     assert_eq!(
         store.get_meta("last_backup_ts"),
         Some(1_700_000_100),
-        "reload 应从 meta 恢复 last_backup_ts"
+        "reload should restore last_backup_ts from meta"
     );
 }
 
-// issue #113: 调度到期 → check_backup_schedule 触发 spawn_backup (即时返回 true,
-// 时间戳推进, 不再持锁等 dump)
+// issue #113: schedule due → check_backup_schedule triggers spawn_backup (returns true immediately,
+// timestamp advanced, no longer holds the lock waiting for the dump)
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn test_check_backup_schedule_triggers_spawn() {
@@ -159,8 +160,11 @@ async fn test_check_backup_schedule_triggers_spawn() {
         |_, _, _| Ok(()),
     );
     let mut core = core;
-    assert!(core.check_backup_schedule(1_000).await, "last=0 → 到期触发");
+    assert!(
+        core.check_backup_schedule(1_000).await,
+        "last=0 → due, triggers"
+    );
     assert_eq!(core.last_backup_ts, 1_000);
-    // 推进后同刻不再触发
+    // Already advanced, no re-trigger at the same instant
     assert!(!core.check_backup_schedule(1_001).await);
 }

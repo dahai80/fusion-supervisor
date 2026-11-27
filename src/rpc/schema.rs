@@ -37,12 +37,12 @@ pub enum Method {
     Ping,
     Logs,
     Shutdown,
-    // issue #9: 摘流量 (单服务或全部) + 零停机换版
+    // issue #9: drain traffic (single service or all) + zero-downtime rollout
     Drain,
     Rollout,
-    // issue #10: NAS 备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)
+    // issue #10: NAS backup (Postgres + Qdrant → FUSION_BACKUP_TARGET)
     Backup,
-    // PRD app-tiering (issue #62): boot 分级启动面
+    // PRD app-tiering (issue #62): boot-tier startup face
     Boot,
     BootPin,
     BootGroup,
@@ -100,7 +100,7 @@ mod tests {
         assert!(matches!(parse_method("up"), Some(Method::Up)));
         assert!(matches!(parse_method("ping"), Some(Method::Ping)));
         assert!(matches!(parse_method("SHUTDOWN"), Some(Method::Shutdown)));
-        // PRD app-tiering: boot 三方法解析
+        // PRD app-tiering: boot three-method parsing
         assert!(matches!(parse_method("boot"), Some(Method::Boot)));
         assert!(matches!(parse_method("boot.pin"), Some(Method::BootPin)));
         assert!(matches!(

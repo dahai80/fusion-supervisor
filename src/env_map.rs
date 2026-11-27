@@ -1,18 +1,22 @@
-// issue #8: 依赖 sidecar (PG/Redis/Qdrant) 的 native 服务需显式注入连接 env。
-// 本模块按服务名给出所需连接变量, 并从 .env / 环境变量解析具体值。
-// fail-closed: 必需值解析不出 → 返回 Err, 拒绝启动该服务 (非静默降级)。
-// issue #78: 注入不再 gate 在 compose 开关上 — 此前两处调用点都先判
-// compose.enabled, 默认 (compose off) 时 fusion-cowork 静默跑 SQLite、
-// fusion-rag 静默跑 :memory:。现在两个平面 (bare-metal compose off /
-// 容器化 compose on) 均注入; Qdrant 例外: 本地 6333 不可达时跳过
-// QDRANT_URL 注入 (rag 有 :memory: 兜底), 不 fail-closed。
+// issue #8: native services depending on sidecars (PG/Redis/Qdrant) need
+// explicit connection env injection. This module maps service names to the
+// required connection variables and resolves concrete values from
+// .env / process env.
+// fail-closed: a required value that cannot be resolved -> Err, refusing to
+// start the service (no silent degradation).
+// issue #78: injection is no longer gated on the compose flag — both call
+// sites previously checked compose.enabled first, so by default (compose
+// off) fusion-cowork silently ran SQLite and fusion-rag silently ran
+// :memory:. Both planes (bare-metal compose off / containerized compose on)
+// now inject; Qdrant exception: when local 6333 is unreachable, skip
+// QDRANT_URL injection (rag has a :memory: fallback), not fail-closed.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-// 依赖 sidecar 的 native 服务及其所需连接 env key 列表。
-// 未在表中的服务 → 无注入, 保留现状。
+// Native services that depend on sidecars, plus their required connection
+// env key lists. Services not in the table -> no injection, unchanged.
 fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
     match svc {
         "fusion-identity" => Some(&["DATABASE_URL"]),
@@ -23,26 +27,34 @@ fn required_vars(svc: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-// issue #29: shell-ecosystem 模块服务的注册 env。
-// issue #45: business 平台服务的 FUSION_CLIENT_KEY (gateway 客户端 key, 约定 1)
-// 也走此注入通道 — 三个 arg-less start.sh 均硬性要求该 key, 缺失 fail-fast。
-// 这些注入不受 compose 开关控制 (与 sidecar 连接 env 不同)。
-// issue #85: FUSION_CLIENT_KEY 反转默认 — 全部托管 native 服务统一注入,
-// 仅明确排除的服务例外。手工 allowlist 已三次漏登 (fusion-rag 2026-10-31
-// 夜 / ai-trysuite #84 / fusion-code-modenization #85), 每个新 gateway
-// 消费服务都会静默降级 (回退 daemon env 快照里已轮换失效的旧别名
-// FUSION_MLX_API_KEY → 401) 直到有人注意到。不读该 env 的服务直接忽略,
-// 注入无副作用; fail-fast `:?` 消费方由注入满足; 解析链不变
-// (进程 env → env_file → gateway config 兜底, 全缺 Err 拒启动)。
-// 排除表 (不注入 FUSION_CLIENT_KEY):
-// - fusion-gateway: 上游 config.go 刻意不 BindEnv FUSION_CLIENT_KEY —
-//   ambient 客户端 key 会经 api_key_env 引用覆写 mlx backend key
-//   (fusion-gateway#412), 注入属于越权。
-// - fusion-mlx: 推理服务端, 鉴权单一真源是 settings.json (strip_env_for
-//   同理), 客户端 key 不该进服务端 env。
-// - 纯静态托管 (http.server web/dist, 不打 gateway)。
-// - fusion-health (issue #88): 直连 mlx :11434 的非 gateway 消费方,
-//   v1.2.3 起 env 优先的 _mlx_key() 见 FUSION_CLIENT_KEY 即采用 → 401。
+// issue #29: registration env for shell-ecosystem module services.
+// issue #45: business-plane services' FUSION_CLIENT_KEY (gateway client key,
+// conventions #1) goes through this injection channel too — all three
+// arg-less start.sh scripts hard-require this key, missing = fail-fast.
+// These injections are not gated on the compose flag (unlike sidecar
+// connection env).
+// issue #85: FUSION_CLIENT_KEY default inverted — inject into every managed
+// native service, except services explicitly excluded. The manual allowlist
+// missed entries three times (fusion-rag 2026-10-31 night / ai-trysuite #84 /
+// fusion-code-modenization #85); every new gateway-consuming service would
+// silently degrade (falling back to the stale rotated alias FUSION_MLX_API_KEY
+// in the daemon env snapshot -> 401) until someone noticed. Services that
+// never read this env simply ignore it, injection has no side effects;
+// fail-fast `:?` consumers are satisfied by the injection; the resolve chain
+// is unchanged (process env -> env_file -> gateway config fallback, all
+// missing -> Err refusing to start).
+// Exclusion table (no FUSION_CLIENT_KEY injection):
+// - fusion-gateway: upstream config.go deliberately does not BindEnv
+//   FUSION_CLIENT_KEY — an ambient client key would overwrite the mlx backend
+//   key via the api_key_env reference (fusion-gateway#412), injection is
+//   out of bounds.
+// - fusion-mlx: inference server, the single source of auth truth is
+//   settings.json (same for strip_env_for); the client key must not enter
+//   the server env.
+// - pure static hosting (http.server web/dist, never hits the gateway).
+// - fusion-health (issue #88): non-gateway consumer connecting directly to
+//   mlx :11434; since v1.2.3 the env-first _mlx_key() adopts
+//   FUSION_CLIENT_KEY on sight -> 401.
 fn shell_vars(svc: &str) -> Vec<&'static str> {
     let mut vars: Vec<&'static str> = Vec::new();
     if !matches!(
@@ -57,13 +69,15 @@ fn shell_vars(svc: &str) -> Vec<&'static str> {
         vars.push("FUSION_CLIENT_KEY");
     }
     match svc {
-        // issue #54: 上游已迁 conventions §6 新名 — cowork shell_registry.py 读
-        // FUSION_SHELL_GATEWAY_URL + FUSION_ADMIN_KEY (URL 尚未迁 BASE_URL,
-        // 迁移期保留旧名); plugins console v0.4.7 (fusion-plugins-ecosystem#39)
-        // 读 FUSION_GATEWAY_BASE_URL + FUSION_ADMIN_KEY, 不再认旧名。
-        // issue #105: 加 FUSION_COWORK_WORKSPACE_ROOT — web_api.py 的
-        // /api/workspaces/system-dirs 用它限定目录选择器 browsable 根,
-        // 缺省回退 Path.home() 会暴露整个家目录树给终端用户。
+        // issue #54: upstream migrated to the conventions §6 new names — cowork
+        // shell_registry.py reads FUSION_SHELL_GATEWAY_URL + FUSION_ADMIN_KEY
+        // (URL not yet migrated to BASE_URL, old name kept during migration);
+        // plugins console v0.4.7 (fusion-plugins-ecosystem#39) reads
+        // FUSION_GATEWAY_BASE_URL + FUSION_ADMIN_KEY, no longer the old name.
+        // issue #105: added FUSION_COWORK_WORKSPACE_ROOT — web_api.py's
+        // /api/workspaces/system-dirs uses it to bound the directory picker's
+        // browsable root; the Path.home() default would expose the entire home
+        // directory tree to end users.
         "fusion-cowork-web" => vars.extend([
             "FUSION_SHELL_GATEWAY_URL",
             "FUSION_ADMIN_KEY",
@@ -78,39 +92,47 @@ fn shell_vars(svc: &str) -> Vec<&'static str> {
     vars
 }
 
-// 该服务是否需要 shell 注册 env (调用方无条件注入, 不 gate 在 compose 上)。
-// issue #85 反转默认后, 除排除表外的全部服务都需要 (FUSION_CLIENT_KEY)。
+// Whether the service needs shell registration env (caller injects
+// unconditionally, not gated on compose). After the issue #85 default
+// inversion, every service outside the exclusion table needs it
+// (FUSION_CLIENT_KEY).
 pub fn needs_shell_env(svc: &str) -> bool {
     !shell_vars(svc).is_empty()
 }
 
-// issue #39/#40: 启动子进程前须剥离的 env 变量名。
-// fusion-mlx 的 start.sh 中 FUSION_MLX_API_KEY env 优先级高于 settings.json,
-// daemon env 快照 (来自 monorepo .env) 会钉死旧 key → supervisor 每次重启
-// 都让新实例用旧 key 鉴权, 所有 settings.json 客户端 401。
-// 剥离后 start.sh 每次现场从 ~/.fusion-mlx/settings.json 解析, 单一真源。
-// compose check_env 仍要求 daemon 自身持有该 var (gate compose 容器, 不受影响)。
+// issue #39/#40: env variable names to strip before spawning a child process.
+// In fusion-mlx's start.sh the FUSION_MLX_API_KEY env outranks settings.json,
+// so the daemon env snapshot (from the monorepo .env) pins the old key — every
+// supervisor restart would have the new instance authenticate with the old
+// key, 401 for all settings.json clients. After stripping, start.sh resolves
+// from ~/.fusion-mlx/settings.json each time, single source of truth.
+// compose check_env still requires the daemon itself to hold the var (gates
+// compose containers, unaffected).
 pub fn strip_env_for(svc: &str) -> &'static [&'static str] {
     match svc {
         "fusion-mlx" => &["FUSION_MLX_API_KEY"],
-        // issue #45: fusion-health 的 config.py env 优先级高于 ~/.fusion-mlx/
-        // settings.json — daemon 快照里的旧 key 让 backend 探活 401 (503 degraded)。
-        // 剥离后其配置回退解析 settings.json, 与 mlx 实例的 key 单一真源一致。
-        // issue #88: 加剥 FUSION_CLIENT_KEY — v1.2.3 (upstream #28) 起 _mlx_key()
-        // 见到该 env 就优先采用, 但 fusion-health 直连 :11434 (非 gateway 消费方),
-        // client key 对 mlx 无效 → backend 401 → /api/v1/health 恒 503 degraded。
-        // 同时加入 shell_vars 排除表不注入, 双保险 (strip 兜底手动启动带 .env 的继承)。
+        // issue #45: fusion-health's config.py env outranks ~/.fusion-mlx/
+        // settings.json — the old key in the daemon snapshot makes the backend
+        // probe 401 (503 degraded). After stripping its config falls back to
+        // resolving settings.json, single source of truth with the mlx instance.
+        // issue #88: also strip FUSION_CLIENT_KEY — since v1.2.3 (upstream #28)
+        // _mlx_key() adopts this env on sight, but fusion-health connects
+        // directly to :11434 (not a gateway consumer); the client key is
+        // invalid for mlx -> backend 401 -> /api/v1/health permanently 503
+        // degraded. Also added to the shell_vars exclusion table so it is not
+        // injected — belt and braces (strip covers manual starts inheriting .env).
         "fusion-health" => &["FUSION_MLX_API_KEY", "FUSION_CLIENT_KEY"],
         _ => &[],
     }
 }
 
-// 返回服务所需的全部连接变量名 (供调用方判断是否需注入)。
+// Returns all connection variable names the service needs (for callers to
+// decide whether injection is required).
 pub fn needs_injection(svc: &str) -> bool {
     required_vars(svc).is_some()
 }
 
-// 解析单个环境变量值: 先查进程 env, 再查 env_file, 均无则用默认。
+// Resolve a single env value: process env first, then env_file, else None.
 fn resolve(key: &str, env_file: &std::path::Path) -> Option<String> {
     if let Ok(v) = std::env::var(key)
         && !v.is_empty()
@@ -120,7 +142,7 @@ fn resolve(key: &str, env_file: &std::path::Path) -> Option<String> {
     read_env_file(env_file).get(key).cloned()
 }
 
-// 解析 .env 文件为 HashMap (key → value), 跳过注释/空行。
+// Parse a .env file into a HashMap (key -> value), skipping comments/blank lines.
 fn read_env_file(path: &std::path::Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let text = match std::fs::read_to_string(path) {
@@ -139,16 +161,22 @@ fn read_env_file(path: &std::path::Path) -> HashMap<String, String> {
     map
 }
 
-// 为某服务解析需注入的连接 env (name → value)。
-// fail-closed: 任一必需值无法解析 → Err (带服务名与缺失 key)。
-// 非依赖服务 (required_vars=None) → 空 map (无注入, 不报错)。
-// issue #78: QDRANT_URL 注入前先探本地 6333 可达性 — qdrant 容器没起时
-// 跳过该 key (fusion-rag 上游有 :memory: 兜底), 不让整个注入失败。
-// issue #78 补: FUSION_PG_PASSWORD 缺失时探本地 5432 — native 平面 (compose_on=false)
-// 是 brew trust auth (fusion-db-conventions-1030 §1, 根本没有密码), 可达则注入
-// 无密码连接串; 不可达则跳过 DATABASE_URL (应用走 SQLite 兜底)。
-// compose 平面 (compose_on=true) sidecar PG 是密码认证, 缺密码 = 配置错误,
-// 保持 fail-closed 拒绝 (不静默降级到 trust 串打错库)。
+// Resolve the connection env to inject for a service (name -> value).
+// fail-closed: any required value unresolvable -> Err (with service name and
+// the missing key).
+// Non-dependent services (required_vars=None) -> empty map (no injection, no
+// error).
+// issue #78: probe local 6333 reachability before injecting QDRANT_URL — when
+// the qdrant container is down, skip the key (fusion-rag upstream has a
+// :memory: fallback) instead of failing the whole injection.
+// issue #78 addendum: when FUSION_PG_PASSWORD is missing, probe local 5432 —
+// the native plane (compose_on=false) uses brew trust auth
+// (fusion-db-conventions-1030 §1, there is no password at all); reachable ->
+// inject a passwordless connection string, unreachable -> skip DATABASE_URL
+// (the app falls back to SQLite).
+// The compose plane (compose_on=true) sidecar PG uses password auth; a missing
+// password = configuration error, stay fail-closed (no silent degradation to a
+// trust string hitting the wrong database).
 pub fn native_env_for(
     svc: &str,
     env_file: &std::path::Path,
@@ -159,7 +187,8 @@ pub fn native_env_for(
     native_env_for_opts(svc, env_file, compose_on, pg_up, qdrant_up)
 }
 
-// issue #78: 可测版本 — pg_up/qdrant_up 由测试注入 (不做真实网络探测)。
+// issue #78: testable variant — pg_up/qdrant_up injected by tests (no real
+// network probing).
 pub fn native_env_for_opts(
     svc: &str,
     env_file: &std::path::Path,
@@ -170,7 +199,7 @@ pub fn native_env_for_opts(
     let Some(keys) = required_vars(svc) else {
         return Ok(HashMap::new());
     };
-    // PG 连接串依赖的公共片段
+    // Common fragments the PG connection string depends on
     let pg_user = resolve("FUSION_PG_USER", env_file);
     let pg_pw = resolve("FUSION_PG_PASSWORD", env_file);
     let pg_host = "localhost";
@@ -187,20 +216,23 @@ pub fn native_env_for_opts(
                         let user = user.as_deref().unwrap_or("fusion");
                         format!("postgresql://{user}:{pw}@{pg_host}:{pg_port}/{db}")
                     }
-                    // issue #78 补: compose 平台 sidecar PG 密码认证, 缺密码 =
-                    // 配置错误, 保持 fail-closed (check_env 之外的二道防线)。
+                    // issue #78 addendum: compose-plane sidecar PG uses password
+                    // auth; a missing password = configuration error, stay
+                    // fail-closed (second line of defense beyond check_env).
                     (None, _) if compose_on => {
                         bail!(
-                            "FUSION_PG_PASSWORD 缺失 — 无法为 {svc} 构造 DATABASE_URL (compose 平面 fail-closed)"
+                            "FUSION_PG_PASSWORD missing — cannot build DATABASE_URL for {svc} (compose plane fail-closed)"
                         );
                     }
-                    // issue #78 补: native 平面 brew trust auth 无密码 —
-                    // PG 可达即注入无密码串 (FUSION_PG_USER 缺省省略 user
-                    // 段, libpq/asyncpg 默认 OS user); 不可达跳过让应用兜底。
+                    // issue #78 addendum: native-plane brew trust auth has no
+                    // password — reachable PG -> inject the passwordless string
+                    // (missing FUSION_PG_USER omits the user segment; libpq/
+                    // asyncpg default to the OS user); unreachable -> skip and
+                    // let the app fall back.
                     (None, _) if pg_up => {
                         tracing::info!(
                             svc,
-                            "FUSION_PG_PASSWORD 未设但 5432 可达 (trust auth), 注入无密码 DATABASE_URL"
+                            "FUSION_PG_PASSWORD unset but 5432 reachable (trust auth), injecting passwordless DATABASE_URL"
                         );
                         match &pg_user {
                             Some(u) => format!("postgresql://{u}@{pg_host}:{pg_port}/{db}"),
@@ -211,7 +243,7 @@ pub fn native_env_for_opts(
                         skipped = true;
                         tracing::info!(
                             svc,
-                            "FUSION_PG_PASSWORD 未设且 5432 不可达, 跳过 DATABASE_URL 注入"
+                            "FUSION_PG_PASSWORD unset and 5432 unreachable, skipping DATABASE_URL injection"
                         );
                         continue;
                     }
@@ -223,32 +255,34 @@ pub fn native_env_for_opts(
                     skipped = true;
                     tracing::info!(
                         svc,
-                        "qdrant 127.0.0.1:6333 不可达, 跳过 QDRANT_URL 注入 (rag 走 :memory: 兜底)"
+                        "qdrant 127.0.0.1:6333 unreachable, skipping QDRANT_URL injection (rag falls back to :memory:)"
                     );
                     continue;
                 }
                 "http://localhost:6333".to_string()
             }
-            other => bail!("env_map: 未知连接 key {other} for {svc}"),
+            other => bail!("env_map: unknown connection key {other} for {svc}"),
         };
         out.insert((*k).to_string(), val);
     }
-    // 被跳过的 key (qdrant down / pg down) 允许空 map (应用有兜底);
-    // 其余情况空 map = 解析异常, fail-closed。
+    // Skipped keys (qdrant down / pg down) allow an empty map (the app has a
+    // fallback); any other empty map = resolution anomaly, fail-closed.
     if out.is_empty() && !skipped {
-        bail!("env_map: {svc} 所需连接变量解析为空 (fail-closed)");
+        bail!("env_map: {svc} required connection variables resolved to empty (fail-closed)");
     }
-    tracing::info!(svc, keys = ?keys, "native env 注入解析完成");
+    tracing::info!(svc, keys = ?keys, "native env injection resolved");
     Ok(out)
 }
 
-// issue #78: 本地 qdrant (127.0.0.1:6333) 可达性探测, 300ms 超时。
-// 探测失败不阻断注入 (调用方跳过 QDRANT_URL, rag 走上游兜底)。
+// issue #78: local qdrant (127.0.0.1:6333) reachability probe, 300ms timeout.
+// A failed probe does not block injection (caller skips QDRANT_URL; rag falls
+// back upstream).
 fn qdrant_reachable() -> bool {
     tcp_reachable(6333, "qdrant")
 }
 
-// issue #78 补: 本地 PG (127.0.0.1:5432) 可达性探测 (trust auth 佐证)。
+// issue #78 addendum: local PG (127.0.0.1:5432) reachability probe (corroborates
+// trust auth).
 fn pg_reachable() -> bool {
     tcp_reachable(5432, "postgres")
 }
@@ -258,22 +292,25 @@ fn tcp_reachable(port: u16, what: &str) -> bool {
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)) {
         Ok(_) => true,
         Err(e) => {
-            tracing::info!(err = %e, what, port, "探测失败, 对应连接 env 将跳过注入");
+            tracing::info!(err = %e, what, port, "probe failed, the matching connection env will be skipped");
             false
         }
     }
 }
 
-// issue #29: 解析某服务的 shell 注册 env。
-// 解析顺序 (与 trainer-bridge.sh 自读 gateway config 的模式一致):
-//   进程 env → env_file → 兜底
-// - FUSION_SHELL_GATEWAY_URL / FUSION_GATEWAY_BASE_URL: 兜底 http://127.0.0.1:11432
-//   (本地网关固定端口; issue #54 起按消费方分用新旧 URL 名)
-// - FUSION_ADMIN_KEY: 兜底读 fusion-gateway config.yaml web_shell.admin_key
-//   (只读, 不改写上游), 路径由 FUSION_GATEWAY_CONFIG 覆盖
-// - FUSION_TRAINER_BRIDGE_KEY: 无兜底, env/env_file 均无 → fail-closed Err
-//   (bridge 自身要求此 key, 缺了起不来, 早失败早告警)
-// 非 shell 模块服务 → 空 map。
+// issue #29: resolve a service's shell registration env.
+// Resolve order (mirrors trainer-bridge.sh reading gateway config itself):
+//   process env -> env_file -> fallback
+// - FUSION_SHELL_GATEWAY_URL / FUSION_GATEWAY_BASE_URL: fallback
+//   http://127.0.0.1:11432 (local gateway fixed port; since issue #54 the old
+//   vs new URL name is split per consumer)
+// - FUSION_ADMIN_KEY: fallback reads fusion-gateway config.yaml
+//   web_shell.admin_key (read-only, never rewrites upstream), path overridden
+//   by FUSION_GATEWAY_CONFIG
+// - FUSION_TRAINER_BRIDGE_KEY: no fallback, neither env nor env_file ->
+//   fail-closed Err (the bridge requires this key to start; fail early, alert
+//   early)
+// Non-shell-module services -> empty map.
 pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, String>> {
     // issue #101: fusion-health audit-key persistence, injected additively
     // before the shell_vars gate (fusion-health is excluded from FUSION_CLIENT_KEY
@@ -294,21 +331,23 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
                 let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
                 out.insert(k.to_string(), v);
             }
-            // issue #54: admin key 发布到新名 FUSION_ADMIN_KEY (conventions §1),
-            // 兜底仍只读 gateway config web_shell.admin_key, 不改上游。
+            // issue #54: admin key published under the new name FUSION_ADMIN_KEY
+            // (conventions §1); the fallback still reads gateway config
+            // web_shell.admin_key read-only, never rewrites upstream.
             "FUSION_ADMIN_KEY" => {
                 let v = match resolve(k, env_file) {
                     Some(v) => v,
                     None => read_gateway_admin_key().with_context(|| {
                         format!(
-                            "FUSION_ADMIN_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
-                                 无法为 {svc} 注册 shell (fail-closed)"
+                            "FUSION_ADMIN_KEY missing — neither env nor .env has it and gateway config is unreadable, \
+                                 cannot register shell for {svc} (fail-closed)"
                         )
                     })?,
                 };
                 out.insert(k.to_string(), v);
             }
-            // issue #54: plugins console v0.4.7 读的新 URL 变量, 兜底同本地网关。
+            // issue #54: the new URL variable read by plugins console v0.4.7,
+            // same fallback as the local gateway.
             "FUSION_GATEWAY_BASE_URL" => {
                 let v = resolve(k, env_file).unwrap_or_else(|| "http://127.0.0.1:11432".into());
                 out.insert(k.to_string(), v);
@@ -316,39 +355,43 @@ pub fn shell_env_for(svc: &str, env_file: &Path) -> Result<HashMap<String, Strin
             "FUSION_TRAINER_BRIDGE_KEY" => {
                 let v = resolve(k, env_file).with_context(|| {
                     format!(
-                        "FUSION_TRAINER_BRIDGE_KEY 缺失 — bridge 拒绝启动 (fail-closed, svc {svc})"
+                        "FUSION_TRAINER_BRIDGE_KEY missing — bridge refuses to start (fail-closed, svc {svc})"
                     )
                 })?;
                 out.insert(k.to_string(), v);
             }
-            // issue #45: business 平台 gateway 客户端 key — 解析顺序同 shell 注册:
-            // 进程 env → env_file → 兜底读 gateway config auth.api_keys (优先 name=admin
-            // 且 allowed_models 含 * 的全模型 key; 否则第一条)。三服务 start.sh 均
-            // `:?` 硬性要求, 全缺 → fail-closed Err (早失败早告警)。
+            // issue #45: business-plane gateway client key — resolve order same
+            // as shell registration: process env -> env_file -> fallback reading
+            // gateway config auth.api_keys (prefer the name=admin all-model key
+            // whose allowed_models includes *; else the first entry). All three
+            // services' start.sh hard-require it with `:?`; all missing ->
+            // fail-closed Err (fail early, alert early).
             "FUSION_CLIENT_KEY" => {
                 let v = match resolve(k, env_file) {
                     Some(v) => v,
                     None => read_gateway_client_key().with_context(|| {
                         format!(
-                            "FUSION_CLIENT_KEY 缺失 — env/.env 均无且 gateway config 不可读, \
-                             无法为 {svc} 启动 (fail-closed)"
+                            "FUSION_CLIENT_KEY missing — neither env nor .env has it and gateway config is unreadable, \
+                             cannot start {svc} (fail-closed)"
                         )
                     })?,
                 };
                 out.insert(k.to_string(), v);
             }
-            // issue #105: workspace 根是可选的收敛配置, 非启动依赖 — env/env_file
-            // 均缺时不注入 (上游 web_api.py 回退 Path.home(), 与未修复前行为一致),
-            // 不 fail-closed, 遵守 boot contract (缺省项不得阻塞启动)。
+            // issue #105: the workspace root is optional hardening config, not a
+            // startup dependency — when both env and env_file lack it, skip
+            // injection (upstream web_api.py falls back to Path.home(), same as
+            // pre-fix behavior), not fail-closed, honoring the boot contract
+            // (absent optional config must not block startup).
             "FUSION_COWORK_WORKSPACE_ROOT" => {
                 if let Some(v) = resolve(k, env_file) {
                     out.insert(k.to_string(), v);
                 }
             }
-            other => bail!("env_map: 未知 shell 注册 key {other} for {svc}"),
+            other => bail!("env_map: unknown shell registration key {other} for {svc}"),
         }
     }
-    tracing::info!(svc, keys = ?keys, "shell 注册 env 解析完成");
+    tracing::info!(svc, keys = ?keys, "shell registration env resolved");
     Ok(out)
 }
 
@@ -401,8 +444,8 @@ fn parse_health_env_key(text: &str) -> Option<String> {
     None
 }
 
-// 只读 fusion-gateway config.yaml 的 web_shell.admin_key。
-// 路径: FUSION_GATEWAY_CONFIG 覆盖, 默认 ~/fusion/fusion-gateway/config.yaml。
+// Read fusion-gateway config.yaml's web_shell.admin_key, read-only.
+// Path: FUSION_GATEWAY_CONFIG overrides, default ~/fusion/fusion-gateway/config.yaml.
 fn read_gateway_admin_key() -> Result<String> {
     let path = std::env::var("FUSION_GATEWAY_CONFIG")
         .map(std::path::PathBuf::from)
@@ -411,21 +454,27 @@ fn read_gateway_admin_key() -> Result<String> {
             std::path::PathBuf::from(home).join("fusion/fusion-gateway/config.yaml")
         });
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("读 gateway config 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read gateway config: {}", path.display()))?;
     let cfg: serde_yaml::Value = serde_yaml::from_str(&text)
-        .with_context(|| format!("解析 gateway config 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to parse gateway config: {}", path.display()))?;
     let key = cfg
         .get("web_shell")
         .and_then(|w| w.get("admin_key"))
         .and_then(|k| k.as_str())
         .filter(|k| !k.is_empty())
-        .with_context(|| format!("gateway config 无 web_shell.admin_key: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "gateway config has no web_shell.admin_key: {}",
+                path.display()
+            )
+        })?;
     Ok(key.to_string())
 }
 
-// issue #45: 只读 fusion-gateway config.yaml 的 auth.api_keys, 取 name=admin 的
-// key (全模型通配, 业务后端打 gateway 的 LLM 通道需要), 无 admin 则取第一条。
-// 路径: FUSION_GATEWAY_CONFIG 覆盖, 默认 ~/fusion/fusion-gateway/config.yaml。
+// issue #45: read fusion-gateway config.yaml's auth.api_keys, take the
+// name=admin key (all-model wildcard, needed by business backends hitting the
+// gateway's LLM channel); if no admin entry, take the first.
+// Path: FUSION_GATEWAY_CONFIG overrides, default ~/fusion/fusion-gateway/config.yaml.
 fn read_gateway_client_key() -> Result<String> {
     let path = std::env::var("FUSION_GATEWAY_CONFIG")
         .map(std::path::PathBuf::from)
@@ -434,33 +483,41 @@ fn read_gateway_client_key() -> Result<String> {
             std::path::PathBuf::from(home).join("fusion/fusion-gateway/config.yaml")
         });
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("读 gateway config 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read gateway config: {}", path.display()))?;
     let cfg: serde_yaml::Value = serde_yaml::from_str(&text)
-        .with_context(|| format!("解析 gateway config 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to parse gateway config: {}", path.display()))?;
     let keys = cfg
         .get("auth")
         .and_then(|a| a.get("api_keys"))
         .and_then(|k| k.as_sequence())
-        .with_context(|| format!("gateway config 无 auth.api_keys: {}", path.display()))?;
+        .with_context(|| format!("gateway config has no auth.api_keys: {}", path.display()))?;
     let admin = keys
         .iter()
         .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("admin"));
     let entry = admin
         .or_else(|| keys.first())
-        .with_context(|| format!("gateway config auth.api_keys 为空: {}", path.display()))?;
+        .with_context(|| format!("gateway config auth.api_keys is empty: {}", path.display()))?;
     let key = entry
         .get("key")
         .and_then(|k| k.as_str())
         .filter(|k| !k.is_empty())
-        .with_context(|| format!("gateway config api_keys 条目无 key: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "gateway config api_keys entry has no key: {}",
+                path.display()
+            )
+        })?;
     Ok(key.to_string())
 }
 
-// 据服务名决定 PG 库名: modelhub/cowork 用各自 env, identity/rag 用服务名。
-// issue #78 补: db 名回退按平面分 — compose sidecar pg-init 建的是去前缀短名
-// (cowork/identity/rag, 见 docker-compose.sidecar.yml FUSION_PG_DATABASES),
-// native brew PG 建的是下划线全名 (fusion_cowork/fusion_identity, 见
-// fusion-db-conventions-1030)。FUSION_*_DB env 覆盖两平面均优先。
+// Derive the PG database name from the service name: modelhub/cowork use their
+// own env, identity/rag use the service name.
+// issue #78 addendum: the db-name fallback splits per plane — compose sidecar
+// pg-init creates short prefix-less names (cowork/identity/rag, see
+// docker-compose.sidecar.yml FUSION_PG_DATABASES), native brew PG creates
+// underscored full names (fusion_cowork/fusion_identity, see
+// fusion-db-conventions-1030). FUSION_*_DB env overrides take priority on
+// both planes.
 fn pg_db_for(svc: &str, env_file: &std::path::Path, compose_on: bool) -> String {
     let fallback = if compose_on {
         svc.replace("fusion-", "")
@@ -477,14 +534,17 @@ fn pg_db_for(svc: &str, env_file: &std::path::Path, compose_on: bool) -> String 
     resolve(key, env_file).unwrap_or(fallback)
 }
 
-// issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`)。
-// 操作员改环境变量不必再绕道手工 start.sh (daemon env 快照固定, 既有注入
-// 只覆盖已知名字)。每个 exec 路径 (up / restart / rollout / 崩溃自动恢复)
-// 现场重读该文件, 叠加在 shell/sidecar 注入之后 (同 key 覆盖旧值), 因此
-// auto-recovery 也自动带上操作员变量。优先级: 进程 env → per-service 文件
-// → shell/sidecar 注入 → strip_env_for 剥离 (剥离永远最后, 安全员获胜)。
-// 文件缺失/不可读 → 空向量 (可选增强, 绝不阻断启动); 坏行 WARN 跳过;
-// 值绝不落日志。
+// issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`).
+// Operators no longer need to detour through manual start.sh to change env
+// vars (the daemon env snapshot is fixed and existing injections only cover
+// known names). Every exec path (up / restart / rollout / crash auto-recovery)
+// re-reads the file on the spot, layered after shell/sidecar injections (same
+// key overrides the old value), so auto-recovery automatically carries the
+// operator's variables too. Priority: process env -> per-service file ->
+// shell/sidecar injection -> strip_env_for stripping (stripping is always
+// last, the security guard wins).
+// File missing/unreadable -> empty vector (optional enhancement, never blocks
+// startup); malformed lines are WARNed and skipped; values are never logged.
 pub fn overlay_env_for(svc: &str) -> Vec<(String, String)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = std::path::PathBuf::from(home).join(".fusion-sv/env");
@@ -502,8 +562,9 @@ pub fn overlay_env_for_in(dir: &std::path::Path, svc: &str) -> Vec<(String, Stri
     out
 }
 
-// 纯解析: KEY=VALUE 行, 忽略空行/# 注释/缺 = 的坏行。KEY 首尾空白 trimmed,
-// VALUE 保留原样 (含内嵌 = 与引号, 不做 shell 展开 — 确定性优先)。
+// Pure parser: KEY=VALUE lines, ignoring blank lines/# comments/malformed
+// lines missing '='. KEY whitespace is trimmed, VALUE kept verbatim (embedded
+// '=' and quotes included, no shell expansion — determinism first).
 pub fn parse_env_overlay(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -551,11 +612,14 @@ pub(crate) mod tests {
         assert_eq!(parse_health_env_key(""), None);
     }
 
-    // 进程 env 是全局共享的, 测试并行会互相污染。此锁强制 env 测试串行。
-    // pub(crate): supervisor/config/backup 的 env 测试共用此锁。
-    // 线程内可重入 (thread_local 深度计数 + 最外层持 std Mutex): EnvGuard 自身
-    // 也获取此锁 (#134 CI flake — 裸 set/remove 与持锁测试并发), 同线程嵌套
-    // set 不自锁, 跨线程仍互斥。
+    // Process env is globally shared; parallel tests pollute each other. This
+    // lock forces env tests to run serially.
+    // pub(crate): shared by the env tests in supervisor/config/backup.
+    // Reentrant within a thread (thread_local depth counter + the outermost
+    // holder takes the std Mutex): EnvGuard itself also acquires this lock
+    // (#134 CI flake — bare set/remove racing lock-holding tests); nested sets
+    // on the same thread do not self-deadlock, cross-thread stays mutually
+    // exclusive.
     thread_local! {
         static ENV_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -585,7 +649,7 @@ pub(crate) mod tests {
         f
     }
 
-    // identity + .env 有 PG 密码 → 解析出 DATABASE_URL
+    // identity + .env with PG password -> DATABASE_URL resolved
     #[test]
     fn test_native_env_injected_for_identity() {
         let _g = env_lock();
@@ -599,7 +663,8 @@ pub(crate) mod tests {
         );
     }
 
-    // issue #78 补: FUSION_PG_PASSWORD 缺失 + PG 可达 (brew trust auth) → 无密码连接串
+    // issue #78 addendum: FUSION_PG_PASSWORD missing + PG reachable (brew trust
+    // auth) -> passwordless connection string
     #[test]
     fn test_native_env_trust_auth_when_pg_up() {
         let _g = env_lock();
@@ -612,7 +677,8 @@ pub(crate) mod tests {
         );
     }
 
-    // issue #78 补: 密码与 FUSION_PG_USER 双缺 + PG 可达 → 省略 user 段 (libpq 默认 OS user)
+    // issue #78 addendum: both password and FUSION_PG_USER missing + PG
+    // reachable -> user segment omitted (libpq defaults to the OS user)
     #[test]
     fn test_native_env_trust_auth_no_user() {
         let _g = env_lock();
@@ -626,8 +692,9 @@ pub(crate) mod tests {
         );
     }
 
-    // issue #78 补: 密码缺失 + PG 不可达 → 跳过 DATABASE_URL (应用走 SQLite 兜底),
-    // 不让整个注入失败; REDIS_URL 仍无条件注入
+    // issue #78 addendum: password missing + PG unreachable -> skip DATABASE_URL
+    // (the app falls back to SQLite), not failing the whole injection;
+    // REDIS_URL still injected unconditionally
     #[test]
     fn test_native_env_pg_down_skips_db_keeps_redis() {
         let _g = env_lock();
@@ -636,43 +703,53 @@ pub(crate) mod tests {
         let env = native_env_for_opts("fusion-cowork", f.path(), false, false, true).unwrap();
         assert!(
             !env.contains_key("DATABASE_URL"),
-            "PG 不可达且无密码不应注入 DATABASE_URL"
+            "unreachable PG with no password should not inject DATABASE_URL"
         );
-        assert!(env.contains_key("REDIS_URL"), "REDIS_URL 不受 PG 状态影响");
+        assert!(
+            env.contains_key("REDIS_URL"),
+            "REDIS_URL unaffected by PG state"
+        );
     }
 
-    // issue #78 补: compose 平面缺密码 → 仍 fail-closed Err (sidecar PG 密码认证,
-    // 静默降级 trust 串会打错库)
+    // issue #78 addendum: compose plane with missing password -> still
+    // fail-closed Err (sidecar PG uses password auth; silently degrading to a
+    // trust string would hit the wrong database)
     #[test]
     fn test_compose_plane_missing_password_fail_closed() {
         let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_USER=fusion\n");
         let r = native_env_for_opts("fusion-identity", f.path(), true, true, true);
-        assert!(r.is_err(), "compose 平面缺密码应 fail-closed 拒绝");
+        assert!(
+            r.is_err(),
+            "compose plane with missing password should fail-closed"
+        );
         assert!(
             r.unwrap_err().to_string().contains("FUSION_PG_PASSWORD"),
-            "err 应点名缺失 key"
+            "err should name the missing key"
         );
     }
 
-    // 非依赖服务 → 空注入 (保留现状)
+    // Non-dependent service -> empty injection (unchanged)
     #[test]
     fn test_native_env_unknown_service_no_injection() {
         let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let f = env_file("FUSION_PG_PASSWORD=x\n");
         let env = native_env_for("fusion-mlx", f.path(), false).unwrap();
-        assert!(env.is_empty(), "非依赖服务不应注入 env");
+        assert!(
+            env.is_empty(),
+            "non-dependent service should not get env injected"
+        );
     }
 
-    // 进程 env 优先于 env_file
+    // Process env takes precedence over env_file
     #[test]
     fn test_process_env_precedence() {
         let _g = env_lock();
-        // edition 2024: set_var/remove_var 需 unsafe (见 CLAUDE.md EnvGuard)
+        // edition 2024: set_var/remove_var are unsafe (see CLAUDE.md EnvGuard)
         unsafe { std::env::set_var("FUSION_PG_PASSWORD", "fromproc") };
-        // RAII: panic 也清掉进程 env, 避免污染其它测试
+        // RAII: clear the process env even on panic, avoid polluting other tests
         struct EnvCleanup;
         impl Drop for EnvCleanup {
             fn drop(&mut self) {
@@ -683,10 +760,10 @@ pub(crate) mod tests {
         let f = env_file("FUSION_PG_PASSWORD=fromfile\n");
         let env = native_env_for("fusion-identity", f.path(), false).unwrap();
         let url = env.get("DATABASE_URL").unwrap();
-        assert!(url.contains("fromproc"), "进程 env 应优先: {url}");
+        assert!(url.contains("fromproc"), "process env should win: {url}");
     }
 
-    // cowork 需 DATABASE_URL + REDIS_URL 两条
+    // cowork needs both DATABASE_URL + REDIS_URL
     #[test]
     fn test_cowork_gets_db_and_redis() {
         let _g = env_lock();
@@ -698,7 +775,8 @@ pub(crate) mod tests {
         assert!(env["REDIS_URL"].contains("6379"));
     }
 
-    // rag 需 QDRANT_URL (issue #78: 用 opts 可测版本, 不做真实网络探测)
+    // rag needs QDRANT_URL (issue #78: use the opts testable variant, no real
+    // network probing)
     #[test]
     fn test_rag_gets_qdrant() {
         let f = env_file("");
@@ -706,19 +784,24 @@ pub(crate) mod tests {
         assert_eq!(env.get("QDRANT_URL").unwrap(), "http://localhost:6333");
     }
 
-    // issue #78: qdrant 不可达 → 跳过 QDRANT_URL 注入, rag 允许空 map (兜底 :memory:)
+    // issue #78: qdrant unreachable -> skip QDRANT_URL injection, rag allowed an
+    // empty map (:memory: fallback)
     #[test]
     fn test_rag_qdrant_down_skips_key() {
         let f = env_file("");
         let env = native_env_for_opts("fusion-rag", f.path(), false, true, false).unwrap();
         assert!(
             !env.contains_key("QDRANT_URL"),
-            "qdrant 不可达不应注入 QDRANT_URL"
+            "unreachable qdrant should not inject QDRANT_URL"
         );
-        assert!(env.is_empty(), "rag 唯一 key 被跳过时允许空 map");
+        assert!(
+            env.is_empty(),
+            "rag allowed an empty map when its only key is skipped"
+        );
     }
 
-    // issue #78 补: db 名回退按平面分 — compose=短名 (pg-init), native=下划线全名 (brew)
+    // issue #78 addendum: db-name fallback splits per plane — compose=short name
+    // (pg-init), native=underscored full name (brew)
     #[test]
     fn test_pg_db_name_per_plane() {
         let _g = env_lock();
@@ -739,7 +822,7 @@ pub(crate) mod tests {
         );
     }
 
-    // read_env_file 跳过注释与空行, 解析 key=value
+    // read_env_file skips comments and blank lines, parses key=value
     #[test]
     fn test_read_env_file_skips_comments() {
         let f = env_file("# comment\n\nKEY=val\nOTHER=2\n");
@@ -749,14 +832,17 @@ pub(crate) mod tests {
         assert!(!map.contains_key("# comment"));
     }
 
-    // ---- issue #29: shell 注册 env ----
+    // ---- issue #29: shell registration env ----
 
-    // 进程 env 直接给 admin key → 注入成功, 不读 gateway config。
-    // issue #54: 注入名迁 FUSION_ADMIN_KEY; cowork 仍读旧 URL 名。
+    // Process env provides the admin key directly -> injection succeeds, gateway
+    // config not read.
+    // issue #54: injection name moved to FUSION_ADMIN_KEY; cowork still reads the
+    // old URL name.
     #[test]
     fn test_shell_env_from_process_env() {
         let _g = env_lock();
-        // issue #85: 反转默认后 cowork-web 也注入 FUSION_CLIENT_KEY, 测试显式供 key
+        // issue #85: after the default inversion cowork-web also gets
+        // FUSION_CLIENT_KEY injected; the test supplies the key explicitly
         let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-proc");
         let _c = EnvGuard::set("FUSION_ADMIN_KEY", "fromproc");
         let f = env_file("");
@@ -765,12 +851,13 @@ pub(crate) mod tests {
         assert_eq!(
             env.get("FUSION_SHELL_GATEWAY_URL").unwrap(),
             "http://127.0.0.1:11432",
-            "URL 未配置应兜底本地网关"
+            "unconfigured URL should fall back to the local gateway"
         );
     }
 
-    // .env 给 admin key → 进程 env 缺失时从文件解析;
-    // plugins console 读新 URL 名 FUSION_GATEWAY_BASE_URL (issue #54)
+    // .env provides the admin key -> resolved from the file when the process env
+    // lacks it; plugins console reads the new URL name FUSION_GATEWAY_BASE_URL
+    // (issue #54)
     #[test]
     fn test_shell_env_from_env_file() {
         let _g = env_lock();
@@ -782,11 +869,12 @@ pub(crate) mod tests {
         assert_eq!(
             env.get("FUSION_GATEWAY_BASE_URL").unwrap(),
             "http://127.0.0.1:11432",
-            "console URL 未配置应兜底本地网关"
+            "console URL unconfigured should fall back to the local gateway"
         );
     }
 
-    // issue #105: workspace 根从 env_file 注入; 缺失时不注入也不 fail (可选收敛)
+    // issue #105: workspace root injected from env_file; when absent, neither
+    // injected nor failed (optional hardening)
     #[test]
     fn test_shell_env_workspace_root_optional() {
         let _g = env_lock();
@@ -799,13 +887,15 @@ pub(crate) mod tests {
             env.get("FUSION_COWORK_WORKSPACE_ROOT").unwrap(),
             "/srv/cowork-workspaces"
         );
-        // 进程 env 与 env_file 均缺 → 不注入, 不报错 (上游回退 Path.home())
+        // Both process env and env_file lack it -> not injected, no error
+        // (upstream falls back to Path.home())
         let f2 = env_file("");
         let env2 = shell_env_for("fusion-cowork-web", f2.path()).unwrap();
         assert!(!env2.contains_key("FUSION_COWORK_WORKSPACE_ROOT"));
     }
 
-    // admin key 全缺 + gateway config 不可读 (指到不存在路径) → fail-closed Err
+    // Admin key entirely missing + gateway config unreadable (pointed at a
+    // nonexistent path) -> fail-closed Err
     #[test]
     fn test_shell_env_fail_closed_no_admin_key() {
         let _g = env_lock();
@@ -816,15 +906,15 @@ pub(crate) mod tests {
         );
         let f = env_file("FUSION_CLIENT_KEY=ck-file\n");
         let r = shell_env_for("fusion-cowork-web", f.path());
-        assert!(r.is_err(), "admin key 全缺应 fail-closed");
+        assert!(r.is_err(), "admin key entirely missing should fail-closed");
         let msg = r.unwrap_err().to_string();
         assert!(
             msg.contains("FUSION_ADMIN_KEY"),
-            "err 应点名缺失 key: {msg}"
+            "err should name the missing key: {msg}"
         );
     }
 
-    // trainer-bridge key 无兜底: env/.env 均无 → fail-closed Err
+    // trainer-bridge key has no fallback: neither env nor .env -> fail-closed Err
     #[test]
     fn test_shell_env_bridge_key_fail_closed() {
         let _g = env_lock();
@@ -838,7 +928,7 @@ pub(crate) mod tests {
         let _ck = EnvGuard::set("FUSION_CLIENT_KEY", "ck-bridge-fail-closed");
         let f = env_file("");
         let r = shell_env_for("fusion-trainer-bridge", f.path());
-        assert!(r.is_err(), "bridge key 缺失应 fail-closed");
+        assert!(r.is_err(), "missing bridge key should fail-closed");
         assert!(
             r.unwrap_err()
                 .to_string()
@@ -846,7 +936,7 @@ pub(crate) mod tests {
         );
     }
 
-    // trainer-bridge key 从 .env 解析成功
+    // trainer-bridge key resolved successfully from .env
     #[test]
     fn test_shell_env_bridge_key_from_file() {
         let _g = env_lock();
@@ -861,11 +951,11 @@ pub(crate) mod tests {
         assert_eq!(env.get("FUSION_TRAINER_BRIDGE_KEY").unwrap(), "bridge-k");
         assert!(
             !env.contains_key("FUSION_SHELL_GATEWAY_URL"),
-            "bridge 只需自身 key"
+            "bridge needs only its own key"
         );
     }
 
-    // 非 shell 模块服务 → 空 map (保留现状)
+    // Non-shell-module service -> empty map (unchanged)
     #[test]
     fn test_shell_env_unknown_service_empty() {
         let f = env_file("");
@@ -876,10 +966,12 @@ pub(crate) mod tests {
         assert!(needs_shell_env("fusion-trainer-bridge"));
     }
 
-    // issue #39/#40: fusion-mlx 子进程剥离 FUSION_MLX_API_KEY (防旧 key 钉死),
-    // 其它服务不剥离。issue #45: fusion-health 同剥离 (config.py env 优先于
-    // settings.json, 旧 key 让 backend 探活 401)。issue #88: fusion-health 再加剥
-    // FUSION_CLIENT_KEY (v1.2.3 _mlx_key() env 优先, 直连 mlx 用 client key 恒 401)。
+    // issue #39/#40: fusion-mlx child processes strip FUSION_MLX_API_KEY
+    // (prevents old-key pinning); other services do not strip. issue #45:
+    // fusion-health strips too (config.py env outranks settings.json; the old
+    // key makes the backend probe 401). issue #88: fusion-health also strips
+    // FUSION_CLIENT_KEY (v1.2.3 _mlx_key() is env-first; direct mlx connection
+    // with a client key is a permanent 401).
     #[test]
     fn test_strip_env_for_mlx_only() {
         assert_eq!(strip_env_for("fusion-mlx"), &["FUSION_MLX_API_KEY"]);
@@ -891,9 +983,10 @@ pub(crate) mod tests {
         assert!(strip_env_for("fusion-rag").is_empty());
     }
 
-    // issue #88: fusion-health 非 gateway 消费方 — 不注入 FUSION_CLIENT_KEY
-    // (shell_vars 排除), 但仍是 shell 生态一员 (needs_shell_env 走 match 分支)。
-    // trainer-bridge 等其它服务不受影响。
+    // issue #88: fusion-health is not a gateway consumer — no FUSION_CLIENT_KEY
+    // injection (shell_vars exclusion), but still part of the shell ecosystem
+    // (needs_shell_env goes through the match branch). Other services such as
+    // trainer-bridge are unaffected.
     #[test]
     fn test_issue88_health_excluded_from_client_key() {
         assert!(!shell_vars("fusion-health").contains(&"FUSION_CLIENT_KEY"));
@@ -901,9 +994,10 @@ pub(crate) mod tests {
         assert!(shell_vars("ai-trysuite").contains(&"FUSION_CLIENT_KEY"));
     }
 
-    // ---- issue #45: business 平台 FUSION_CLIENT_KEY 注入 ----
+    // ---- issue #45: business-plane FUSION_CLIENT_KEY injection ----
 
-    // 进程 env 直接给 key → 注入成功, 不读 gateway config
+    // Process env provides the key directly -> injection succeeds, gateway
+    // config not read
     #[test]
     fn test_client_key_from_process_env() {
         let _g = env_lock();
@@ -914,25 +1008,26 @@ pub(crate) mod tests {
         assert!(needs_shell_env("ai-fit"));
         assert!(needs_shell_env("ai-speech-exam"));
         assert!(needs_shell_env("ai-apparelmockup"));
-        // issue #55: 批量登记的 FastAPI 条目同注入
+        // issue #55: batch-registered FastAPI entries get injected too
         assert!(needs_shell_env("ai-ads-videobuilder"));
         assert!(needs_shell_env("ai-charactervoice"));
-        // issue #85 反转默认: 排除表外全部注入 — 静态托管/gateway/mlx 除外
+        // issue #85 default inversion: everything outside the exclusion table is
+        // injected — except static hosting/gateway/mlx
         assert!(!needs_shell_env("customer-insight"));
         assert!(!needs_shell_env("customer-insight-api"));
         assert!(!needs_shell_env("ai-apparelmockup-web"));
         assert!(!needs_shell_env("fusion-gateway"));
         assert!(!needs_shell_env("fusion-mlx"));
-        // 未知/未登记服务同样注入 (不读则忽略)
+        // Unknown/unregistered services are injected as well (ignored if unread)
         assert!(needs_shell_env("ai-family"));
         assert!(needs_shell_env("fusion-rag"));
         assert!(needs_shell_env("ai-trysuite"));
-        // issue #85 直接触发服务: /health gateway 检查 401
+        // issue #85 directly triggered service: /health gateway check 401
         assert!(needs_shell_env("fusion-code-modenization"));
         assert!(needs_shell_env("fusion-unknown-new-service"));
     }
 
-    // .env 给 key → 进程 env 缺失时从文件解析
+    // .env provides the key -> resolved from the file when the process env lacks it
     #[test]
     fn test_client_key_from_env_file() {
         let _g = env_lock();
@@ -942,7 +1037,8 @@ pub(crate) mod tests {
         assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "fromfile");
     }
 
-    // 全缺 + gateway config 不可读 → fail-closed Err, 点名缺失 key
+    // Entirely missing + gateway config unreadable -> fail-closed Err naming the
+    // missing key
     #[test]
     fn test_client_key_fail_closed_no_source() {
         let _g = env_lock();
@@ -953,14 +1049,14 @@ pub(crate) mod tests {
         );
         let f = env_file("");
         let r = shell_env_for("ai-apparelmockup", f.path());
-        assert!(r.is_err(), "client key 全缺应 fail-closed");
+        assert!(r.is_err(), "client key entirely missing should fail-closed");
         assert!(
             r.unwrap_err().to_string().contains("FUSION_CLIENT_KEY"),
-            "err 应点名缺失 key"
+            "err should name the missing key"
         );
     }
 
-    // 兜底读 gateway config auth.api_keys — 优先 name=admin 条目
+    // Fallback reads gateway config auth.api_keys — prefers the name=admin entry
     #[test]
     fn test_client_key_gateway_fallback_prefers_admin() {
         let _g = env_lock();
@@ -976,11 +1072,12 @@ pub(crate) mod tests {
         assert_eq!(env.get("FUSION_CLIENT_KEY").unwrap(), "adminkey456");
     }
 
-    // env guard (RAII 恢复进程 env), 与 config.rs EnvGuard 同构
+    // Env guard (RAII restore of process env), isomorphic to config.rs EnvGuard
     pub(crate) struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
-        // 持有 env 测试锁: 设/删/恢复全程与其他 env 测试互斥 (#134 CI flake)。
+        // Holds the env test lock: set/remove/restore are mutually exclusive with
+        // other env tests throughout (#134 CI flake).
         _lock: EnvLockGuard,
     }
     impl EnvGuard {
@@ -1004,7 +1101,8 @@ pub(crate) mod tests {
         }
     }
 
-    // issue #125: overlay 解析 — KEY=VALUE / 注释 / 空行 / 坏行跳过
+    // issue #125: overlay parsing — KEY=VALUE / comments / blank lines / malformed
+    // lines skipped
     #[test]
     fn test_issue125_parse_env_overlay() {
         let out = parse_env_overlay(
@@ -1020,15 +1118,16 @@ pub(crate) mod tests {
         );
     }
 
-    // issue #125: overlay 文件读取 — 存在读取, 缺失空向量
+    // issue #125: overlay file reading — existing file parsed, missing file empty
+    // vector
     #[test]
     fn test_issue125_overlay_env_for_in() {
         let dir = std::env::temp_dir().join(format!("fusion-sv-ovl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let svc = "fusion-test-ovl";
-        // 缺失 → 空
+        // Missing -> empty
         assert!(overlay_env_for_in(&dir, svc).is_empty());
-        // 存在 → 解析
+        // Existing -> parsed
         std::fs::write(dir.join(format!("{svc}.env")), "A=1\n# c\nB=two\n").unwrap();
         assert_eq!(
             overlay_env_for_in(&dir, svc),

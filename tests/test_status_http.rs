@@ -1,7 +1,7 @@
-// issue #26/#25: HTTP 面集成测试。
-// 直接 spawn lib 的 http_server::serve (真实现, 非测试内复制), 验证:
-// status 镜像 / metrics 不受影响 / history+events / 编排操作 token 校验 /
-// web 静态文件 + 路径穿越拒绝 / 未知路径 404。
+// issue #26/#25: HTTP face integration tests.
+// Spawns the lib's http_server::serve directly (real implementation, not a test copy) and
+// verifies: status mirroring / metrics untouched / history+events / orchestration token
+// validation / web static files + traversal rejection / unknown paths 404.
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::probe::ProbeResult;
 use fusion_supervisor::supervisor::{SupervisorCore, runner::State};
@@ -24,7 +24,7 @@ fn cfg() -> fusion_supervisor::config::Config {
     fusion_supervisor::config::Config::default()
 }
 
-// 真实现 server: 随机端口, 可选 token / web_dir。
+// Real-implementation server: random port, optional token / web_dir.
 async fn start_server(
     core: Arc<tokio::sync::Mutex<SupervisorCore>>,
     token: Option<String>,
@@ -45,7 +45,7 @@ async fn start_server(
 
 async fn http_req(url: &str, req: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // spawn 后 listener 可能未就绪 — 重试连接 (最多 ~1s)。
+    // listener may not be ready right after spawn — retry connect (up to ~1s).
     let mut stream = None;
     for _ in 0..50 {
         match tokio::net::TcpStream::connect(url).await {
@@ -56,7 +56,7 @@ async fn http_req(url: &str, req: &str) -> String {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
         }
     }
-    let mut stream = stream.expect("server 未就绪 (1s 内连接失败)");
+    let mut stream = stream.expect("server not ready (connect failed within 1s)");
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).await.unwrap();
@@ -87,7 +87,11 @@ async fn test_status_endpoint_mirrors_status_rpc_fields() {
     }
     let (addr, handle) = start_server(core_arc.clone(), None, None).await;
     let resp = http_get(&addr, "/api/v1/status").await;
-    assert!(resp.starts_with("HTTP/1.1 200"), "应 200: {}", &resp[..30]);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected 200: {}",
+        &resp[..30]
+    );
     assert!(resp.contains("application/json"));
     let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -118,11 +122,11 @@ async fn test_metrics_health_and_unknown_404() {
     let h = http_get(&addr, "/health").await;
     assert!(h.starts_with("HTTP/1.1 200"));
     assert!(h.contains("{\"ok\":true}"));
-    // 编排操作不在 GET 面, 未知路径 404
+    // orchestration ops are not on the GET face; unknown paths 404
     let nf = http_get(&addr, "/api/v1/up").await;
     assert!(
         nf.starts_with("HTTP/1.1 404"),
-        "GET up 应 404: {}",
+        "GET up should 404: {}",
         &nf[..30]
     );
     handle.abort();
@@ -159,7 +163,7 @@ async fn test_history_and_events_read_store() {
     assert_eq!(hist[0]["status"], "Healthy");
     assert_eq!(hist[0]["latency_ms"], 12);
     assert_eq!(hist[1]["status"], "Unhealthy");
-    // 缺 service → 400
+    // missing service → 400
     let bad = http_get(&addr, "/api/v1/history").await;
     assert!(bad.starts_with("HTTP/1.1 400"));
     let e = http_get(&addr, "/api/v1/events?limit=10").await;
@@ -174,7 +178,7 @@ async fn test_history_and_events_read_store() {
 
 #[tokio::test]
 async fn test_mutation_requires_token_and_reuses_dispatch() {
-    // invoke_start 恒 Ok — up_all/restart 可执行; token 校验在 dispatch 层。
+    // invoke_start always Ok — up_all/restart execute; token validation happens in dispatch.
     let core = SupervisorCore::new_with_fns(
         vec![def("fusion-mlx", 11434)],
         cfg(),
@@ -184,7 +188,7 @@ async fn test_mutation_requires_token_and_reuses_dispatch() {
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
 
-    // 无 token → dispatch 返回 unauthorized (HTTP 面透传错误)
+    // no token → dispatch returns unauthorized (HTTP face passes the error through)
     let no_auth = http_req(
         &addr,
         "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
@@ -199,7 +203,7 @@ async fn test_mutation_requires_token_and_reuses_dispatch() {
             .contains("unauthorized")
     );
 
-    // Bearer token → 通过 dispatch 执行 up
+    // Bearer token → up executes via dispatch
     let ok = http_req(
         &addr,
         "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
@@ -207,10 +211,10 @@ async fn test_mutation_requires_token_and_reuses_dispatch() {
     .await;
     let body = ok.split("\r\n\r\n").nth(1).unwrap_or("");
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert!(!v["result"].is_null(), "up 应成功: {body}");
+    assert!(!v["result"].is_null(), "up should succeed: {body}");
     assert!(v["error"].is_null());
 
-    // 未知方法 → method not found
+    // unknown method → method not found
     let nf = http_req(
         &addr,
         "POST /api/v1/bogus HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
@@ -221,8 +225,9 @@ async fn test_mutation_requires_token_and_reuses_dispatch() {
     handle.abort();
 }
 
-// 2026-10-31: 全量 up 与单服务 up 都要记录来源事件 (与 down 侧 #82 对称) —
-// 此前 01:05 全 fleet 启动波在日志/事件表零痕迹, 无法定位触发方。
+// 2026-10-31: fleet-wide up and single-service up both record origin events (symmetric
+// with the down side, #82) — the 01:05 fleet-wide start wave previously left zero trace
+// in logs/event table; the trigger could not be attributed.
 #[tokio::test]
 async fn test_up_records_startall_and_manualstart_events() {
     let core = SupervisorCore::new_with_fns(
@@ -234,7 +239,7 @@ async fn test_up_records_startall_and_manualstart_events() {
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
 
-    // 单服务 up (JSON body) → ManualStart 事件
+    // single-service up (JSON body) → ManualStart event
     let body = r#"{"service":"fusion-mlx"}"#;
     let req = format!(
         "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n{body}"
@@ -242,7 +247,7 @@ async fn test_up_records_startall_and_manualstart_events() {
     let resp = http_req(&addr, &req).await;
     assert!(resp.starts_with("HTTP/1.1 200"), "{}", &resp[..30]);
 
-    // 全量 up (无 body) → StartAll 事件 (service="*")
+    // fleet-wide up (no body) → StartAll event (service="*")
     let all = http_req(
         &addr,
         "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
@@ -256,26 +261,27 @@ async fn test_up_records_startall_and_manualstart_events() {
         let manual = evs
             .iter()
             .find(|e| e.kind == "ManualStart")
-            .expect("ManualStart 事件缺失");
+            .expect("ManualStart event missing");
         assert_eq!(manual.service, "fusion-mlx");
         assert!(
             manual.detail.contains("http POST /api/v1/up from"),
-            "origin 应带 http 来源: {}",
+            "origin should carry an http source: {}",
             manual.detail
         );
         let star = evs
             .iter()
             .find(|e| e.kind == "StartAll")
-            .expect("StartAll 事件缺失");
+            .expect("StartAll event missing");
         assert_eq!(star.service, "*");
         assert!(star.detail.contains("http POST /api/v1/up from"));
     }
     handle.abort();
 }
 
-// issue #128: 全量 down (STOP-ALL) 必须逐服务记 ManualStop — 此前只有一条
-// StopAll("*") 聚合事件, 单服务 last_restart 留陈旧 note (如 AutoRestart
-// "restart ok"), fleet drift 排障无法归因停止方。
+// issue #128: fleet-wide down (STOP-ALL) must record a ManualStop per service — previously
+// only one StopAll("*") aggregate event was written, leaving stale notes on per-service
+// last_restart (e.g. AutoRestart "restart ok"); fleet drift triage could not attribute
+// who stopped a service.
 #[tokio::test]
 async fn test_stopall_records_per_service_manualstop_events() {
     let core = SupervisorCore::new_with_fns(
@@ -287,7 +293,7 @@ async fn test_stopall_records_per_service_manualstop_events() {
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
 
-    // 先全量 up 让 runner 进入 Healthy (was_running 快照非空)
+    // fleet-wide up first so runners enter Healthy (was_running snapshot non-empty)
     let up = http_req(
         &addr,
         "POST /api/v1/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
@@ -295,7 +301,7 @@ async fn test_stopall_records_per_service_manualstop_events() {
     .await;
     assert!(up.starts_with("HTTP/1.1 200"), "{}", &up[..30]);
 
-    // 全量 down (无 body) → StopAll("*") + 每个先前运行的服务一条 ManualStop
+    // fleet-wide down (no body) → StopAll("*") + one ManualStop per previously running service
     let down = http_req(
         &addr,
         "POST /api/v1/down HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sekret\r\nConnection: close\r\n\r\n",
@@ -310,16 +316,16 @@ async fn test_stopall_records_per_service_manualstop_events() {
             let ev = evs
                 .iter()
                 .find(|e| e.kind == "ManualStop" && e.service == svc)
-                .unwrap_or_else(|| panic!("{svc} 缺 ManualStop 事件"));
+                .unwrap_or_else(|| panic!("{svc} missing ManualStop event"));
             assert!(
                 ev.detail.contains("http POST /api/v1/down from"),
-                "origin 应带 http 来源: {}",
+                "origin should carry an http source: {}",
                 ev.detail
             );
         }
         assert!(
             evs.iter().any(|e| e.kind == "StopAll" && e.service == "*"),
-            "StopAll 聚合事件缺失"
+            "StopAll aggregate event missing"
         );
     }
     handle.abort();
@@ -334,7 +340,7 @@ async fn test_static_serving_and_traversal_rejected() {
         |_, _, _| Ok(()),
     );
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
-    // 临时 dist: index.html + assets/app.js
+    // temp dist: index.html + assets/app.js
     let dist = std::env::temp_dir().join(format!("fsv-web-test-{}", std::process::id()));
     std::fs::create_dir_all(dist.join("assets")).unwrap();
     std::fs::write(dist.join("index.html"), "<html>supervisor console</html>").unwrap();
@@ -353,20 +359,20 @@ async fn test_static_serving_and_traversal_rejected() {
     let js = http_get(&addr, "/assets/app.js").await;
     assert!(js.starts_with("HTTP/1.1 200"));
     assert!(js.contains("text/javascript"));
-    // 路径穿越 → 404
+    // path traversal → 404
     let trav = http_get(&addr, "/../Cargo.toml").await;
     assert!(
         trav.starts_with("HTTP/1.1 404"),
-        "穿越应 404: {}",
+        "traversal should 404: {}",
         &trav[..30]
     );
-    // 存在性清理
+    // existence cleanup
     handle.abort();
     std::fs::remove_dir_all(&dist).unwrap();
 }
 
-// issue #139: 外部告警摄入 — token 校验 + 事件落库 + dedup_key 窗口去重,
-// 事件经 /api/v1/events 可读 (plane="external")。
+// issue #139: external alert ingestion — token validation + event persistence +
+// dedup_key window dedup; events readable via /api/v1/events (plane="external").
 #[tokio::test]
 async fn test_alert_ingest_token_record_and_dedup() {
     let core = SupervisorCore::new_with_fns(
@@ -379,7 +385,7 @@ async fn test_alert_ingest_token_record_and_dedup() {
     let (addr, handle) = start_server(core_arc.clone(), Some("sekret".into()), None).await;
     let body = r#"{"source":"fusion-ops","kind":"fail","severity":"error","detail":"probe down","dedup_key":"ops:11400"}"#;
 
-    // 无 token → 401, 不落事件
+    // no token → 401, no event recorded
     let no_auth = http_req(
         &addr,
         &format!(
@@ -388,7 +394,7 @@ async fn test_alert_ingest_token_record_and_dedup() {
     )
     .await;
     assert!(no_auth.starts_with("HTTP/1.1 401"));
-    // 错 token → 401
+    // wrong token → 401
     let bad_auth = http_req(
         &addr,
         &format!("POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: wrong\r\n\r\n{body}"),
@@ -396,7 +402,7 @@ async fn test_alert_ingest_token_record_and_dedup() {
     .await;
     assert!(bad_auth.starts_with("HTTP/1.1 401"));
 
-    // 合法 token → 200 记事件; 同 dedup_key 窗口内再发 → deduped:true 不重复
+    // valid token → 200 records the event; same dedup_key within the window → deduped:true, no duplicate
     let ok = http_req(
         &addr,
         &format!("POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: sekret\r\n\r\n{body}"),
@@ -414,7 +420,7 @@ async fn test_alert_ingest_token_record_and_dedup() {
     assert!(dup.starts_with("HTTP/1.1 200"));
     assert!(dup.contains("\"deduped\":true"));
 
-    // 坏 body → 400
+    // bad body → 400
     let bad = http_req(
         &addr,
         "POST /api/v1/alerts/ingest HTTP/1.1\r\nx-token: sekret\r\n\r\n{\"kind\":\"k\"}",
@@ -422,7 +428,7 @@ async fn test_alert_ingest_token_record_and_dedup() {
     .await;
     assert!(bad.starts_with("HTTP/1.1 400"));
 
-    // 事件流恰好一条, plane=external, severity 透传
+    // exactly one event, plane=external, severity passed through
     let e = http_get(&addr, "/api/v1/events?limit=10").await;
     let v: serde_json::Value =
         serde_json::from_str(e.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();

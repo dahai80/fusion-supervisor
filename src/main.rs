@@ -28,7 +28,7 @@ enum Commands {
         service: Option<String>,
     },
     Status {
-        /// Optional service name filter (issue #96: `status <svc>` 此前被拒)
+        /// Optional service name filter (issue #96: `status <svc>` used to be rejected)
         service: Option<String>,
     },
     Restart {
@@ -56,8 +56,8 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // issue #31: RUST_LOG 未设时默认 info — 操作员须能看到启动告警
-    // (如 FUSION_ROOT 未设提示), 默认 error 会静默吞掉。
+    // issue #31: default to info when RUST_LOG is unset — operators must see
+    // startup warnings (e.g. the FUSION_ROOT hint); default error would swallow them.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -67,8 +67,9 @@ async fn main() -> anyhow::Result<()> {
         None | Some(Commands::Daemon) => run_daemon(cfg).await,
         Some(Commands::Status { service }) => cli_status(cfg, service).await,
         Some(Commands::Top) => cli_top(cfg).await,
-        // issue #41: [SERVICE] 参数必须路由到单服务 RPC (up_one/down_one),
-        // 此前 `{ .. }` 丢弃参数致 `down <svc>` 全停。经 cli::up_down_target 路由 (可测)。
+        // issue #41: the [SERVICE] arg must route to the single-service RPC (up_one/down_one);
+        // `{ .. }` used to drop the arg making `down <svc>` stop the whole fleet. Routed via
+        // cli::up_down_target (testable).
         Some(Commands::Up { service }) => match cli::up_down_target(service) {
             Some(s) => cli_call_param(cfg, "up", s).await,
             None => cli_call(cfg, "up").await,
@@ -90,11 +91,12 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-// issue #114: 单实例守卫 — 文件锁持有到进程退出 (flock, 内核在退出时释放,
-// 崩溃无残留)。锁文件路径 ~/.fusion-sv/daemon.lock。
-// 双 daemon 并跑 = 双份 tick/备份/告警 (2026-11-09 实证: 孤儿 daemon 覆写当日备份)。
+// issue #114: single-instance guard — the file lock is held until process exit (flock,
+// released by the kernel on exit, no residue on crash). Lock file: ~/.fusion-sv/daemon.lock.
+// Two daemons running = duplicated ticks/backups/alerts (2026-11-09 incident: an orphan
+// daemon overwrote the day's backup).
 fn acquire_daemon_lock() -> Option<std::fs::File> {
-    // FUSION_SV_LOCK_PATH 覆盖锁路径 (测试隔离, 不碰真实 daemon.lock)
+    // FUSION_SV_LOCK_PATH overrides the lock path (test isolation, never touches the real daemon.lock)
     let path = match std::env::var("FUSION_SV_LOCK_PATH") {
         Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
         _ => {
@@ -134,14 +136,15 @@ fn acquire_daemon_lock() -> Option<std::fs::File> {
 
 async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     tracing::info!("fusion-sv daemon starting");
-    // issue #114: 守卫先于一切 — 拿不到锁直接退出 (launchd KeepAlive 会重试,
-    // 但持有方活着时重试也会持续失败, 静默双跑不可能再发生)。
+    // issue #114: guard runs before everything — exit immediately when the lock is
+    // unavailable (launchd KeepAlive will retry, but retries keep failing while the
+    // holder lives; silent double-running can no longer happen).
     let _daemon_lock = match acquire_daemon_lock() {
         Some(f) => f,
         None => anyhow::bail!("fusion-sv daemon already running (instance lock held)"),
     };
-    // issue #145: config 声明的 systemd 托管表灌入 start_map (OnceLock 一次;
-    // CLI one-shot 不注册 — 生命周期命令全部经 daemon RPC 执行)。
+    // issue #145: feed the systemd-managed table declared in config into start_map (OnceLock, once;
+    // CLI one-shot does not register — all lifecycle commands go through daemon RPC).
     fusion_supervisor::start_map::register_systemd_units(cfg.systemd_units.clone());
     if !cfg.systemd_units.is_empty() {
         tracing::info!(
@@ -149,40 +152,40 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             "systemd-managed services registered (start/stop/restart via systemctl)"
         );
     }
-    // issue #80: launchd 默认 PATH 不含 Homebrew bin — node/brew 系 start.sh 在
-    // daemon 拉起时 `command -v node` 全挂。启动时把 native_extra_path 中缺失的
-    // 项追加到 daemon 自身 PATH 尾部; 所有子进程 (exec_bash_script /
-    // exec_start_spec) 继承 daemon env, 单一注入点覆盖全部 exec 路径。
-    // 空串禁用 (保持 launchd 原始 PATH 行为)。
+    // issue #80: launchd's default PATH lacks Homebrew bin — node/brew-based start.sh
+    // scripts all fail `command -v node` when spawned by the daemon. At startup, append
+    // missing entries from native_extra_path to the daemon's own PATH; all child processes
+    // (exec_bash_script / exec_start_spec) inherit daemon env, so a single injection point
+    // covers every exec path. Empty string disables (keeps launchd's original PATH).
     if !cfg.native_extra_path.trim().is_empty() {
         let cur = std::env::var("PATH").unwrap_or_default();
         let merged = config::append_path_entries(&cur, &cfg.native_extra_path);
         if merged != cur {
             tracing::info!(
                 extra = %cfg.native_extra_path,
-                "daemon PATH 追加 Homebrew 目录 (子进程继承)"
+                "daemon PATH extended with Homebrew dirs (inherited by children)"
             );
-            // SAFETY: run_daemon 入口, 尚未 spawn 任何并发读 PATH 的线程。
+            // SAFETY: run_daemon entry point; no thread concurrently reading PATH has been spawned yet.
             unsafe { std::env::set_var("PATH", merged) };
         }
     }
-    // issue #31: FUSION_ROOT 未设且 cwd 不像 monorepo 根时一次告警。
-    // start.sh 路径解析 env > cwd, cwd 错误时 up_native 会全量 fail-closed。
+    // issue #31: warn once when FUSION_ROOT is unset and cwd does not look like the monorepo root.
+    // start.sh path resolution prefers env over cwd; with a wrong cwd up_native fails closed across the fleet.
     if std::env::var("FUSION_ROOT").is_err() {
         let cwd = std::env::current_dir().unwrap_or_default();
         if !cwd.join("architecture/port-registry.yaml").exists() {
             tracing::warn!(
                 cwd = %cwd.display(),
-                "FUSION_ROOT 未设置且当前目录不是 fusion monorepo 根 — 默认 start.sh 路径将解析失败。请 FUSION_ROOT=<monorepo 根> fusion-sv daemon 启动"
+                "FUSION_ROOT is unset and the current directory is not the fusion monorepo root — default start.sh paths will fail to resolve. Start with FUSION_ROOT=<monorepo root> fusion-sv daemon"
             );
         }
     }
     // issue #102: absent registry degrades to an empty managed set (one WARN
     // inside load_or_empty) — never blocks boot on the minimal-download profile.
-    // issue #114: bind 面先行 — UDS/HTTP bind 失败 = fatal (exit 1), 不再
-    // faceless 空转 tick (旧路径 serve task 内 bind 失败只记日志, daemon 假活,
-    // 与持锁 daemon 并跑形成双份监督)。
-    // UDS 面仅 unix — windows 无 UnixStream, daemon 降级为纯 HTTP API 面 (CLI 走 HTTP)。
+    // issue #114: bind surfaces first — UDS/HTTP bind failure is fatal (exit 1), no more
+    // faceless idle ticking (the old path bound inside the serve task and only logged the
+    // failure, leaving a zombie daemon running alongside the lock-holding one).
+    // UDS face is unix-only — windows has no UnixStream; the daemon degrades to a pure HTTP API face (CLI uses HTTP).
     #[cfg(unix)]
     let uds_listener = rpc::server::bind_uds(&cfg.socket_path)
         .map_err(|e| anyhow::anyhow!("uds bind fail (fatal) {}: {e}", cfg.socket_path))?;
@@ -204,21 +207,22 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let defs = manifest::load_or_empty(&cfg.registry_path);
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
     let mut core = core;
-    // issue #107 D2: 先对账再开 RPC — 幸存进程 (launchd 崩溃重启后) 不再被
-    // status 谎报 Stopped。探活一轮即可, 阻塞远小于首个 tick 的等待窗口。
+    // issue #107 D2: reconcile before opening RPC — surviving processes (after launchd
+    // crash-restart) are no longer misreported as Stopped by status. One probe round is
+    // enough; the block is far shorter than the first tick's wait window.
     let adopted = core.reconcile_on_boot().await;
     tracing::info!(adopted, "boot reconcile complete");
     let core = Arc::new(tokio::sync::Mutex::new(core));
     let token = std::env::var("FUSION_SV_TOKEN").ok();
     let core_rpc = core.clone();
-    // issue #20: shutdown 信号通道 (RPC Shutdown → run_daemon select 退出)。
-    // issue #25: 共享 Arc — UDS 与 HTTP 两个面同一信号。
+    // issue #20: shutdown signal channel (RPC Shutdown → run_daemon select exit).
+    // issue #25: shared Arc — the same signal for both the UDS and HTTP faces.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_shared = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let shutdown_for_rpc = shutdown_shared.clone();
     #[cfg(unix)]
     tokio::spawn(async move {
-        // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
+        // issue #114: listener already bound at entry (failure was fatal); serve only accepts.
         if let Err(e) =
             rpc::server::serve_with_shutdown_on(core_rpc, uds_listener, token, shutdown_for_rpc)
                 .await
@@ -231,17 +235,18 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let _ = (core_rpc, uds_listener, shutdown_for_rpc, token);
     }
     tracing::info!("daemon ready (socket {})", cfg.socket_path);
-    // 监督 tick 循环: 周期探活 + 宕机自动重启 (C1 修复)
-    // 锁纪律: 取锁读 poll_interval → 释放 → sleep → 再取锁 tick_all。
-    // 绝不持锁跨 sleep (否则阻塞 RPC status/up/down)。
+    // Supervision tick loop: periodic probing + automatic crash restart (C1 fix)
+    // Lock discipline: lock to read poll_interval → unlock → sleep → re-lock for tick_all.
+    // Never hold the lock across a sleep (it would block RPC status/up/down).
     let core_tick = core.clone();
-    // issue #168: 日志轮转参数快照 (tick 内只读, 配置 reload 才变)
+    // issue #168: log rotation params snapshot (read-only in the tick; changes only via config reload)
     let rotate_paths = cfg.log_rotate_paths.clone();
     let rotate_max_mb = cfg.log_rotate_max_mb;
     let rotate_keep = cfg.log_rotate_keep;
     let tick_handle = tokio::spawn(async move {
-        // issue #107 D1: 睡眠/挂起诊断 — 两轮 tick 间隔远超 poll_interval 即视为
-        // 系统睡眠唤醒 (daemon 若在睡眠中死亡, 此日志缺席可佐证 SIGKILL 类硬杀)。
+        // issue #107 D1: sleep/suspend diagnostics — a gap between two ticks far exceeding
+        // poll_interval is treated as a system wake (if the daemon died during sleep, the
+        // absence of this log corroborates a hard kill like SIGKILL).
         let mut last_tick_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -265,25 +270,27 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                 );
             }
             last_tick_ts = now;
-            // tick 单轮 panic 隔离: panic 会杀掉整个 tick task — RPC/HTTP 仍活
-            // 但监督静默停摆 (探活/自愈/告警全停), 常驻组件不可接受。inner spawn
-            // 隔离 (JoinError 捕获 panic), 崩了记 ERROR 下一 tick 续跑。
-            // 锁纪律不变: tick 体内取锁, 外层 sleep 无锁。
+            // Per-round tick panic isolation: a panic kills the whole tick task — RPC/HTTP
+            // stay alive but supervision silently stalls (probing/self-healing/alerting all
+            // stop), unacceptable for a resident component. Inner spawn isolates it (JoinError
+            // captures the panic); on crash, log ERROR and continue next tick.
+            // Lock discipline unchanged: the tick body takes the lock, the outer sleep is lock-free.
             let core_inner = core_tick.clone();
-            // issue #168: 轮转参数快照克隆进 'static tick task (Vec 不可 Copy,
-            // 两元素字符串每 tick 克隆一次可忽略)
+            // issue #168: rotation params cloned into the 'static tick task (Vec is not Copy;
+            // cloning the two-element strings once per tick is negligible)
             let rotate_paths = rotate_paths.clone();
             let tick_round = tokio::spawn(async move {
-                // issue #122 phase-2: tick 挂起的到点重启 exec 在核心锁外并发执行 —
-                // start.sh (go build 等) 可达数分钟, 持锁执行会堵死 RPC/HTTP status。
+                // issue #122 phase-2: due restart execs scheduled by the tick run concurrently outside
+                // the core lock — start.sh (go build etc.) can take minutes; holding the lock would
+                // block RPC/HTTP status.
                 let execs = {
                     let mut c = core_inner.lock().await;
                     c.tick_all(now).await;
-                    // issue #10/#113: 备份调度检查 (到期触发 spawn_backup, fail-closed 已告警)
+                    // issue #10/#113: backup schedule check (due → spawn_backup, fail-closed already alerted)
                     c.check_backup_schedule(now).await;
-                    // issue #37: retention sweep 调度检查 (到期裁剪 history.db 过期行)
+                    // issue #37: retention sweep schedule check (due → prune expired history.db rows)
                     c.check_retention(now);
-                    // issue #137: 定时任务调度 (到期触发 detached exec, 游标持久化)
+                    // issue #137: scheduled jobs (due → detached exec, cursor persisted)
                     c.dispatch_due_jobs(now);
                     c.collect_pending_execs()
                 };
@@ -292,8 +299,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                     let mut c = core_inner.lock().await;
                     c.finish_pending_execs(now, results).await;
                 }
-                // issue #168: 日志尺寸轮转检查 (锁外 — 到阈值才付拷贝成本,
-                // 平时只付 metadata stat; check_paths 内部单文件失败 WARN 续跑)
+                // issue #168: log size rotation check (outside the lock — pays the copy cost only at
+                // the threshold, otherwise just a metadata stat; check_paths logs a WARN per failing
+                // file internally and continues)
                 fusion_supervisor::log_rotate::check_paths(
                     &rotate_paths,
                     rotate_max_mb,
@@ -301,13 +309,13 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                 );
             });
             if let Err(e) = tick_round.await {
-                tracing::error!(err = %e, "tick 单轮 panic (自愈续跑)");
+                tracing::error!(err = %e, "tick round panicked (self-healing, continuing)");
             }
         }
     });
-    // issue #22/#26/#25: HTTP 面 (metrics + 只读 status/history/events + web
-    // 静态控制台 + token 校验编排操作), 第三个 spawn task, 共享 core.clone()。
-    // issue #114: listener 已在入口 bind (失败已 fatal), serve 只 accept。
+    // issue #22/#26/#25: HTTP face (metrics + read-only status/history/events + web static
+    // console + token-checked orchestration ops), third spawn task, shared via core.clone().
+    // issue #114: listener already bound at entry (failure was fatal); serve only accepts.
     let http_handle = if let Some(listener) = tcp_listener {
         let core_http = core.clone();
         let token_http = std::env::var("FUSION_SV_TOKEN").ok();
@@ -329,24 +337,27 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     } else {
         None
     };
-    // issue #29: daemon 启动即自动拉起 (探活跳过已健康, 不双启)。
-    // PRD app-tiering (issue #62) 语义收窄: auto_up 只拉 T0 ∪ pin=auto,
-    // 不再 up_all 全量 (40+ 服务启动风暴挤爆内存)。up_all 保留给 Web/CLI 显式操作。
-    // 持锁跨 up_boot_set 与 RPC up 行为一致; 默认 false, 开发机手动行为不变。
+    // issue #29: auto-start at daemon boot (probe skips already-healthy services, no double start).
+    // PRD app-tiering (issue #62) narrowed semantics: auto_up only starts T0 ∪ pin=auto,
+    // no longer a full up_all (a 40+ service boot storm exhausted memory). up_all is reserved
+    // for explicit Web/CLI operations. Holding the lock across up_boot_set matches RPC up
+    // behavior; default false keeps manual dev-machine behavior unchanged.
     if cfg.auto_up_on_start {
         let core_boot = core.clone();
         tokio::spawn(async move {
-            tracing::info!("auto_up_on_start: 启动即 up_boot_set (T0 ∪ pin=auto, layer 序)");
+            tracing::info!("auto_up_on_start: up_boot_set at boot (T0 ∪ pin=auto, layer order)");
             let mut c = core_boot.lock().await;
             if let Err(e) = c.up_boot_set().await {
-                tracing::error!(err = %e, "auto_up_on_start up_boot_set 部分失败 (tick 兜底)");
+                tracing::error!(err = %e, "auto_up_on_start up_boot_set partially failed (tick backstop)");
             }
         });
     }
-    // issue #20: ctrl-c 或 RPC Shutdown 信号任一触发优雅退出。
-    // issue #107 D1: SIGTERM (launchd bootout) 也走优雅退出并留痕 — 睡眠中
-    // 的静默死亡若非信号所致, 日志里缺 shutdown 行即可排除正常终止路径。
-    // SIGTERM 面仅 unix — windows 下该臂退化为永不就绪的 pending (select 只剩 ctrl-c + rpc)。
+    // issue #20: graceful exit on either ctrl-c or the RPC Shutdown signal.
+    // issue #107 D1: SIGTERM (launchd bootout) also exits gracefully with a log trace — if a
+    // silent death during sleep was not signal-caused, the missing shutdown line rules out
+    // normal termination paths.
+    // SIGTERM face is unix-only — on windows this arm degrades to a never-ready pending
+    // (select then only watches ctrl-c + rpc).
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow::anyhow!("SIGTERM handler install fail: {e}"))?;
@@ -388,7 +399,7 @@ async fn cli_status(cfg: Config, service: Option<String>) -> anyhow::Result<()> 
     }
     let mut entries: Vec<supervisor::StatusEntry> =
         serde_json::from_value(resp.result.unwrap_or(Value::Array(vec![]))).unwrap_or_default();
-    // issue #96: `status <svc>` 客户端过滤 (RPC 仍是全量 status 面)
+    // issue #96: `status <svc>` client-side filtering (the RPC remains the full status face)
     if let Some(f) = &service {
         entries.retain(|e| &e.name == f);
         if entries.is_empty() {
@@ -402,7 +413,7 @@ async fn cli_status(cfg: Config, service: Option<String>) -> anyhow::Result<()> 
 
 async fn cli_top(cfg: Config) -> anyhow::Result<()> {
     loop {
-        // M6: 先清屏再打印, 避免首帧滞留 1s 再空白
+        // M6: clear the screen before printing, avoiding a 1s stale first frame
         print!("\x1b[2J\x1b[H");
         if let Err(e) = cli_status(cfg.clone(), None).await {
             cli::print_error(&e.to_string());
@@ -411,7 +422,7 @@ async fn cli_top(cfg: Config) -> anyhow::Result<()> {
     }
 }
 
-// issue #82: CLI 请求带来源 — daemon 侧停止/停止全部操作可追溯发起进程
+// issue #82: CLI requests carry an origin — stop/stop-all operations on the daemon side are attributable to the originating process
 fn cli_origin() -> String {
     let argv = std::env::args().collect::<Vec<_>>().join(" ");
     format!("cli pid={} argv: {}", std::process::id(), argv)
@@ -509,8 +520,8 @@ async fn cli_ping(cfg: Config) -> anyhow::Result<()> {
     }
 }
 
-// issue #114: 单实例守卫可测性 — FUSION_SV_LOCK_PATH 指向临时文件,
-// 不碰真实 ~/.fusion-sv/daemon.lock (生产 daemon 可能正持有)。
+// issue #114: single-instance guard testability — FUSION_SV_LOCK_PATH points at a temp file,
+// never touching the real ~/.fusion-sv/daemon.lock (a production daemon may be holding it).
 #[cfg(test)]
 mod daemon_lock_tests {
     use super::*;
@@ -519,7 +530,7 @@ mod daemon_lock_tests {
     fn test_daemon_lock_exclusive() {
         let tmp = tempfile::TempDir::new().unwrap();
         let lock_path = tmp.path().join("test-daemon.lock");
-        // SAFETY: 测试进程单线程使用该 env, 且本 mod 是 main.rs 唯一 env 测试
+        // SAFETY: the test process uses this env single-threaded, and this mod is the only env test in main.rs
         unsafe { std::env::set_var("FUSION_SV_LOCK_PATH", &lock_path) };
         let f1 = acquire_daemon_lock().expect("first acquire should succeed");
         assert!(
@@ -527,7 +538,7 @@ mod daemon_lock_tests {
             "second acquire must fail (lock held)"
         );
         drop(f1);
-        // flock 随 fd 释放 → 可再获取
+        // flock is released with the fd → can be acquired again
         assert!(
             acquire_daemon_lock().is_some(),
             "release then reacquire should succeed"

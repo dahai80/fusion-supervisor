@@ -1,8 +1,10 @@
 import { sdk } from "./sdk";
 
-// issue #95: 主题跟随 shell (UI spec — tokens.css 双主题) — 嵌入模式取
-// sdk.theme 快照 + 订阅 host 'theme' 事件切换 html.light; 独立模式
-// localStorage 记忆 → prefers-color-scheme 兜底 (对齐 cowork initTheme)。
+// issue #95: theme follows the shell (UI spec — tokens.css dual theme) —
+// embedded mode takes the sdk.theme snapshot + subscribes to the host
+// 'theme' event to toggle html.light; standalone mode falls back to
+// localStorage memory → prefers-color-scheme (aligned with cowork
+// initTheme).
 export function initTheme() {
     const apply = (mode: "dark" | "light") => {
         const el = document.documentElement;
@@ -14,7 +16,7 @@ export function initTheme() {
             const saved = localStorage.getItem("fusion.shell.theme");
             if (saved === "light" || saved === "dark") return saved;
         } catch {
-            // localStorage 不可用时走系统偏好
+            // localStorage unavailable — fall back to system preference
         }
         return window.matchMedia("(prefers-color-scheme: light)").matches
             ? "light"

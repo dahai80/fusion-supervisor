@@ -43,9 +43,9 @@ async fn test_badpath_never_restarts() {
     }
     assert!(
         calls.lock().unwrap().is_empty(),
-        "BadPath 绝不调 start.sh (防风暴)"
+        "BadPath must never call start.sh (anti-storm)"
     );
-    assert_eq!(r.policy.crash_count(), 0, "BadPath 不记 crash");
+    assert_eq!(r.policy.crash_count(), 0, "BadPath records no crash");
     cleanup_db(&path);
 }
 

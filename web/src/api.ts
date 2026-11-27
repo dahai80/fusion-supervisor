@@ -3,11 +3,13 @@
 // /shell/fusion-supervisor/ proxy. Mutations need the supervisor token
 // (FUSION_SV_TOKEN): VITE_SV_TOKEN wires it in dev builds only.
 
-// issue #93: embedded 模式 API 路径必须带模块前缀。SPA 以绝对根路径
-// fetch("/api/v1/...") 在 shell 里会打到 gateway 自身的 /api 鉴权层
-// (401), 而不是 /shell/fusion-supervisor/ 代理命名空间。运行时从
-// location.pathname 推导前缀: 独立部署 (根路径 / vite 代理) 无前缀,
-// 嵌入 shell 时自动带上 /shell/fusion-supervisor。
+// issue #93: embedded mode API paths must carry the module prefix. An SPA
+// fetching "/api/v1/..." from the absolute root hits the gateway's own
+// /api auth layer (401) inside the shell, not the
+// /shell/fusion-supervisor/ proxy namespace. The prefix is derived at
+// runtime from location.pathname: standalone deploy (root path / vite
+// proxy) has no prefix, embedded in the shell automatically carries
+// /shell/fusion-supervisor.
 const API_BASE: string = (() => {
     if (typeof window === "undefined") return "";
     const m = window.location.pathname.match(

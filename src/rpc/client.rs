@@ -2,8 +2,8 @@ use crate::rpc::schema::{RpcRequest, RpcResponse};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-// UDS JSON-RPC 客户端 (daemon 同机 CLI 面)。windows 无 UnixStream —
-// 连接即时报错, 引导走 HTTP API 面 (daemon HTTP 端口跨平台可用)。
+// UDS JSON-RPC client (same-host CLI face of the daemon). windows has no UnixStream —
+// connecting errors immediately, directing users to the HTTP API face (the daemon HTTP port is cross-platform).
 pub struct RpcClient {
     #[cfg(unix)]
     stream: tokio::net::UnixStream,
@@ -17,7 +17,9 @@ impl RpcClient {
         {
             let stream = tokio::net::UnixStream::connect(socket_path)
                 .await
-                .map_err(|e| anyhow!("daemon 未运行, 用 `fusion-sv daemon` 启动: {e}"))?;
+                .map_err(|e| {
+                    anyhow!("daemon not running; start it with `fusion-sv daemon`: {e}")
+                })?;
             Ok(Self { stream })
         }
         #[cfg(not(unix))]

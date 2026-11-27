@@ -10,19 +10,19 @@ use crate::probe::{ProbeResult, ProbeSpec, probe};
 use crate::probe_map;
 use crate::store::{HistoryStore, PinMode};
 use anyhow::Result;
-// issue #60: CommandExt::process_group — 服务子进程独立进程组, 隔离 daemon 重载的组信号
-// (unix 专属; windows 目标编译无此 API, 隔离交给 CREATE_NEW_PROCESS_GROUP 语义默认即可, 直接跳过)。
+// issue #60: CommandExt::process_group — service child processes get their own process group, isolating daemon-reload group signals
+// (unix only; windows targets lack this API — isolation falls to CREATE_NEW_PROCESS_GROUP semantics there, simply skipped).
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-// 签名: (repo_dir, cmd, env_overrides)。env_overrides 为注入连接 env (issue #8)。
+// Signature: (repo_dir, cmd, env_overrides). env_overrides carries injected connection env (issue #8).
 pub type ArcStartFn = Arc<dyn Fn(&str, &str, &[(String, String)]) -> Result<()> + Send + Sync>;
 pub type ArcProbeFn = Arc<dyn Fn(&ProbeSpec) -> ProbeResult + Send + Sync>;
 
-// issue #122: 可移交的 exec 作业 — prepare (锁内) 产出, 调用方在核心锁外 run(),
-// 再拿锁 finish。exec (start.sh / go build 等) 可达数分钟, 绝不能持锁等待。
+// issue #122: hand-off-able exec job — produced by prepare (under the lock), the caller runs it
+// outside the core lock, then re-acquires the lock to finish. exec (start.sh / go build etc.) can take minutes — never wait holding the lock.
 pub struct StartJob {
     pub service: String,
     pub verb: &'static str,
@@ -32,7 +32,7 @@ pub struct StartJob {
 }
 
 impl StartJob {
-    // 锁外执行 — 与旧内联 exec 同语义 (同步闭包 + 超时包裹)。
+    // Runs outside the lock — same semantics as the old inline exec (sync closure + timeout wrapper).
     pub async fn run(&self) -> Result<()> {
         let start_fn = self.start_fn.clone();
         let svc = self.service.clone();
@@ -53,16 +53,16 @@ impl StartJob {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusEntry {
     pub name: String,
-    pub state: String, // State 的字符串形式, 兼容容器平面 (Failed/Healthy/...)
+    pub state: String, // String form of State, covers the compose plane (Failed/Healthy/...)
     pub port: u16,
     pub plane: String, // "native" | "compose"
-    // issue #112: 最近一次 restart 类事件 ("kind detail"), 审计 "谁拉起的"。
-    // None = 无记录 (从没重启过/手工事件缺), 序列化时省略。
+    // issue #112: most recent restart-class event ("kind detail"), audits "who started it".
+    // None = no record (never restarted / manual event missing), omitted when serializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_restart: Option<String>,
 }
 
-// PRD app-tiering: /api/v1/boot 行。pinned=None 表示无个人覆盖 (走注册表 boot 字段)。
+// PRD app-tiering: /api/v1/boot row. pinned=None means no personal override (registry boot field applies).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BootEntry {
     pub name: String,
@@ -72,8 +72,8 @@ pub struct BootEntry {
     pub port: u16,
 }
 
-// issue #90: 当前 unix 秒 — up 路径没有 tick 的注入时钟, 重试排期只需
-// 真实时刻 (测试对状态机断言走 tick 的 now_ts 注入, 不受影响)。
+// issue #90: current unix seconds — the up path has no tick's injected clock, retry scheduling
+// only needs the real time (state-machine test assertions go through tick's injected now_ts, unaffected).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -83,50 +83,50 @@ fn now_unix() -> u64 {
 
 pub struct SupervisorCore {
     pub runners: Vec<runner::ServiceRunner>,
-    // issue #37: Arc 化 — Alerter 的事件落库 sink 需要持有 store 的克隆
-    // (告警 chokepoint 统一写 event 表, native + compose 共用)。
+    // issue #37: Arc — the Alerter's event-persist sink needs to hold a clone of the store
+    // (alert chokepoint writes the event table uniformly, shared by native + compose).
     pub store: Arc<HistoryStore>,
     pub alerter: Alerter,
     pub cfg: Config,
-    // 注入的 start 函数 (生产=bash start.sh, 测试=fake)。签名: (repo_dir, cmd) -> Result
+    // Injected start function (prod = bash start.sh, test = fake). Signature: (repo_dir, cmd) -> Result
     start_fn: ArcStartFn,
     probe_fn: ArcProbeFn,
-    // compose 平面 (可选)。enabled=false 时为 None, 保留仅 native 行为。
+    // compose plane (optional). None when enabled=false, preserving native-only behavior.
     compose: Option<Box<dyn ComposeBackend>>,
-    // compose 容器告警节流 (issue #6): 防 flapping 容器每 tick 刷告警。
+    // compose container alert throttle (issue #6): keeps flapping containers from spamming alerts every tick.
     compose_tracker: crate::compose_tracker::ComposeTracker,
-    // issue #10: 上次备份时间戳 (调度判定用)。0=从未备份 → 首次 tick 即到期。
-    // pub: #113 detached 语义的集成测试直接断言 (tests/test_backup_detach.rs)。
+    // issue #10: last backup timestamp (for scheduling decisions). 0 = never backed up → due on first tick.
+    // pub: integration tests assert the #113 detached semantics directly (tests/test_backup_detach.rs).
     pub last_backup_ts: u64,
-    // issue #103: 备份目标从未配置的一次性 WARN 锁存 (调度路径静默, 不逐 tick 刷)。
+    // issue #103: one-shot WARN latch for never-configured backup target (scheduling path stays silent, no per-tick spam).
     backup_disabled_notified: bool,
-    // issue #37: 上次 retention sweep 时间戳 (调度判定用, 语义同 last_backup_ts)。
+    // issue #37: last retention sweep timestamp (for scheduling, same semantics as last_backup_ts).
     last_prune_ts: u64,
-    // issue #37: 累计清除的 history.db 行数 (/metrics fusion_sv_events_pruned_total)
+    // issue #37: total history.db rows pruned (/metrics fusion_sv_events_pruned_total)
     pub events_pruned_total: u64,
-    // PRD app-tiering: pin 覆盖内存缓存 (boot_auto 零查询); 真源在 store.boot_pin 表
+    // PRD app-tiering: in-memory pin override cache (boot_auto does zero queries); source of truth is store.boot_pin
     boot_pins: std::collections::HashMap<String, PinMode>,
-    // issue #137: 定时任务游标 (job name → 上次触发 ts)。内存镜像 meta job_last:<name>,
-    // spawn 即推进 (失败不重试到下个到期, 同 backup 语义)。
+    // issue #137: job cursors (job name → last fired ts). In-memory mirror of meta job_last:<name>;
+    // advanced at spawn time (no retry until next due on failure, same semantics as backup).
     job_last: std::collections::HashMap<String, u64>,
-    // issue #139: 外部告警摄入 dedup 闸门 (调用方 dedup_key → 上次放行 ts)。
-    // pub: http_server 摄入路由直接操作 (与 store/alerter 同级暴露)。
+    // issue #139: external alert ingest dedup gate (caller dedup_key → last admitted ts).
+    // pub: the http_server ingest route operates it directly (exposed alongside store/alerter).
     pub ingest_gate: crate::ingest::IngestGate,
-    // compose 容器上轮 tick 是否有 Failed (poll_interval 用)。ps() 是阻塞
-    // docker 子进程, poll_interval 每 tick 现场重查会在持锁下双倍 spawn
-    // (tick_compose 已查过一次) — 复用上轮结果, 一 tick 陈旧可接受。
+    // Whether any compose container was Failed last tick (used by poll_interval). ps() is a blocking
+    // docker subprocess; re-querying per tick inside poll_interval would double-spawn under the lock
+    // (tick_compose already queried once) — reuse the last result; one tick of staleness is acceptable.
     compose_any_failed: bool,
 }
 
 impl SupervisorCore {
-    // 生产构造: 真 bash start.sh + 真 probe。probe_map 填 spec + restart_cmd。
+    // Production constructor: real bash start.sh + real probe. probe_map supplies spec + restart_cmd.
     pub fn new(defs: Vec<ServiceDef>, cfg: Config) -> Result<Self> {
         let store = Arc::new(HistoryStore::open(&cfg.db_path)?);
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
             .with_event_sink(make_event_sink(store.clone()));
         let env_file = cfg.compose.env_file.clone();
         let compose_on = cfg.compose.enabled;
-        // issue #96: 端口快照供 daemon_stop_cmd 孤儿兜底查询
+        // issue #96: port snapshot for the daemon_stop_cmd orphan-cleanup lookup
         crate::manifest::register_ports(&defs);
         let runners: Vec<_> = defs
             .into_iter()
@@ -146,27 +146,27 @@ impl SupervisorCore {
                     &cmd,
                     move || real_probe_spec(&spec),
                     move |c: &str| {
-                        // issue #29: crash 自动重启路径也注入 shell 注册 env。
-                        // issue #78: 同时注入 sidecar 连接 env (不 gate compose 开关,
-                        // 与 up_native/up_one 一致 — 否则崩溃重启的服务又静默
-                        // 落回 SQLite)。解析失败仅 ERROR + 已解析部分继续 (不 bail):
-                        // 服务真起不来时探活失败告警兜底; 首次启动路径 up_native
-                        // 才是严格 fail-closed。
+                        // issue #29: the crash auto-restart path also injects shell registration env.
+                        // issue #78: also inject sidecar connection env (not gated on the compose
+                        // switch, matching up_native/up_one — otherwise a crash-restarted service
+                        // silently falls back to SQLite again). Parse failure logs ERROR only and
+                        // continues with what parsed (no bail): probe-failure alerts cover a service
+                        // that truly cannot start; only the first-start path up_native is strictly fail-closed.
                         let mut env: Vec<(String, String)> =
                             match crate::env_map::shell_env_for(&name, &env_file) {
                                 Ok(m) => m.into_iter().collect(),
                                 Err(e) => {
-                                    tracing::error!(svc = %name, err = %e, "shell env 解析失败, 重启以空 env 继续");
+                                    tracing::error!(svc = %name, err = %e, "shell env parse failed, restarting with empty env");
                                     Vec::new()
                                 }
                             };
                         match crate::env_map::native_env_for(&name, &env_file, compose_on) {
                             Ok(m) => env.extend(m),
                             Err(e) => {
-                                tracing::error!(svc = %name, err = %e, "sidecar env 解析失败, 重启以剩余 env 继续");
+                                tracing::error!(svc = %name, err = %e, "sidecar env parse failed, restarting with remaining env");
                             }
                         }
-                        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+                        // issue #125: per-service overlay applied last (same key overrides)
                         env.extend(crate::env_map::overlay_env_for(&name));
                         real_start_pair(&name, c, &env)
                     },
@@ -174,7 +174,7 @@ impl SupervisorCore {
                 )
             })
             .collect();
-        // issue #126: 仅生产构造器注入启动宽限窗口; 测试构造器保持 0 (行为不变)
+        // issue #126: only the production constructor injects the startup grace window; test constructors keep 0 (behavior unchanged)
         let grace = cfg.startup_grace_secs;
         let runners: Vec<_> = runners
             .into_iter()
@@ -189,9 +189,9 @@ impl SupervisorCore {
             cfg.alert_dedup_sec,
             cfg.container_crash_escalation,
         );
-        // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+        // issue #113: restore last backup timestamp — reload no longer re-triggers a full backup
         let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
-        // issue #137: 恢复定时任务游标 — reload 不重触发所有 job
+        // issue #137: restore job cursors — reload does not re-fire all jobs
         let job_last = load_job_last(&store, &cfg.jobs);
         Ok(Self {
             runners,
@@ -202,21 +202,21 @@ impl SupervisorCore {
             probe_fn: Arc::new(real_probe_spec),
             compose,
             compose_tracker,
-            // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+            // issue #113: restore last backup timestamp — reload no longer re-triggers a full backup
             last_backup_ts,
             backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
             job_last,
-            // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
+            // issue #139: start with an empty gate (dedup cursor not persisted — window resets after process restart, acceptable)
             ingest_gate: crate::ingest::IngestGate::default(),
             compose_any_failed: false,
         })
     }
 
-    // 测试构造: 注入 fake probe + fake start。defs 不经 layer 排序 (测试自带顺序)。
-    // compose 可选注入 (None=仅 native, Some=测试 compose 编排)。
+    // Test constructor: injects fake probe + fake start. defs skip layer sorting (tests supply their own order).
+    // compose optionally injected (None = native-only, Some = test compose orchestration).
     pub fn new_with_fns(
         defs: Vec<ServiceDef>,
         cfg: Config,
@@ -226,7 +226,7 @@ impl SupervisorCore {
         Self::new_with_fns_and_compose(defs, cfg, probe_fn, start_fn, None)
     }
 
-    // 测试构造 + compose 注入。
+    // Test constructor + compose injection.
     pub fn new_with_fns_and_compose(
         defs: Vec<ServiceDef>,
         cfg: Config,
@@ -240,7 +240,7 @@ impl SupervisorCore {
             std::env::temp_dir().join(format!("fusion-sv-test-{}-{}.db", std::process::id(), seq));
         let store = Arc::new(HistoryStore::open(&db_path).unwrap());
         let boot_pins = load_boot_pins(&store);
-        // issue #37: 测试构造同样注入事件 sink — native 告警落库行为与生产一致 (可测)
+        // issue #37: the test constructor also injects the event sink — native alert persistence matches prod (testable)
         let alerter = Alerter::new(cfg.alert_dedup_sec, cfg.alert_url.clone())
             .with_event_sink(make_event_sink(store.clone()));
         let start_fn = Arc::new(start_fn);
@@ -250,9 +250,9 @@ impl SupervisorCore {
             .filter(|d| d.managed)
             .map(|d| {
                 let pf = probe_fn.clone();
-                // issue #96: runner 内部 start 闭包接注入 start_fn (verb 转发) —
-                // invoke_start 在测试中可观测 (此前 no-op, restart/rollout 的
-                // start 半段测试不可见)
+                // issue #96: the runner's internal start closure uses the injected start_fn (verb forwarded) —
+                // invoke_start is observable in tests (previously a no-op, leaving the
+                // start half of restart/rollout invisible to tests)
                 let sf = start_fn.clone();
                 let name = d.name.clone();
                 runner::ServiceRunner::new(
@@ -272,9 +272,9 @@ impl SupervisorCore {
             cfg.alert_dedup_sec,
             cfg.container_crash_escalation,
         );
-        // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+        // issue #113: restore last backup timestamp — reload no longer re-triggers a full backup
         let last_backup_ts = store.get_meta("last_backup_ts").unwrap_or(0);
-        // issue #137: 恢复定时任务游标 (测试构造同款, 行为一致)
+        // issue #137: restore job cursors (same as the prod constructor, behavior identical)
         let job_last = load_job_last(&store, &cfg.jobs);
         Self {
             runners,
@@ -285,44 +285,44 @@ impl SupervisorCore {
             probe_fn,
             compose,
             compose_tracker,
-            // issue #113: 恢复上次备份时间戳 — reload 不再重触发全量备份
+            // issue #113: restore last backup timestamp — reload no longer re-triggers a full backup
             last_backup_ts,
             backup_disabled_notified: false,
             last_prune_ts: 0,
             events_pruned_total: 0,
             boot_pins,
             job_last,
-            // issue #139: 空闸门起步 (dedup 游标不持久化 — 进程重启后窗口重新计时, 可接受)
+            // issue #139: start with an empty gate (dedup cursor not persisted — window resets after process restart, acceptable)
             ingest_gate: crate::ingest::IngestGate::default(),
             compose_any_failed: false,
         }
     }
 
-    // up: compose 平面先 (sidecar), native 按 layer 序, business 容器最后。
-    // enabled=false 跳过 compose, 仅 native (保留单节点开发行为)。
+    // up: compose plane first (sidecar), native in layer order, business containers last.
+    // enabled=false skips compose, native only (preserves single-node dev behavior).
     pub async fn up_all(&mut self) -> Result<()> {
-        // 1. compose sidecar 先 (traefik/redis/postgres/qdrant), 等健康
+        // 1. compose sidecar first (traefik/redis/postgres/qdrant), wait for healthy
         if let Some(cb) = &self.compose {
-            tracing::info!("up: compose sidecar 平面先起");
+            tracing::info!("up: compose sidecar plane first");
             cb.up_sidecar()?;
         }
-        // 2. native 按 layer 序 (core→...→cluster), 层内并发 cap, 探活跳过已健康
+        // 2. native in layer order (core→...→cluster), concurrency cap within layer, probe-skip already healthy
         self.up_native().await?;
-        // 3. compose business 容器 (model-hub/cowork), 依赖 sidecar 健康
+        // 3. compose business containers (model-hub/cowork), depend on sidecar health
         if let Some(cb) = &self.compose {
-            tracing::info!("up: compose business 容器起 (依赖 sidecar)");
+            tracing::info!("up: compose business containers starting (depend on sidecar)");
             cb.up_business()?;
         }
         Ok(())
     }
 
-    // native up: 按 layer 序, 层内并发 cap。先探活, 已健康跳过 (避双启)。
+    // native up: layer order, concurrency cap within layer. Probe first, skip already healthy (avoid double start).
     async fn up_native(&mut self) -> Result<()> {
         self.up_native_where(&|_| true).await
     }
 
-    // PRD app-tiering: 带 boot 集过滤的 native up — keep=true 的服务参与启动, 其余跳过。
-    // up_all 走全真谓词; up_boot_set / boot_group 走成员谓词。复用既有层序+并发+探活逻辑。
+    // PRD app-tiering: native up with a boot-set filter — services with keep=true participate, the rest are skipped.
+    // up_all uses an always-true predicate; up_boot_set / boot_group use membership predicates. Reuses existing layer order + concurrency + probe-skip logic.
     async fn up_native_where(
         &mut self,
         keep: &(dyn Fn(&ServiceDef) -> bool + Send + Sync),
@@ -335,7 +335,7 @@ impl SupervisorCore {
                 .collect(),
         );
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
-        // 分层桶: 同 layer 内并发, 层间串行
+        // Layer buckets: concurrent within a layer, serial across layers
         let mut by_layer: std::collections::BTreeMap<Layer, Vec<ServiceDef>> =
             std::collections::BTreeMap::new();
         for d in sorted {
@@ -344,11 +344,11 @@ impl SupervisorCore {
         for (_layer, batch) in by_layer {
             let mut handles = Vec::new();
             for d in batch {
-                // 依赖门: compose 启用时, 该 native 服务依赖的 sidecar 容器须 Healthy 才起。
-                // 不靠 layer 隐式顺序; 显式校验, gate 未就绪跳过启动 (不标 Failed, 依赖问题非服务崩溃)。
+                // Dep gate: when compose is enabled, the sidecar containers this native service depends on must be Healthy before it starts.
+                // Not relying on implicit layer order; explicit check — an unready gate skips startup (not marked Failed, a dependency problem is not a service crash).
                 if !self.dep_gate_ok(&d.name).await {
                     if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == d.name) {
-                        // issue #90: 清残留重试排期 (避免旧 restart_after 触发陈旧重启)
+                        // issue #90: clear leftover retry schedule (avoid a stale restart_after triggering an outdated restart)
                         r.mark_stopped();
                     }
                     continue;
@@ -359,28 +359,28 @@ impl SupervisorCore {
                 let timeout = self.cfg.start_timeout_sec;
                 let env_file = self.cfg.compose.env_file.clone();
                 let compose_on = self.compose_enabled();
-                // 返回 (服务名, 是否跳过=已健康, 启动结果, 是否可重试)
-                // 可重试 = 真执行失败/超时 (依赖可能后到); env fail-closed 属配置
-                // 问题, 重试无救, 仍标终态 Failed (issue #90)
+                // Returns (service name, skipped=already healthy, start result, retryable)
+                // retryable = real exec failure/timeout (deps may arrive late); env fail-closed is a
+                // config problem no retry can fix — still marked terminal Failed (issue #90)
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    // 先探活: 已健康跳过 (R11: 用注入 probe_fn, 非真 probe)
+                    // Probe first: skip already healthy (R11: uses the injected probe_fn, not the real probe)
                     let spec = ProbeSpec::tcp(d.port);
                     if matches!((probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                         tracing::info!(svc = %d.name, "skip start (already up)");
                         return (d.name, true, Ok(()), false);
                     }
-                    // env 注入两类, 均解析失败 fail-closed 拒绝启动 (均不 gate 在
-                    // compose 开关上):
-                    // - issue #29: shell 注册 env
-                    // - issue #8/#78: sidecar 连接 env — 此前 gate 在 compose.enabled
-                    //   上, 默认 off 时 cowork 静默跑 SQLite / rag 静默跑 :memory:
+                    // Two env injection classes, both fail-closed on parse error (neither gated on
+                    // the compose switch):
+                    // - issue #29: shell registration env
+                    // - issue #8/#78: sidecar connection env — previously gated on compose.enabled;
+                    //   with the default off, cowork silently ran SQLite / rag silently ran :memory:
                     let mut env_overrides: Vec<(String, String)> = Vec::new();
                     if crate::env_map::needs_shell_env(&d.name) {
                         match crate::env_map::shell_env_for(&d.name, &env_file) {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
-                                tracing::error!(svc = %d.name, err = %e, "shell env 解析失败, fail-closed 拒绝启动");
+                                tracing::error!(svc = %d.name, err = %e, "shell env parse failed, fail-closed refusing to start");
                                 return (d.name, false, Err(e), false);
                             }
                         }
@@ -389,12 +389,12 @@ impl SupervisorCore {
                         match crate::env_map::native_env_for(&d.name, &env_file, compose_on) {
                             Ok(m) => env_overrides.extend(m),
                             Err(e) => {
-                                tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
+                                tracing::error!(svc = %d.name, err = %e, "env injection parse failed, fail-closed refusing to start");
                                 return (d.name, false, Err(e), false);
                             }
                         }
                     }
-                    // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+                    // issue #125: per-service overlay applied last (same key overrides)
                     env_overrides.extend(crate::env_map::overlay_env_for(&d.name));
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start");
                     let cmd = async { (start_fn)(&d.name, "start", &env_overrides) };
@@ -417,9 +417,9 @@ impl SupervisorCore {
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
                     if skipped_healthy {
-                        // 已健康采纳: 全套计数复位 (与 runner #124 恢复路径同语义) —
-                        // 只翻 state 不复位会让 Failed/带熔断计数的 runner 带
-                        // 陈旧 crash 窗口, 下一次宕机瞬间再触发封顶
+                        // Adopt already-healthy: reset the full counter set (same semantics as runner #124 recovery) —
+                        // flipping only the state without resetting would leave Failed runners / ones with circuit
+                        // counts carrying stale crash windows, tripping the cap again at the next outage
                         r.state = runner::State::Healthy;
                         r.fail_streak = 0;
                         r.restart_after = None;
@@ -428,7 +428,7 @@ impl SupervisorCore {
                         r.policy.reset();
                     } else if start_res.is_ok() {
                         r.state = runner::State::Starting;
-                        // issue #126: 拉起成功记启动宽限截止
+                        // issue #126: on successful start, record the boot grace deadline
                         r.set_boot_grace(now_unix());
                     } else {
                         let detail = start_res
@@ -436,19 +436,19 @@ impl SupervisorCore {
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "start failed".into());
                         if retryable {
-                            // issue #90: 启动失败进 tick 退避重试流 (依赖未就绪常见),
-                            // 不再直接标终态 Failed — 此前开机 PG 未起时 gateway/
-                            // identity 死等人工。exit-78 配置致命仍在 mark_start_failed
-                            // 内部标 Failed (重试无救)。
-                            tracing::error!(svc = %name, %detail, "up_native: 启动失败, 排期重试");
+                            // issue #90: start failures enter the tick backoff-retry flow (missing deps are common),
+                            // no longer directly marked terminal Failed — previously gateway/
+                            // identity waited forever for a human when PG was not up at boot. exit-78
+                            // config-fatal is still marked Failed inside mark_start_failed (no retry can fix it).
+                            tracing::error!(svc = %name, %detail, "up_native: start failed, retry scheduled");
                             let now_ts = now_unix();
                             let retry = r.mark_start_failed(&detail, now_ts);
                             if retry {
-                                tracing::info!(svc = %name, "已排期启动失败重试");
+                                tracing::info!(svc = %name, "start-fail retry scheduled");
                             }
                         } else {
-                            // env fail-closed = 配置问题, 重试不会自愈, 保持终态 Failed
-                            tracing::error!(svc = %name, %detail, "up_native: env 解析失败, 标 Failed (配置问题)");
+                            // env fail-closed = config problem, retry cannot self-heal, stays terminal Failed
+                            tracing::error!(svc = %name, %detail, "up_native: env parse failed, marked Failed (config problem)");
                             r.state = runner::State::Failed;
                         }
                     }
@@ -458,25 +458,25 @@ impl SupervisorCore {
         Ok(())
     }
 
-    // down: business 容器先 → native 逆序 (cluster→...→core) → sidecar 最后。
-    // compose down 一次性停 business+sidecar, 故分两步: 先停 business, native 停后再 down 全部。
+    // down: business containers first → native reverse order (cluster→...→core) → sidecar last.
+    // compose down stops business+sidecar in one shot, so two steps: stop business first, then down everything after native stops.
     pub async fn down_all(&mut self) -> Result<()> {
-        // 1. compose 全停 (business + sidecar 一起; 容器无 native 依赖, 先停安全)
+        // 1. compose down everything (business + sidecar together; containers have no native deps, safe to stop first)
         if let Some(cb) = &self.compose {
-            tracing::info!("down: compose 平面停 (business + sidecar)");
+            tracing::info!("down: compose plane stopping (business + sidecar)");
             cb.down()?;
         }
-        // 2. native 逆序停
+        // 2. native stop in reverse order
         self.down_native().await?;
         Ok(())
     }
 
-    // native down: 逆序 (cluster→domain→app→platform→core)。
+    // native down: reverse order (cluster→domain→app→platform→core).
     async fn down_native(&mut self) -> Result<()> {
         self.down_native_where(&|_| true).await
     }
 
-    // PRD app-tiering: 带 boot 集过滤的 native down (分组批量停用)。
+    // PRD app-tiering: native down with a boot-set filter (group bulk stop).
     async fn down_native_where(
         &mut self,
         keep: &(dyn Fn(&ServiceDef) -> bool + Send + Sync),
@@ -488,20 +488,20 @@ impl SupervisorCore {
             .filter(|d| keep(d))
             .collect();
         defs = ServiceManifest::sort_by_layer(defs);
-        defs.reverse(); // 逆序停
+        defs.reverse(); // stop in reverse order
         let sem = Arc::new(Semaphore::new(self.cfg.max_concurrent_start));
         let mut by_layer: std::collections::BTreeMap<Layer, Vec<ServiceDef>> =
             std::collections::BTreeMap::new();
         for d in defs {
             by_layer.entry(d.layer).or_default().push(d);
         }
-        // R12: BTreeMap 默认按键升序 (Core 先), 故 .rev() 取降序 (Cluster→...→Core)
+        // R12: BTreeMap defaults to ascending key order (Core first), so .rev() walks descending (Cluster→...→Core)
         for (_layer, batch) in by_layer.into_iter().rev() {
             let mut handles = Vec::new();
             for d in batch {
                 let sem = sem.clone();
                 let start_fn = self.start_fn.clone();
-                // 返回服务名, join 后写 runner.state = Stopped
+                // Returns the service name; after join, runner.state = Stopped
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tracing::info!(svc = %d.name, repo = %d.repo_dir, "start.sh stop");
@@ -515,7 +515,7 @@ impl SupervisorCore {
                 if let Ok(name) = h.await
                     && let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name)
                 {
-                    // issue #90: 手动停止清掉待执行的重试排期
+                    // issue #90: manual stop clears the pending retry schedule
                     r.mark_stopped();
                 }
             }
@@ -523,12 +523,12 @@ impl SupervisorCore {
         Ok(())
     }
 
-    // issue #31: 单服务 up/down。RPC up/down 的 service 参数此前被忽略 —
-    // `fusion-sv down <svc>` 实际跑 down_all 全停, 与 CLI 文档 `down [svc]` 不符且危险。
-    // 语义与 up_native/down_native 单条目一致: 探活跳过已健康 / env 注入 fail-closed / 状态机同款。
-    // issue #122: exec 移出核心锁。RPC 单服务 up/down/restart 期间 (start.sh
-    // 里 go build 链接可达数分钟) 曾持锁阻塞全部 RPC/HTTP (2026-11-11 实证)。
-    // 协议: prepare (锁内, 无 exec) → StartJob::run (锁外) → finish (锁内)。
+    // issue #31: single-service up/down. The RPC up/down service param was previously ignored —
+    // `fusion-sv down <svc>` actually ran down_all (full stop), contradicting the CLI doc `down [svc]` and dangerous.
+    // Semantics match the up_native/down_native single entry: probe-skip healthy / fail-closed env injection / same state machine.
+    // issue #122: exec moved out of the core lock. During single-service RPC up/down/restart
+    // (go build linking inside start.sh can take minutes) the lock blocked all RPC/HTTP (observed 2026-11-11).
+    // Protocol: prepare (under lock, no exec) → StartJob::run (outside lock) → finish (under lock).
 
     pub async fn up_one(&mut self, name: &str) -> Result<()> {
         match self.prepare_up_one(name).await? {
@@ -540,7 +540,7 @@ impl SupervisorCore {
         }
     }
 
-    // 阶段 1 (锁内): 依赖门 + 探活跳过 + env 解析, 不 exec。None = 已健康跳过。
+    // Phase 1 (under lock): dep gate + probe skip + env resolution, no exec. None = skipped (already healthy).
     pub async fn prepare_up_one(&mut self, name: &str) -> Result<Option<StartJob>> {
         let d = self
             .runners
@@ -549,13 +549,13 @@ impl SupervisorCore {
             .map(|r| r.def.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
         if !self.dep_gate_ok(&d.name).await {
-            // 与 up_native 一致: 依赖问题非崩溃, 标 Stopped 跳过
+            // Same as up_native: a dependency problem is not a crash, mark Stopped and skip
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
                 r.mark_stopped();
             }
-            anyhow::bail!("dep gate 未就绪, 跳过启动: {}", d.name);
+            anyhow::bail!("dep gate not ready, skipping start: {}", d.name);
         }
-        // 先探活: 已健康跳过 (避双启)
+        // Probe first: skip already healthy (avoid double start)
         let spec = ProbeSpec::tcp(d.port);
         if matches!((self.probe_fn)(&spec), ProbeResult::Healthy { .. }) {
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
@@ -564,13 +564,13 @@ impl SupervisorCore {
             tracing::info!(svc = %d.name, "skip start (already up)");
             return Ok(None);
         }
-        // env 注入: shell 注册 + sidecar 连接, 均不 gate 在 compose 开关上
-        // (issue #78: 默认 off 时也要注入, 否则 cowork 静默跑 SQLite), 均 fail-closed
+        // env injection: shell registration + sidecar connection, neither gated on the compose
+        // switch (issue #78: inject even when off by default, otherwise cowork silently runs SQLite), both fail-closed
         let env_file = self.cfg.compose.env_file.clone();
         let mut env_overrides: Vec<(String, String)> = Vec::new();
         if crate::env_map::needs_shell_env(&d.name) {
             let m = crate::env_map::shell_env_for(&d.name, &env_file).map_err(|e| {
-                tracing::error!(svc = %d.name, err = %e, "shell env 解析失败, fail-closed 拒绝启动");
+                tracing::error!(svc = %d.name, err = %e, "shell env parse failed, fail-closed refusing to start");
                 e
             })?;
             env_overrides.extend(m);
@@ -578,12 +578,12 @@ impl SupervisorCore {
         if crate::env_map::needs_injection(&d.name) {
             let m = crate::env_map::native_env_for(&d.name, &env_file, self.compose_enabled())
                 .map_err(|e| {
-                tracing::error!(svc = %d.name, err = %e, "env 注入解析失败, fail-closed 拒绝启动");
+                tracing::error!(svc = %d.name, err = %e, "env injection parse failed, fail-closed refusing to start");
                 e
             })?;
             env_overrides.extend(m);
         }
-        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+        // issue #125: per-service overlay applied last (same key overrides)
         env_overrides.extend(crate::env_map::overlay_env_for(&d.name));
         tracing::info!(svc = %d.name, repo = %d.repo_dir, env_n = env_overrides.len(), "start.sh start (single)");
         Ok(Some(StartJob {
@@ -595,7 +595,7 @@ impl SupervisorCore {
         }))
     }
 
-    // 阶段 3 (锁内): exec 结果落状态机。
+    // Phase 3 (under lock): apply the exec result to the state machine.
     pub async fn finish_up_one(&mut self, name: &str, res: Result<()>) -> Result<()> {
         let r = self
             .runners
@@ -605,19 +605,20 @@ impl SupervisorCore {
         match res {
             Ok(()) => {
                 r.state = runner::State::Starting;
-                // 拉起成功清残留重启排期/熔断 — 不清的话此前 start-fail/crash
-                // 流留下的 restart_after 会在下次宕机时绕过退避立即重启
+                // On successful start clear leftover restart schedule / circuit counters — without
+                // clearing, a restart_after left by a prior start-fail/crash flow would
+                // bypass backoff and restart immediately at the next outage
                 r.restart_after = None;
                 r.start_retry = false;
                 r.start_fail_streak = 0;
-                // issue #126: 拉起成功记启动宽限截止 — 窗口内探活失败不计失败
-                // 不排重启 (慢启动 daemon 绑定口需 30-60s)
+                // issue #126: on successful start record the boot grace deadline — probe failures inside the
+                // window count no failures and schedule no restarts (slow-start daemons need 30-60s to bind)
                 r.set_boot_grace(now_unix());
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!(svc = %name, err = %e, "start fail (exec 锁外返回)");
-                // issue #90: 同 up_native — 排期退避重试而非终态 Failed
+                tracing::warn!(svc = %name, err = %e, "start fail (exec returned outside the lock)");
+                // issue #90: same as up_native — schedule a backoff retry instead of terminal Failed
                 r.mark_start_failed(&e.to_string(), now_unix());
                 Err(e)
             }
@@ -630,7 +631,7 @@ impl SupervisorCore {
         self.finish_down_one(name, res).await
     }
 
-    // 阶段 1 (锁内): 校验 + 组 stop 作业 (不 exec)。
+    // Phase 1 (under lock): validate + assemble the stop job (no exec).
     pub async fn prepare_down_one(&mut self, name: &str) -> Result<StartJob> {
         let d = self
             .runners
@@ -648,33 +649,33 @@ impl SupervisorCore {
         })
     }
 
-    // 阶段 3 (锁内): stop 结果落状态机 (stop fail 不拒 — pidfile 缺失等 no-op)。
+    // Phase 3 (under lock): apply the stop result to the state machine (stop fail does not reject — pidfile missing etc. are no-ops).
     pub async fn finish_down_one(&mut self, name: &str, res: Result<()>) -> Result<()> {
         if let Err(e) = res.as_ref() {
-            tracing::warn!(svc = %name, err = %e, "stop fail (exec 锁外返回)");
+            tracing::warn!(svc = %name, err = %e, "stop fail (exec returned outside the lock)");
         }
         if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
-            // issue #90: 手动 down 清掉待执行的启动重试排期
+            // issue #90: manual down clears the pending start-retry schedule
             r.mark_stopped();
         }
         Ok(())
     }
 
-    // ===== issue #96: restart/rollout 必须真正替换进程 =====
-    // 此前 RPC restart 与 rollout 都只 invoke_start (从不 stop): 旧监听器存活,
-    // 新进程撞注册端口死掉, 探活命中旧进程 → "ok"/Healthy 但代码从未被替换。
+    // ===== issue #96: restart/rollout must truly replace the process =====
+    // Previously both RPC restart and rollout only invoked start (never stop): the old listener survived,
+    // the new process died colliding with the registered port, the probe hit the old process → "ok"/Healthy but the code was never replaced.
 
-    // stop 命令 + 端口探活验证 — 窗口内端口仍被占则重发 stop (issue #134:
-    // 脚本型 stop 的孤儿兜底/异步退出偶发慢于首轮验证, 有界重试后仍占口才
-    // fail, 失败信息带占口 PID), 调用方不得返回 ok。stop 命令失败不 bail
-    // (pidfile 缺失等 no-op 场景), 由探活验证兜底; daemon spec 的孤儿监听
-    // 由 daemon_stop_cmd 的 port 锚定 lsof 补杀处理。
+    // stop command + port probe verification — if the port is still held within the window, re-issue stop (issue #134:
+    // script-type stop's orphan cleanup / async exit is occasionally slower than the first verification pass; only fail
+    // after bounded retries still find the port held, with the holder PID in the failure message). The caller must not get ok.
+    // stop command failure does not bail (pidfile-missing etc. no-op scenarios); probe verification covers it;
+    // orphan listeners of daemon specs are handled by daemon_stop_cmd's port-anchored lsof cleanup.
     async fn stop_and_verify(&mut self, name: &str, run_stop: bool) -> Result<()> {
-        // issue #122: restart 路径的 stop exec 已在锁外作业执行; 这里的重发
-        // 是 stop verb 本身 (TERM→宽限→KILL, 有界秒级, 非长构建脚本), 锁内
-        // 可接受 — 与 #123 的 5s 预跑窗口同量级。
+        // issue #122: the restart path's stop exec already ran as an outside-lock job; the re-issue
+        // here is the stop verb itself (TERM→grace→KILL, bounded seconds, not a long build script) —
+        // acceptable under the lock, same magnitude as #123's 5s pre-run window.
         if run_stop && let Err(e) = (self.start_fn)(name, "stop", &[]) {
-            tracing::warn!(svc = %name, err = %e, "stop 命令失败 (由探活验证兜底)");
+            tracing::warn!(svc = %name, err = %e, "stop command failed (covered by probe verification)");
         }
         let port = self
             .runners
@@ -683,20 +684,20 @@ impl SupervisorCore {
             .map(|r| r.def.port)
             .unwrap_or(0);
         let spec = ProbeSpec::tcp(port);
-        // 30×250ms (7.5s) — daemon_stop_cmd 已在 shell 内等进程退出, 此处是
-        // 脚本型 stop 异步退出 / 孤儿兜底生效的最后确认; i=8 与 i=20 时端口
-        // 仍被占则重发 stop (最多补发 2 次)。
+        // 30×250ms (7.5s) — daemon_stop_cmd already waits for process exit inside the shell; this is the
+        // final confirmation for script-type stop's async exit / orphan cleanup; re-issue stop at i=8 and
+        // i=20 if the port is still held (at most 2 re-issues).
         for i in 0..30 {
             if !matches!((self.probe_fn)(&spec), ProbeResult::Healthy { .. }) {
                 if i > 0 {
-                    tracing::info!(svc = %name, waits = i, "stop 确认: 端口已释放");
+                    tracing::info!(svc = %name, waits = i, "stop confirmed: port released");
                 }
                 return Ok(());
             }
             if i == 8 || i == 20 {
-                tracing::warn!(svc = %name, round = i, "端口仍被占, 重发 stop 命令");
+                tracing::warn!(svc = %name, round = i, "port still held, re-issuing stop command");
                 if let Err(e) = (self.start_fn)(name, "stop", &[]) {
-                    tracing::warn!(svc = %name, err = %e, "stop 重发失败 (继续探活验证)");
+                    tracing::warn!(svc = %name, err = %e, "stop re-issue failed (continuing probe verification)");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -704,14 +705,16 @@ impl SupervisorCore {
         let holder = port_holder_pid(port)
             .map(|p| format!(", pid={p}"))
             .unwrap_or_default();
-        anyhow::bail!("stop 后端口仍被占用 (旧进程未被替换, 重发 stop 无效): {name}:{port}{holder}")
+        anyhow::bail!(
+            "port still held after stop (old process not replaced, stop re-issue ineffective): {name}:{port}{holder}"
+        )
     }
 
-    // 人工 restart: stop 旧进程 (验证端口释放) → start 新进程。返回 pidfile
-    // 记录的旧→新 PID (None = pidfile 缺失/非法)。复位熔断与启动失败重试
-    // (原 RPC restart 内联语义, 移入此处与真实 stop+start 流程绑定)。
-    // issue #122: RPC 路径改走三段 (prepare → 锁外 exec → finish), 此编排器
-    // 仅供内部/测试 — 持锁等价旧语义。
+    // Manual restart: stop the old process (verify port release) → start the new one. Returns the
+    // pidfile-recorded old→new PIDs (None = pidfile missing/invalid). Resets circuit counters and start-fail
+    // retries (the original inline RPC restart semantics, moved here and bound to the real stop+start flow).
+    // issue #122: the RPC path now goes through the three phases (prepare → outside-lock exec → finish); this
+    // orchestrator is for internal/test use only — holding the lock matches the old semantics.
     pub async fn restart_one(&mut self, name: &str) -> Result<(Option<u32>, Option<u32>)> {
         let (old_pid, stop_job) = self.prepare_restart(name).await?;
         let stop_res = stop_job.run().await;
@@ -726,7 +729,7 @@ impl SupervisorCore {
         self.finish_restart(name, old_pid, res).await
     }
 
-    // 阶段 1 (锁内): 复位计数/排期 + 组 stop 作业 (不 exec)。
+    // Phase 1 (under lock): reset counters/schedule + assemble the stop job (no exec).
     pub async fn prepare_restart(&mut self, name: &str) -> Result<(Option<u32>, StartJob)> {
         if !self.runners.iter().any(|r| r.def.name == name) {
             anyhow::bail!("unknown service: {name}");
@@ -736,13 +739,13 @@ impl SupervisorCore {
             r.policy.reset();
             r.start_fail_streak = 0;
             r.start_retry = false;
-            // issue #121: 清掉崩溃路径排定的 restart_after — 否则人工 restart 刚
-            // 替换进程, 到期的 tick 又 spawn 一次, 双实例抢端口后败者秒死 (实测
-            // old_pid=40281 → 40s 后 new_pid=42476 的连环重启)。
+            // issue #121: clear the crash path's scheduled restart_after — otherwise a manual restart just
+            // replaced the process, the due tick spawns another, and the double instance fights over the port
+            // with the loser dying instantly (observed chain restarts old_pid=40281 → new_pid=42476 40s later).
             r.restart_after = None;
             r.state = runner::State::Stopped;
         }
-        tracing::info!(svc = %name, old_pid, "restart: 停旧进程");
+        tracing::info!(svc = %name, old_pid, "restart: stopping old process");
         Ok((
             old_pid,
             StartJob {
@@ -755,34 +758,34 @@ impl SupervisorCore {
         ))
     }
 
-    // 阶段 2 (锁内): stop 结果核验 (探活确认端口释放, 有界等待无长 exec) +
-    // 组 start 作业。非 restart 型服务 (Daemon spec) 语义 = stop → start 两次 exec。
+    // Phase 2 (under lock): verify the stop result (probe confirms port release, bounded wait, no long exec) +
+    // assemble the start job. For non-restart services (Daemon spec) the semantics = two execs: stop → start.
     pub async fn restart_after_stop(
         &mut self,
         name: &str,
         stop_res: Result<()>,
     ) -> Result<Vec<StartJob>> {
         if let Err(e) = stop_res.as_ref() {
-            tracing::warn!(svc = %name, err = %e, "restart: stop 命令失败 (由探活验证兜底)");
+            tracing::warn!(svc = %name, err = %e, "restart: stop command failed (covered by probe verification)");
         }
         self.stop_and_verify(name, false).await?;
-        tracing::info!(svc = %name, "restart: 旧进程已停, 拉起新进程");
+        tracing::info!(svc = %name, "restart: old process stopped, starting new process");
         let r = self
             .runners
             .iter()
             .find(|r| r.def.name == name)
             .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
-        // 与 runner invoke_start 闭包同语义: shell 注册 env 解析, 失败仅 ERROR +
-        // 空 env 继续 (restart 型 exec 需要共享 venv / key 注入, #34/#80)
+        // Same semantics as the runner invoke_start closure: shell registration env resolution; on failure
+        // only ERROR + continue with empty env (restart-type exec needs the shared venv / key injection, #34/#80)
         let env_file = self.cfg.compose.env_file.clone();
         let env: Vec<(String, String)> = match crate::env_map::shell_env_for(name, &env_file) {
             Ok(m) => m.into_iter().collect(),
             Err(e) => {
-                tracing::error!(svc = %name, err = %e, "shell env 解析失败, restart 以空 env 继续");
+                tracing::error!(svc = %name, err = %e, "shell env parse failed, restart continues with empty env");
                 Vec::new()
             }
         };
-        // issue #125: per-service overlay 最后叠加 (同 key 覆盖)
+        // issue #125: per-service overlay applied last (same key overrides)
         let mut env = env;
         env.extend(crate::env_map::overlay_env_for(name));
         let timeout = self.cfg.start_timeout_sec;
@@ -808,7 +811,7 @@ impl SupervisorCore {
         Ok(jobs)
     }
 
-    // 阶段 3 (锁内): start 结果落状态机 + pid 替换证据。
+    // Phase 3 (under lock): apply the start result to the state machine + pid replacement evidence.
     pub async fn finish_restart(
         &mut self,
         name: &str,
@@ -822,17 +825,17 @@ impl SupervisorCore {
             .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?;
         res?;
         r.state = runner::State::Starting;
-        // issue #126: restart 拉起成功记启动宽限截止 (慢启动 daemon 绑口窗口)
+        // issue #126: on restart success record the boot grace deadline (slow-start daemon bind window)
         r.set_boot_grace(now_unix());
         let new_pid = read_pidfile_pid(name);
-        tracing::info!(svc = %name, old_pid, new_pid, "restart: start 已发起 (pid 替换)");
+        tracing::info!(svc = %name, old_pid, new_pid, "restart: start issued (pid replacement)");
         Ok((old_pid, new_pid))
     }
 
-    // ===== PRD app-tiering (issue #62): boot 分级启动 API =====
+    // ===== PRD app-tiering (issue #62): boot tiering start API =====
 
-    // 生效优先级: pin 覆盖 > 注册表 boot 字段。boot_pins 内存缓存 (构造时从 store 加载),
-    // set_boot_pin 时同步更新 — boot_auto 零查询, tick/RPC 热路径不碰 SQLite。
+    // Precedence: pin override > registry boot field. boot_pins in-memory cache (loaded from the store at
+    // construction), updated in sync at set_boot_pin — boot_auto does zero queries, hot tick/RPC paths never touch SQLite.
     pub fn boot_auto(&self, d: &ServiceDef) -> bool {
         match self.boot_pins.get(&d.name) {
             Some(PinMode::Auto) => true,
@@ -841,11 +844,11 @@ impl SupervisorCore {
         }
     }
 
-    // 开机集 = T0 ∪ pin=auto。auto_up_on_start 语义收窄为只拉这批 (issue #62)。
-    // 复用 up_native_where: 层序 + 并发 cap + 探活跳过已健康, 行为与 up_all 一致。
+    // Boot set = T0 ∪ pin=auto. auto_up_on_start is narrowed to only bring up this set (issue #62).
+    // Reuses up_native_where: layer order + concurrency cap + probe-skip healthy, same behavior as up_all.
     pub async fn up_boot_set(&mut self) -> Result<()> {
-        // 先物化成员集再进 up_native_where — 闭包只捕获 owned set,
-        // 不借 &self.boot_pins (与循环内 &mut self 借用冲突)。
+        // Materialize the member set before entering up_native_where — the closure captures only the owned set,
+        // never borrowing &self.boot_pins (conflicts with the &mut self borrow inside the loop).
         let members: std::collections::HashSet<String> = self
             .runners
             .iter()
@@ -856,8 +859,8 @@ impl SupervisorCore {
         self.up_native_where(&|d| members.contains(&d.name)).await
     }
 
-    // 分组批量 up/down (面板 "一键拉起/全部停止")。复用逐服务路径,
-    // 返回部分失败汇总 (验收: group 部分失败可观测, 不因单个失败中断整批)。
+    // Group bulk up/down (panel "start all / stop all"). Reuses per-service paths,
+    // returns a partial-failure summary (acceptance: group partial failures observable, one failure never aborts the batch).
     pub async fn boot_group(&mut self, group: &str, action: &str) -> Result<serde_json::Value> {
         if action != "up" && action != "down" {
             anyhow::bail!("unknown boot action: {action}");
@@ -865,16 +868,16 @@ impl SupervisorCore {
         let keep: Box<dyn Fn(&ServiceDef) -> bool + Send + Sync> = match group {
             "T0" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T0),
             "T1" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T1),
-            // T2 = 按需层 (注册表无 boot 字段的缺省 tier), tray "APP · 按需" 面板
-            // 一键启动/停止走这里 — 此前缺该 arm, tray 发 T2 直接 bail。
+            // T2 = on-demand tier (default tier for registry entries without a boot field); the tray "APP · on-demand"
+            // panel one-click start/stop goes here — this arm was previously missing and tray T2 requests bailed outright.
             "T2" => Box::new(|d: &ServiceDef| d.boot_tier == BootTier::T2),
-            // issue #106: app = T1 ∪ T2 联合组 — tray APP 面板一键启停走这里。
-            // #91 把 shell 常驻后端迁到 T1 后, 用户感知的 "app fleet" 是 T1∪T2;
-            // 只发 T2 会把 8 个 T1 (cowork/agent-studio/plugins 等) 留在运行态,
-            // 操作员观感即 "一键停止没反应"。T0 永不参与。
+            // issue #106: app = T1 ∪ T2 union group — the tray APP panel one-click start/stop goes here.
+            // After #91 moved shell resident backends to T1, the user-perceived "app fleet" is T1∪T2;
+            // sending only T2 would leave 8 T1 services (cowork/agent-studio/plugins etc.) running,
+            // which operators perceive as "one-click stop does nothing". T0 never participates.
             "app" => Box::new(|d: &ServiceDef| d.boot_tier != BootTier::T0),
             "pinned" => {
-                // 克隆 pin 快照进闭包 — 不借 self
+                // Clone the pin snapshot into the closure — never borrow self
                 let pins: Vec<String> = self.boot_pins.keys().cloned().collect();
                 Box::new(move |d: &ServiceDef| pins.contains(&d.name))
             }
@@ -890,7 +893,7 @@ impl SupervisorCore {
         let mut stopped = 0u32;
         let mut failed = 0u32;
         let mut skipped = 0u32;
-        // issue #90: 启动失败已排期重试 (不再直接 Failed)
+        // issue #90: start failures have a retry scheduled (no longer directly Failed)
         let mut retrying = 0u32;
         for r in self.runners.iter() {
             if !keep(&r.def) {
@@ -901,7 +904,7 @@ impl SupervisorCore {
                 S::Starting | S::Restarting => started += 1,
                 S::Healthy | S::Draining => already_up += 1,
                 S::Stopped if action == "down" => stopped += 1,
-                S::Stopped if action == "up" => skipped += 1, // dep-gate 跳过等
+                S::Stopped if action == "up" => skipped += 1, // dep-gate skips etc.
                 S::Unhealthy => retrying += 1,
                 S::Failed => failed += 1,
                 _ => skipped += 1,
@@ -930,8 +933,8 @@ impl SupervisorCore {
         }))
     }
 
-    // /api/v1/boot 冷启动全量 (只读, 无 token — 与 /api/v1/status 对齐)。
-    // tier 分组序 (T0→T1→T2), 同 tier 内稳定排序保持注册表书写顺序。
+    // /api/v1/boot cold-start full listing (read-only, no token — aligned with /api/v1/status).
+    // Tier group order (T0→T1→T2), stable sort within a tier preserves registry file order.
     pub fn boot_status(&self) -> Vec<BootEntry> {
         let mut out: Vec<BootEntry> = self
             .runners
@@ -955,7 +958,7 @@ impl SupervisorCore {
         out
     }
 
-    // 写/清个人覆盖: 真源 store.boot_pin 表 (重启不丢, 验收 §5.4), 内存缓存同步。
+    // Write/clear personal overrides: source of truth is the store.boot_pin table (survives restart, acceptance §5.4); memory cache kept in sync.
     pub fn set_boot_pin(&mut self, service: &str, mode: Option<PinMode>) -> Result<()> {
         if !self.runners.iter().any(|r| r.def.name == service) {
             anyhow::bail!("unknown service: {service}");
@@ -977,12 +980,12 @@ impl SupervisorCore {
                     "native",
                     "info",
                 ) {
-                    tracing::warn!(svc = %service, err = %e, "BootPin 事件写库失败 (非致命)");
+                    tracing::warn!(svc = %service, err = %e, "BootPin event write fail (non-fatal)");
                 }
             }
             None => {
                 self.boot_pins.remove(service);
-                tracing::info!(svc = %service, "boot pin 清除 (回到注册表 boot 语义)");
+                tracing::info!(svc = %service, "boot pin cleared (back to registry boot semantics)");
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -991,15 +994,15 @@ impl SupervisorCore {
                     self.store
                         .record_event(service, "BootPin", "pin cleared", ts, "native", "info")
                 {
-                    tracing::warn!(svc = %service, err = %e, "BootPin 事件写库失败 (非致命)");
+                    tracing::warn!(svc = %service, err = %e, "BootPin event write fail (non-fatal)");
                 }
             }
         }
         Ok(())
     }
 
-    // status: native entries + compose 容器 entries, 合并一张表。
-    // 容器 plane="compose", state 来自 docker ps 健康映射。
+    // status: native entries + compose container entries merged into one table.
+    // Containers get plane="compose", state from the docker ps health mapping.
     pub fn status_all(&self) -> Vec<StatusEntry> {
         let mut out: Vec<StatusEntry> = self
             .runners
@@ -1026,12 +1029,12 @@ impl SupervisorCore {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(err = %e, "compose ps 失败 (状态表缺容器行)");
+                    tracing::warn!(err = %e, "compose ps failed (status table missing container rows)");
                 }
             }
         }
-        // issue #112: status 附带最近一次 restart 类事件 — 事后可答
-        // "这服务最近 24h 谁拉起的" (AutoRestart/ManualStart/ManualStop)。
+        // issue #112: status carries the most recent restart-class event — afterwards answers
+        // "who started this service in the last 24h" (AutoRestart/ManualStart/ManualStop).
         let restarts = self.store.last_restart_map();
         for e in &mut out {
             e.last_restart = restarts.get(&e.name).cloned();
@@ -1039,26 +1042,26 @@ impl SupervisorCore {
         out
     }
 
-    // 单轮监督: native runner tick + compose 容器健康探测。
-    // 容器: ps → exited/unhealthy → 标 Failed + 告警 (同 native 宕机路径)。
-    // compose restart: unless-stopped 已处理自动重启, supervisor 仅报告状态 + 告警。
+    // One supervision round: native runner tick + compose container health probing.
+    // Containers: ps → exited/unhealthy → mark Failed + alert (same as the native down path).
+    // compose restart: unless-stopped already handles auto-restart; supervisor only reports state + alerts.
     pub async fn tick_all(&mut self, now_ts: u64) {
-        // issue #123: 探活并发预跑 — tick 全程持核心锁, 串行探活在降级 fleet 下
-        // (N 个宕机服务 × 2s 超时) 把锁扣住 N×2s, RPC/HTTP 全堵 (2026-11-11 实测:
-        // 睡眠唤醒后 10+ 服务 Timeout, /api/v1/status 连续 5s+ 无响应)。
-        // 并发预跑整轮压到 max(2s) 量级, 锁内只做状态机推进。
+        // issue #123: concurrent probe pre-run — tick holds the core lock throughout; serial probing on a
+        // degraded fleet (N down services × 2s timeout) pins the lock for N×2s, blocking all RPC/HTTP
+        // (measured 2026-11-11: after wake from sleep 10+ services timed out, /api/v1/status unresponsive 5s+).
+        // The concurrent pre-run brings a full round down to ~max(2s); under the lock only the state machine advances.
         self.preflight_probes().await;
         for r in &mut self.runners {
             if let Err(e) = r.tick(now_ts, &self.store, &mut self.alerter).await {
-                tracing::warn!(svc = %r.def.name, err = %e, "tick fail (继续下一个)");
+                tracing::warn!(svc = %r.def.name, err = %e, "tick fail (continuing to the next)");
             }
         }
         self.tick_compose(now_ts).await;
     }
 
-    // issue #123: 全 fleet 探活并发预跑 (spawn_blocking + JoinSet), 结果灌进
-    // runner.cached_probe, 本轮 tick 直接取用。单 runner 失败 (panic/join) 回落
-    // 现场探 (cached_probe 保持 None)。
+    // issue #123: fleet-wide concurrent probe pre-run (spawn_blocking + JoinSet); results feed
+    // runner.cached_probe, which this tick round consumes directly. A single runner failure (panic/join)
+    // falls back to probing inline (cached_probe stays None).
     async fn preflight_probes(&mut self) {
         let jobs: Vec<(String, runner::ProbeFn)> = self
             .runners
@@ -1078,8 +1081,8 @@ impl SupervisorCore {
         }
     }
 
-    // issue #122 phase-2: 收走 tick 挂起的到点重启作业 (锁内, 不 exec)。
-    // 调用方在核心锁外经 run_pending_execs 并发执行, 再 finish_pending_execs 落账。
+    // issue #122 phase-2: collect tick-scheduled due restart jobs (under lock, no exec).
+    // The caller runs them concurrently outside the core lock via run_pending_execs, then settles results via finish_pending_execs.
     pub fn collect_pending_execs(
         &mut self,
     ) -> Vec<(String, bool, runner::StartFn, runner::ProbeFn)> {
@@ -1096,24 +1099,27 @@ impl SupervisorCore {
             }
         }
         if !out.is_empty() {
-            tracing::info!(n = out.len(), "tick 到点重启: exec 移出核心锁");
+            tracing::info!(
+                n = out.len(),
+                "tick due restarts: exec moved out of the core lock"
+            );
         }
         out
     }
 
-    // issue #122 phase-2: 锁外执行挂起重启作业 (并发), 返回逐服务结果。
-    // issue #124: exec 前置探活 — 操作员手工 start.sh restart 可能已把服务拉起
-    // (慢启动窗口内 #86 闸门已放行), 再拉就是双进程撞口 (调用方 502)。
-    // 已 Healthy → 采纳外部实例, 跳过 exec。
+    // issue #122 phase-2: run pending restart jobs outside the lock (concurrently), returning per-service results.
+    // issue #124: probe before exec — an operator's manual start.sh restart may have already brought the service up
+    // (the #86 gate let it through during the slow-start window); starting again means two processes fighting over the port (caller gets 502).
+    // Already Healthy → adopt the external instance, skip exec.
     pub async fn run_pending_execs(
         execs: Vec<(String, bool, runner::StartFn, runner::ProbeFn)>,
     ) -> Vec<(String, runner::ExecOutcome)> {
         let mut set = tokio::task::JoinSet::new();
         for (name, is_restart, f, probe) in execs {
             set.spawn_blocking(move || {
-                // panic 隔离 — start 闭包 panic 若冒泡成 JoinError, 服务名丢失,
-                // exec_in_flight 永远清不掉 → 该服务监督永久停摆 (tick 早退)。
-                // 捕获转 Ran(Err), finish 落账正常复位闸门。
+                // Panic isolation — if a start closure panic bubbles up as a JoinError, the service name is lost
+                // and exec_in_flight can never be cleared → supervision of that service halts permanently (tick early-returns).
+                // Catch and convert to Ran(Err); finish settles it and resets the gate normally.
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if matches!(probe(), crate::probe::ProbeResult::Healthy { .. }) {
                         return (name.clone(), runner::ExecOutcome::Adopted);
@@ -1135,13 +1141,15 @@ impl SupervisorCore {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok(pair) => out.push(pair),
-                Err(e) => tracing::error!(err = %e, "pending exec join fail (该服务本轮回落)"),
+                Err(e) => {
+                    tracing::error!(err = %e, "pending exec join fail (that service falls back this round)")
+                }
             }
         }
         out
     }
 
-    // issue #122 phase-2: 重新拿锁, 逐服务落账 exec 结果 (状态机/告警/pid 审计)。
+    // issue #122 phase-2: re-acquire the lock and settle exec results per service (state machine/alerts/pid audit).
     pub async fn finish_pending_execs(
         &mut self,
         now_ts: u64,
@@ -1149,9 +1157,9 @@ impl SupervisorCore {
     ) {
         for (name, outcome) in results {
             if let Some(r) = self.runners.iter_mut().find(|r| r.def.name == name) {
-                // issue #149: exec 在飞期间操作员 down 了该服务 — 在飞结果必须
-                // 丢弃, 不得落账 (apply_adopted/apply_exec_result 会把 Stopped
-                // 翻回 Healthy/Starting, 静默撤销 ManualStop)。
+                // issue #149: the operator downed this service while exec was in flight — the in-flight result
+                // must be discarded, never settled (apply_adopted/apply_exec_result would flip Stopped
+                // back to Healthy/Starting, silently undoing the ManualStop).
                 if r.state == runner::State::Stopped {
                     r.exec_in_flight = false;
                     tracing::info!(
@@ -1172,9 +1180,9 @@ impl SupervisorCore {
         }
     }
 
-    // 测试/单机便捷入口: tick + 到期 exec + 落账 (持 &mut 全程 — 测试无并发,
-    // 无锁可让)。生产 daemon 路径在 main.rs: tick_all (锁内) → collect → 锁外
-    // run_pending_execs → finish (重新拿锁)。
+    // Test/single-machine convenience entry: tick + due exec + settle (holds &mut throughout — tests have
+    // no concurrency, no lock to yield). The production daemon path lives in main.rs: tick_all (under lock) → collect →
+    // run_pending_execs (outside lock) → finish (re-acquire lock).
     pub async fn drive(&mut self, now_ts: u64) {
         self.tick_all(now_ts).await;
         let execs = self.collect_pending_execs();
@@ -1185,31 +1193,31 @@ impl SupervisorCore {
         self.finish_pending_execs(now_ts, results).await;
     }
 
-    // issue #107 D2: daemon 冷启动状态对账。launchd 崩溃重启 (如系统睡眠中
-    // 进程死亡) 后, 托管服务的 nohup 进程往往还活着, 但 runner 全部初始为
-    // Stopped — 首个 tick 前的 status 会谎报 Stopped, 操作员据此手动 restart
-    // 会杀掉健康进程 (实测事故 2026-11-06: 杀死 in-flight workflow)。
-    // 启动时先探活一轮: probe 通过 → 直接采纳为 Healthy (复位计数/排期),
-    // status 从第一个请求起就与真实探活一致; probe 失败 → 维持 Stopped
-    // (真死的服务交由 auto_up / 手动 up 正常拉起)。返回采纳数 (供日志)。
+    // issue #107 D2: daemon cold-start state reconciliation. After a launchd crash restart (e.g. the process
+    // died mid-sleep), the managed services' nohup processes are often still alive, but all runners initialize to
+    // Stopped — status before the first tick would falsely report Stopped, and an operator-triggered restart based
+    // on it would kill healthy processes (observed incident 2026-11-06: killed an in-flight workflow).
+    // Probe once at startup: probe passes → adopt as Healthy directly (reset counters/schedule), so
+    // status matches real probing from the very first request; probe fails → stay Stopped
+    // (truly dead services are brought up normally via auto_up / manual up). Returns the adoption count (for logging).
     pub async fn reconcile_on_boot(&mut self) -> usize {
         use runner::State as S;
         let mut adopted = 0usize;
-        // issue #111: 常驻档 (T0/T1) 服务在对账时发现死亡 → 落审计事件。
-        // 这类服务预期一直在跑, daemon 缺席窗口 (睡眠/崩溃) 内的死因对
-        // 事后追溯不可见 — 不记就是 #111 那种 "事件表直接跳行" 的空洞。
-        // T2 按需服务不记 (不运行是常态)。记录不改状态 (仍 Stopped,
-        // auto_up 只拉 boot 集合 — 与 #107 语义一致)。
+        // issue #111: resident-tier (T0/T1) services found dead during reconciliation → record an audit event.
+        // These services are expected to run continuously; their cause of death inside a daemon absence window
+        // (sleep/crash) is invisible to hindsight — not recording is exactly #111's "event table skips a line" hole.
+        // T2 on-demand services are not recorded (not running is their norm). Recording does not change state
+        // (still Stopped; auto_up only starts the boot set — consistent with #107 semantics).
         let mut dead_resident: Vec<String> = Vec::new();
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // issue #157: 操作员意图跨 daemon 重启持久化 — runner 全部初始 Stopped,
-        // 事件表里最近一次 restart 类事件为 ManualStop 的服务是操作员刻意停的
-        // (core-only 政策常驻态), 不算 "死" — 不落 reconcile 告警, 活着的
-        // 残留监听器也不采纳翻 Healthy (#149 语义在对账路径同样成立)。
-        // 事件表为空 (新装机) 时视同非操作员停机, T0/T1 死亡照旧落审计事件。
+        // issue #157: operator intent persists across daemon restarts — all runners initialize Stopped;
+        // a service whose most recent restart-class event in the event table is ManualStop was deliberately
+        // stopped by the operator (core-only resident policy) and does not count as "dead" — no reconcile alert,
+        // and a live leftover listener is not adopted back to Healthy (#149 semantics hold on the reconcile path too).
+        // An empty event table (fresh install) counts as not operator-stopped; T0/T1 deaths still record audit events.
         let operator_stopped: std::collections::HashSet<String> = self
             .store
             .last_restart_map()
@@ -1266,8 +1274,8 @@ impl SupervisorCore {
         adopted
     }
 
-    // compose 容器监督: 探活每个容器, 宕机告警 (经 compose_tracker 节流, issue #6)。
-    // tracker 纯逻辑给决策, 此处据决策发告警。容器不被 supervisor 重启 (Docker 管)。
+    // compose container supervision: probe each container, alert on down (throttled via compose_tracker, issue #6).
+    // The tracker is pure logic producing decisions; this emits alerts per decision. Containers are not restarted by the supervisor (Docker owns that).
     async fn tick_compose(&mut self, now_ts: u64) {
         let Some(cb) = &self.compose else {
             return;
@@ -1275,7 +1283,7 @@ impl SupervisorCore {
         let cs = match cb.ps() {
             Ok(cs) => cs,
             Err(e) => {
-                tracing::warn!(err = %e, "compose ps 失败 (跳过容器监督本轮)");
+                tracing::warn!(err = %e, "compose ps failed (skipping container supervision this round)");
                 return;
             }
         };
@@ -1283,12 +1291,12 @@ impl SupervisorCore {
         let live: Vec<String> = cs.iter().map(|c| c.service.clone()).collect();
         for c in &cs {
             let st = c.supervisor_state();
-            // 每容器每 tick 写健康行 plane=compose (issue #7: 容器进 history.db)
+            // Write a health row per container per tick with plane=compose (issue #7: containers enter history.db)
             if let Err(e) = self
                 .store
                 .record_health(&c.service, st, 0, now_ts, "compose")
             {
-                tracing::warn!(svc = %c.service, err = %e, "compose health write fail (非致命)");
+                tracing::warn!(svc = %c.service, err = %e, "compose health write fail (non-fatal)");
             }
             let decisions = self
                 .compose_tracker
@@ -1321,7 +1329,7 @@ impl SupervisorCore {
                         format!("compose container {} recovered", c.name),
                     ),
                 };
-                tracing::info!(svc = %c.service, kind = kind.label(), "compose tick 告警决策");
+                tracing::info!(svc = %c.service, kind = kind.label(), "compose tick alert decision");
                 let _ = self
                     .alerter
                     .alert(crate::alert::Alert {
@@ -1333,11 +1341,11 @@ impl SupervisorCore {
                     .await;
             }
         }
-        // 清除已消失容器快照
+        // Drop snapshots for vanished containers
         self.compose_tracker.reap(&live);
     }
 
-    // 探活间隔: 有 down 态服务 (native 或 compose 容器) 用 poll_unhealthy_sec, 否则 poll_healthy_sec
+    // Probe interval: use poll_unhealthy_sec when any service is down (native or compose container), else poll_healthy_sec
     pub fn poll_interval(&self) -> u64 {
         let any_down = self.runners.iter().any(|r| {
             matches!(
@@ -1348,45 +1356,45 @@ impl SupervisorCore {
         if any_down {
             return self.cfg.poll_unhealthy_sec;
         }
-        // compose 容器有 Failed 也算 down (复用上轮 tick_compose 的 ps 快照 —
-        // 现场重查是阻塞 docker 子进程, 且每 tick 已在 tick_compose 查过一次)
+        // compose containers in Failed also count as down (reuse last round's tick_compose ps snapshot —
+        // a live re-query is a blocking docker subprocess, and it was already queried once per tick in tick_compose)
         if self.compose_any_failed {
             return self.cfg.poll_unhealthy_sec;
         }
         self.cfg.poll_healthy_sec
     }
 
-    // logs 分派: compose 容器服务名 → compose logs; 否则 None (native 走 cli_logs)
+    // logs dispatch: compose container service name → compose logs; else None (native goes through cli_logs)
     pub fn compose_logs(&self, service: &str) -> Option<Result<String>> {
         let cb = self.compose.as_ref()?;
-        // 仅当该服务在 compose 容器列表中才走 compose logs
+        // Only route to compose logs when the service is in the compose container list
         match cb.ps() {
             Ok(cs) if cs.iter().any(|c| c.service == service) => Some(cb.logs(service)),
             _ => None,
         }
     }
 
-    // compose 是否启用 (测试 + cli 用)
+    // Whether compose is enabled (for tests + CLI)
     pub fn compose_enabled(&self) -> bool {
         self.compose.is_some()
     }
 
-    // 依赖门: compose 启用时, 该 native 服务依赖的 sidecar 容器须全部 Healthy。
-    // compose 未启用 → 无门 (无依赖可等, 保留单节点开发行为)。
-    // 服务无依赖 (dep_map 未列) → 通行。
-    // gate 未就绪 → 返回 false (调用方跳过启动 + 记录, 不标 Failed)。
+    // Dependency gate: when compose is enabled, the sidecar containers this native service depends on must all be Healthy.
+    // compose disabled → no gate (nothing to wait on, preserves single-node dev behavior).
+    // Service with no mapped deps (not in dep_map) → pass through.
+    // Gate not ready → return false (caller skips start + records, does not mark Failed).
     async fn dep_gate_ok(&mut self, name: &str) -> bool {
         let deps = dep_map::deps_for(name);
         if deps.is_empty() {
             return true;
         }
         let Some(cb) = &self.compose else {
-            return true; // compose 未启用, 无门
+            return true; // compose disabled, no gate
         };
         let cs = match cb.ps() {
             Ok(cs) => cs,
             Err(e) => {
-                tracing::warn!(svc = name, err = %e, "dep_gate ps 失败, 放行 (避免误阻断)");
+                tracing::warn!(svc = name, err = %e, "dep_gate ps failed, pass open (avoid false blocking)");
                 return true;
             }
         };
@@ -1394,13 +1402,13 @@ impl SupervisorCore {
             let found = cs.iter().find(|c| c.service == *dep);
             match found {
                 Some(c) if c.supervisor_state() == "Healthy" => {
-                    tracing::debug!(svc = name, dep, "dep_gate 通过");
+                    tracing::debug!(svc = name, dep, "dep_gate passed");
                 }
                 _ => {
                     tracing::warn!(
                         svc = name,
                         dep,
-                        "dep_gate 未就绪, 跳过启动 (依赖非 Healthy)"
+                        "dep_gate not ready, skipping start (dependency not Healthy)"
                     );
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1422,9 +1430,9 @@ impl SupervisorCore {
         true
     }
 
-    // issue #9: 摘单服务流量。标 Draining + 设宽限期。
-    // 返回 Err 若服务不存在或状态不可 drain。
-    // 边界: 仅管本地生命周期 (停止接新工作), 流量切换归 fusion-gateway。
+    // issue #9: drain one service's traffic. Marks Draining + sets the grace period.
+    // Returns Err if the service does not exist or its state is not drainable.
+    // Boundary: local lifecycle only (stop accepting new work); traffic cut-over belongs to fusion-gateway.
     pub fn drain(&mut self, service: &str, now_ts: u64) -> Result<()> {
         let r = self
             .runners
@@ -1435,23 +1443,23 @@ impl SupervisorCore {
         Ok(())
     }
 
-    // issue #9: 摘全部 native 服务流量 (集群 drain 的本地部分, 边界归 fusion-multi-node)。
+    // issue #9: drain all native services' traffic (local part of a cluster drain; cluster boundary belongs to fusion-multi-node).
     pub fn drain_all(&mut self, now_ts: u64) -> Result<()> {
         let mut errs = Vec::new();
         for r in &mut self.runners {
             if let Err(e) = r.begin_drain(self.cfg.drain_grace_sec, now_ts) {
-                tracing::warn!(svc = %r.def.name, err = %e, "drain_all 跳过 (状态不可 drain)");
+                tracing::warn!(svc = %r.def.name, err = %e, "drain_all skip (state not drainable)");
                 errs.push(format!("{}: {e}", r.def.name));
             }
         }
         if errs.is_empty() {
             Ok(())
         } else {
-            anyhow::bail!("drain_all 部分失败: {}", errs.join("; "))
+            anyhow::bail!("drain_all partially failed: {}", errs.join("; "))
         }
     }
 
-    // issue #9: 取消单服务 drain (回流量)。仅 Draining 可取消。
+    // issue #9: cancel one service's drain (restore traffic). Only Draining can be cancelled.
     pub fn cancel_drain(&mut self, service: &str) -> Result<()> {
         let r = self
             .runners
@@ -1462,10 +1470,10 @@ impl SupervisorCore {
         Ok(())
     }
 
-    // issue #9: 零停机换版 — drain→stop→start→prewarm(Healthy gate)→清 drain 标记。
-    // prewarm: 循环探活, 达 Healthy 立即返回成功并清 drain (换版完成)。
-    // 超时未达 Healthy → 告警 RolloutPrewarmFailed + 留 Stopped (不回滚, 由调用方决策)。
-    // now_ts=起始时间戳; grace=drain 宽限; prewarm_timeout=探活超时。
+    // issue #9: zero-downtime rollout — drain→stop→start→prewarm(Healthy gate)→clear drain flags.
+    // prewarm: probe loop; reaching Healthy returns success immediately and clears drain (rollout complete).
+    // Timeout without Healthy → RolloutPrewarmFailed alert + stays Stopped (no rollback, caller decides).
+    // now_ts=start timestamp; grace=drain grace; prewarm_timeout=probe timeout.
     pub async fn rollout(
         &mut self,
         service: &str,
@@ -1479,27 +1487,27 @@ impl SupervisorCore {
                 .iter_mut()
                 .find(|r| r.def.name == service)
                 .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
-            // 1. drain (标 Draining + 宽限)
+            // 1. drain (mark Draining + grace)
             r.begin_drain(grace, now_ts)?;
-            tracing::info!(svc = %service, grace, "rollout: drain 开始");
-            // 2. 等宽限期过 (drain 完成) — 实际生产由 tick 推进 Stopped, 此处直接标 Stopped 走 start
+            tracing::info!(svc = %service, grace, "rollout: drain started");
+            // 2. Wait out the grace period (drain completes) — in production the tick advances to Stopped; here mark Stopped directly and proceed to start
             r.state = runner::State::Stopped;
             r.drain_grace_until = None;
         }
-        tracing::info!(svc = %service, "rollout: drain 完成, 停服务");
-        // 2.5 issue #96: 真正停掉旧进程并验证端口释放 — 此前 rollout 从不 stop,
-        // 新进程撞注册端口死掉, prewarm 探活命中旧监听 → "ok" 但代码从未被替换
+        tracing::info!(svc = %service, "rollout: drain done, stopping service");
+        // 2.5 issue #96: actually stop the old process and verify port release — rollout previously never stopped,
+        // the new process died colliding with the registered port, and prewarm probes hit the old listener → "ok" but code never replaced
         let old_pid = read_pidfile_pid(service);
         self.stop_and_verify(service, true).await?;
-        tracing::info!(svc = %service, old_pid, "rollout: 旧进程已停, 拉起新进程");
-        // 3. start (复用 runner.invoke_start, 1-arg start.sh 读自身 .env)
+        tracing::info!(svc = %service, old_pid, "rollout: old process stopped, starting new process");
+        // 3. start (reuse runner.invoke_start; 1-arg start.sh reads its own .env)
         let r = self
             .runners
             .iter_mut()
             .find(|r| r.def.name == service)
             .ok_or_else(|| anyhow::anyhow!("unknown service: {service}"))?;
         if let Err(e) = r.invoke_start() {
-            tracing::error!(svc = %service, err = %e, "rollout: start 失败");
+            tracing::error!(svc = %service, err = %e, "rollout: start failed");
             let _ = self
                 .alerter
                 .alert(crate::alert::Alert {
@@ -1512,21 +1520,21 @@ impl SupervisorCore {
             anyhow::bail!("rollout start fail: {e}");
         }
         r.state = runner::State::Starting;
-        // issue #126: rollout 拉起成功记启动宽限截止
+        // issue #126: on rollout start success record the boot grace deadline
         r.set_boot_grace(now_ts);
-        tracing::info!(svc = %service, "rollout: start 完成, prewarm 等健康");
-        // 4. prewarm: 探活循环, 达 Healthy 即成功
-        // issue #96 伴生缺陷: 此前循环以 t+=1 模拟时间推进且无 sleep — 60 次
-        // 探活微秒级耗尽 "60s" 预算, start 未完成即误判超时 (旧实现靠探活
-        // 立即命中旧监听掩盖)。改真 sleep 1s/轮, 预算=墙钟秒数 (Instant 计时,
-        // 不与注入 now_ts 混用 — 测试的 now_ts 是模拟值)。
+        tracing::info!(svc = %service, "rollout: start done, prewarm waiting for health");
+        // 4. prewarm: probe loop; reaching Healthy = success
+        // issue #96 companion defect: the loop previously advanced time via t+=1 with no sleep — 60 probes
+        // exhausted the "60s" budget in microseconds and misjudged a timeout before start even finished
+        // (the old implementation masked this by probing straight onto the old listener). Now a real 1s sleep
+        // per round, budget = wall-clock seconds (Instant timing, not mixed with injected now_ts — the tests' now_ts is simulated).
         let prewarm_start = std::time::Instant::now();
         let mut t;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             t = now_unix();
             if prewarm_start.elapsed() >= std::time::Duration::from_secs(prewarm_timeout) {
-                tracing::error!(svc = %service, prewarm_timeout, "rollout: prewarm 超时未达 Healthy");
+                tracing::error!(svc = %service, prewarm_timeout, "rollout: prewarm timed out without reaching Healthy");
                 r.state = runner::State::Stopped;
                 let _ = self
                     .alerter
@@ -1544,20 +1552,20 @@ impl SupervisorCore {
             let result = r.probe_once();
             if matches!(result, ProbeResult::Healthy { .. }) {
                 r.state = runner::State::Healthy;
-                tracing::info!(svc = %service, "rollout: prewarm 达 Healthy, 换版完成");
+                tracing::info!(svc = %service, "rollout: prewarm reached Healthy, rollout complete");
                 return Ok(());
             }
         }
     }
 
-    // issue #10: 执行一次备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
-    // issue #113: 改为 detached task — 旧实现持核心 Mutex await 全程
-    // (2GB dump ~15min), 期间 /api/v1/status /metrics /up 全部无响应
-    // (HTTP_STILL_BUSY 实证 2026-11-09)。BackupRunner 在锁内构造 (便宜),
-    // 运行移交 spawn; last_backup_ts 立即推进 + 持久化 (旧语义: 失败也推进,
-    // 防重试风暴), 失败由 BackupFailed 告警兜底。
+    // issue #10: run one backup (Postgres + Qdrant → FUSION_BACKUP_TARGET).
+    // issue #113: converted to a detached task — the old implementation held the core Mutex for the whole
+    // await (2GB dump ~15min), leaving /api/v1/status /metrics /up unresponsive throughout
+    // (HTTP_STILL_BUSY observed 2026-11-09). BackupRunner is constructed under the lock (cheap),
+    // then the run is handed to spawn; last_backup_ts advances immediately + persists (old semantics: advances even
+    // on failure, preventing retry storms), failures fall back to the BackupFailed alert.
     pub fn spawn_backup(&mut self, now_ts: u64) {
-        tracing::info!("backup 开始 (issue #10, detached)");
+        tracing::info!("backup started (issue #10, detached)");
         let runner = crate::backup::BackupRunner::new(&self.cfg);
         spawn_backup_task(
             runner,
@@ -1570,9 +1578,9 @@ impl SupervisorCore {
         self.store.set_meta("last_backup_ts", now_ts);
     }
 
-    // issue #10: 调度检查。到期 (now >= last + schedule) → 触发 backup。
-    // 在 daemon tick 循环内调用。返回是否触发了备份。
-    // issue #113: 触发改走 spawn_backup (detached, 不持锁)。
+    // issue #10: schedule check. Due (now >= last + schedule) → trigger backup.
+    // Called inside the daemon tick loop. Returns whether a backup was triggered.
+    // issue #113: triggering goes through spawn_backup (detached, no lock held).
     pub async fn check_backup_schedule(&mut self, now_ts: u64) -> bool {
         if !crate::backup::backup_due(now_ts, self.last_backup_ts, self.cfg.backup_schedule_sec) {
             return false;
@@ -1595,15 +1603,15 @@ impl SupervisorCore {
         tracing::info!(
             now_ts,
             schedule = self.cfg.backup_schedule_sec,
-            "backup 调度到期, 触发"
+            "backup schedule due, triggering"
         );
         self.spawn_backup(now_ts);
         true
     }
-    // issue #37: history.db retention sweep 调度 (语义同 backup 调度)。
-    // 到期执行 cleanup_old (health_check + event 两表按 history_retention_days 裁剪)。
-    // 失败也更新时间戳 — 避免每 tick 重试风暴, 下轮 sweep 再试。
-    // daemon tick 循环内调用。返回是否执行了 sweep。
+    // issue #37: history.db retention sweep schedule (same semantics as the backup schedule).
+    // On due, runs cleanup_old (trims health_check + event tables by history_retention_days).
+    // The timestamp advances even on failure — avoids a per-tick retry storm; next sweep retries.
+    // Called inside the daemon tick loop. Returns whether a sweep ran.
     pub fn check_retention(&mut self, now_ts: u64) -> bool {
         if !crate::backup::backup_due(now_ts, self.last_prune_ts, self.cfg.prune_schedule_sec) {
             return false;
@@ -1611,27 +1619,27 @@ impl SupervisorCore {
         tracing::info!(
             now_ts,
             retention_days = self.cfg.history_retention_days,
-            "retention sweep 到期, 执行"
+            "retention sweep due, running"
         );
         match self
             .store
             .cleanup_old(now_ts, self.cfg.history_retention_days)
         {
             Ok(n) => {
-                tracing::info!(pruned = n, "retention sweep 完成");
+                tracing::info!(pruned = n, "retention sweep done");
                 self.events_pruned_total += n as u64;
             }
             Err(e) => {
-                tracing::error!(err = %e, "retention sweep 失败 (下轮再试)");
+                tracing::error!(err = %e, "retention sweep failed (retry next round)");
             }
         }
         self.last_prune_ts = now_ts;
         true
     }
 
-    // issue #137: 定时任务调度 (daemon tick 循环内, 核心锁内调用 — 便宜操作:
-    // 到期判定 + 游标推进 + detached spawn, 无 exec)。
-    // 返回本 tick 触发的 job 数 (测试可观测)。
+    // issue #137: scheduled job dispatch (inside the daemon tick loop, called under the core lock — cheap ops:
+    // due check + cursor advance + detached spawn, no exec).
+    // Returns the number of jobs triggered this tick (observable in tests).
     pub fn dispatch_due_jobs(&mut self, now_ts: u64) -> usize {
         if self.cfg.jobs.is_empty() {
             return 0;
@@ -1642,9 +1650,9 @@ impl SupervisorCore {
             if !crate::jobs::job_due(now_ts, last, &job) {
                 continue;
             }
-            tracing::info!(job = %job.name, now_ts, "job 调度到期, 触发");
-            // 游标即时推进 + 持久化 — spawn 即算跑过, 失败不重试到下个到期
-            // (同 backup 语义, 防失败风暴)
+            tracing::info!(job = %job.name, now_ts, "job schedule due, triggering");
+            // Cursor advances immediately + persists — spawn counts as run, failures do not retry until the next due
+            // (same as backup semantics, preventing failure storms)
             self.job_last.insert(job.name.clone(), now_ts);
             self.store
                 .set_meta(&format!("job_last:{}", job.name), now_ts);
@@ -1661,7 +1669,7 @@ impl SupervisorCore {
     }
 }
 
-// issue #137: job 游标从 meta 恢复 (配置在但 meta 缺 → 0, 首启即到期)。
+// issue #137: job cursors restored from meta (config present but meta missing → 0, due on first start).
 fn load_job_last(
     store: &Arc<HistoryStore>,
     jobs: &[crate::config::JobConfig],
@@ -1674,11 +1682,11 @@ fn load_job_last(
         .collect()
 }
 
-// issue #137: job 执行 detached — exec 是同步阻塞 (std::process + 轮询 try_wait,
-// 可达 timeout 分钟级), 与 spawn_backup_task 同款: blocking 池 + 内嵌
-// current_thread runtime 跑 async 段 (告警 webhook), tokio worker 零占用。
-// 事件落库: 成功 info / 失败 error + JobFailed 告警 (独立 Alerter, 不去抖)。
-// stdout/stderr 追加 ~/.fusion-sv/logs/<job>.log (任务日志与服务日志同目录)。
+// issue #137: job execution detached — exec is synchronously blocking (std::process + try_wait polling,
+// up to timeout minutes), same pattern as spawn_backup_task: blocking pool + embedded
+// current_thread runtime for the async section (alert webhook), tokio workers untouched.
+// Event persistence: success info / failure error + JobFailed alert (independent Alerter, no dedup).
+// stdout/stderr append to ~/.fusion-sv/logs/<job>.log (job logs share the service log directory).
 fn spawn_job_task(
     job: crate::config::JobConfig,
     store: Arc<HistoryStore>,
@@ -1693,7 +1701,7 @@ fn spawn_job_task(
         {
             Ok(rt) => rt,
             Err(e) => {
-                tracing::error!(job = %job.name, err = %e, "job 内嵌 runtime 构建失败 (任务未运行)");
+                tracing::error!(job = %job.name, err = %e, "job embedded runtime build failed (task not run)");
                 return;
             }
         };
@@ -1708,22 +1716,22 @@ async fn run_job(
     alert_url: String,
     now_ts: u64,
 ) {
-    // bin 解析: 含 '/' 相对 FUSION_ROOT (同 start_map::resolve_bin 语义);
-    // 裸名优先共享 venv bin, 退回 PATH。
+    // bin resolution: containing '/' resolves relative to FUSION_ROOT (same semantics as start_map::resolve_bin);
+    // bare names prefer the shared venv bin, falling back to PATH.
     let bin = crate::start_map::resolve_bin(&job.bin);
     let log = crate::start_map::log_path(&format!("job-{}", job.name));
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // per-job env overlay (#125 复用) — FUSION_OPS_DATABASE_URL 等走
-    // ~/.fusion-sv/env/<job>.env; 值绝不落日志。
+    // per-job env overlay (#125 reuse) — FUSION_OPS_DATABASE_URL etc. go through
+    // ~/.fusion-sv/env/<job>.env; values are never logged.
     let overlay = crate::env_map::overlay_env_for(&job.name);
     tracing::info!(
         job = %job.name,
         timeout_sec = job.timeout_sec,
         env_n = overlay.len(),
         log = %log.display(),
-        "job 开始"
+        "job started"
     );
     let log_f = std::fs::OpenOptions::new()
         .create(true)
@@ -1735,13 +1743,13 @@ async fn run_job(
             match out {
                 Ok(o) => (Some(f), Some(o)),
                 Err(e) => {
-                    tracing::warn!(job = %job.name, err = %e, "job 日志句柄 clone 失败, 退 null");
+                    tracing::warn!(job = %job.name, err = %e, "job log handle clone failed, falling back to null");
                     (None, None)
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(job = %job.name, err = %e, "job 日志打开失败, 退 null");
+            tracing::warn!(job = %job.name, err = %e, "job log open failed, falling back to null");
             (None, None)
         }
     };
@@ -1771,7 +1779,7 @@ async fn run_job(
             return;
         }
     };
-    // 轮询 try_wait 至 timeout → kill (500ms 粒度, 分钟级任务轮询开销可忽略)
+    // Poll try_wait until timeout → kill (500ms granularity; polling overhead is negligible for minute-scale jobs)
     let deadline = now_ts + job.timeout_sec;
     let mut status = None;
     let mut timed_out = false;
@@ -1841,7 +1849,7 @@ async fn run_job(
     .await;
 }
 
-// 任务结果落 event 表 (kind=Job) + 失败走 JobFailed 告警 (升级 ERROR, 不去抖)。
+// Record the job outcome into the event table (kind=Job); failures also emit a JobFailed alert (escalated ERROR, no dedup).
 async fn record_job_outcome(
     store: &Arc<HistoryStore>,
     alert_dedup_sec: u64,
@@ -1859,7 +1867,7 @@ async fn record_job_outcome(
         "native",
         if ok { "info" } else { "error" },
     ) {
-        tracing::warn!(job = %job.name, err = %e, "job event write fail (非致命)");
+        tracing::warn!(job = %job.name, err = %e, "job event write fail (non-fatal)");
     }
     if ok {
         return;
@@ -1875,13 +1883,13 @@ async fn record_job_outcome(
         })
         .await
     {
-        tracing::warn!(job = %job.name, err = %e, "JobFailed alert emit fail (非致命)");
+        tracing::warn!(job = %job.name, err = %e, "JobFailed alert emit fail (non-fatal)");
     }
 }
 
-// issue #113: 备份任务 detached 执行 — 核心锁内只构造 runner (便宜),
-// 运行移交 tokio::spawn; BackupFailed 不去抖 → 独立 Alerter 状态安全。
-// store Arc 共享 (HistoryStore: Sync), 事件落库走同一 sink。
+// issue #113: backup runs detached — under the core lock only the runner is constructed (cheap),
+// then the run is handed to tokio::spawn; BackupFailed is not deduped → an independent Alerter keeps state safe.
+// The store Arc is shared (HistoryStore: Sync); event persistence goes through the same sink.
 fn spawn_backup_task(
     mut runner: crate::backup::BackupRunner,
     store: Arc<HistoryStore>,
@@ -1889,11 +1897,11 @@ fn spawn_backup_task(
     alert_url: String,
     now_ts: u64,
 ) {
-    // #116: dump/qdrant/prune 全是同步阻塞 (std::process + std::io::copy 流过
-    // 2.2GB, 分钟级) — 直接 tokio::spawn 跑在 worker 线程会把 worker 钉死,
-    // runtime 饿死 → RPC 全黑 (2026-11-09 实证 curl 000 全程)。落 blocking
-    // 池线程 + 内嵌 current_thread runtime 跑 async 段 (alert webhook reqwest /
-    // store await), tokio worker 零阻塞。
+    // #116: dump/qdrant/prune are all synchronously blocking (std::process + std::io::copy streaming
+    // 2.2GB, minutes-long) — running them via tokio::spawn on a worker thread would pin the worker
+    // and starve the runtime → all RPC black-holed (observed 2026-11-09: curl 000 throughout). Use a blocking
+    // pool thread + embedded current_thread runtime for the async section (alert webhook reqwest /
+    // store await), leaving tokio workers unblocked.
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1901,7 +1909,7 @@ fn spawn_backup_task(
         {
             Ok(rt) => rt,
             Err(e) => {
-                tracing::error!(err = %e, "backup 内嵌 runtime 构建失败 (备份未运行)");
+                tracing::error!(err = %e, "backup embedded runtime build failed (backup not run)");
                 return;
             }
         };
@@ -1909,16 +1917,16 @@ fn spawn_backup_task(
             let mut alerter = crate::alert::Alerter::new(alert_dedup_sec, alert_url)
                 .with_event_sink(make_event_sink(store.clone()));
             match runner.run(now_ts, &store, &mut alerter).await {
-                Ok(()) => tracing::info!("backup 完成 (detached)"),
-                Err(e) => tracing::error!(err = %e, "backup 失败 (fail-closed 已告警)"),
+                Ok(()) => tracing::info!("backup done (detached)"),
+                Err(e) => tracing::error!(err = %e, "backup failed (fail-closed already alerted)"),
             }
         });
     });
 }
 
-// issue #37: Alerter 事件落库 sink — 每次真实发出的告警 (去抖通过) 写 event 表。
-// compose 告警 service 带 "compose:" 前缀 → 落库剥离前缀 + plane=compose
-// (语义同旧 tick_compose 显式写入, issue #7)。
+// issue #37: Alerter event sink — every alert actually emitted (dedup passed) is written to the event table.
+// compose alerts carry a "compose:" service prefix → the prefix is stripped on write + plane=compose
+// (same semantics as the old explicit tick_compose writes, issue #7).
 fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
     Arc::new(
         move |service: &str, kind: &str, detail: &str, ts: u64, _plane: &str, severity: &str| {
@@ -1927,27 +1935,27 @@ fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
                 None => (service, "native"),
             };
             if let Err(e) = store.record_event(svc, kind, detail, ts, plane, severity) {
-                tracing::warn!(svc = svc, err = %e, "alert event write fail (非致命)");
+                tracing::warn!(svc = svc, err = %e, "alert event write fail (non-fatal)");
             }
         },
     )
 }
 
-// PRD app-tiering: pin 覆盖从 store 加载 (重启不丢, 验收 §5.4)。失败降级空缓存
-// (pin 表损坏不杀 daemon, 行为同告警兜底哲学, tracing warn 留痕)。
+// PRD app-tiering: pin overrides load from the store (survive restart, acceptance §5.4). On failure degrade to an
+// empty cache (a corrupt pin table must not kill the daemon; same philosophy as alert fallbacks, tracing warn leaves a trace).
 fn load_boot_pins(store: &Arc<HistoryStore>) -> std::collections::HashMap<String, PinMode> {
     store
         .all_boot_pins()
         .unwrap_or_else(|e| {
-            tracing::warn!(err = %e, "boot pins 读取失败, 以空覆盖继续");
+            tracing::warn!(err = %e, "boot pins read failed, continuing with empty overrides");
             Vec::new()
         })
         .into_iter()
         .collect()
 }
 
-// 据配置构建 compose 后端。enabled=false → None (仅 native)。
-// 文件不存在时告警但返回 None (不阻塞 native 启动, 操作员按提示补文件)。
+// Build the compose backend from config. enabled=false → None (native only).
+// Missing files alert but still return None (does not block native startup; the operator creates the files per the hint).
 fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
     if !cfg.compose.enabled {
         return None;
@@ -1955,7 +1963,7 @@ fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
     if !cfg.compose.sidecar_file.exists() {
         tracing::warn!(
             path = %cfg.compose.sidecar_file.display(),
-            "compose.enabled=true 但 sidecar 文件不存在, 回退仅 native"
+            "compose.enabled=true but sidecar file missing, falling back to native-only"
         );
         return None;
     }
@@ -1966,19 +1974,19 @@ fn build_compose(cfg: &Config) -> Option<Box<dyn ComposeBackend>> {
     )))
 }
 
-// 真启动调用 (生产)。svc=服务名: start_map 有覆盖 (issue #29) 走覆盖命令,
-// 否则默认 bash {repo}/start.sh {cmd}。stderr → 每服务日志。
-// env_overrides: 注入 env (issue #8 sidecar 连接 + issue #29 shell 注册)。
-// issue #96: 读服务 pidfile 记录的 PID (缺失/非法 → None) — restart/rollout
-// 输出旧→新 PID 替换证据。
+// Real start invocation (production). svc = service name: start_map overrides (issue #29) take the override command,
+// else the default is bash {repo}/start.sh {cmd}. stderr → per-service log.
+// env_overrides: env to inject (issue #8 sidecar connections + issue #29 shell registration).
+// issue #96: read the PID recorded in the service pidfile (missing/invalid → None) — restart/rollout
+// report old→new PID replacement evidence.
 fn read_pidfile_pid(svc: &str) -> Option<u32> {
     let s = std::fs::read_to_string(crate::start_map::pid_path(svc)).ok()?;
     s.trim().parse::<u32>().ok()
 }
 
-// issue #134: 只读查询占口监听器 PID (lsof, best-effort)。仅用于 stop 验证
-// 失败信息的可归因性 — 绝不据此击杀 (kill-safety #110: 无 pattern-kill 路径)。
-// lsof 缺席/端口 0/未注册 → None。
+// issue #134: read-only query for the PID of the listener holding a port (lsof, best-effort). Only for attributing
+// stop-verification failure messages — never used to kill (kill-safety #110: no pattern-kill path).
+// lsof missing / port 0 / unregistered → None.
 fn port_holder_pid(port: u16) -> Option<String> {
     if port == 0 {
         return None;
@@ -2000,8 +2008,8 @@ fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> 
             let repo_dir = crate::manifest::name_to_dir(svc);
             let sh = probe_map::start_sh_path(repo_dir);
             let r = exec_bash_script(svc, &sh, cmd, env_overrides);
-            // 防 idle sleep 陪护 (gupiao 过渡补丁): start/restart 成功后挂
-            // caffeinate -i -w <pid> 断言, 服务退出自动释放
+            // Anti-idle-sleep companion (gupiao transitional patch): after start/restart success attach
+            // a caffeinate -i -w <pid> assertion, released automatically when the service exits
             if r.is_ok()
                 && matches!(cmd, "start" | "restart")
                 && let Some(pidfile) = crate::start_map::caffeinate_pidfile(svc)
@@ -2013,21 +2021,21 @@ fn real_start_pair(svc: &str, cmd: &str, env_overrides: &[(String, String)]) -> 
     }
 }
 
-// caffeinate 陪护: 读服务 pidfile, `sh -c 'caffeinate -i -w <pid> & ...'` 方式
-// 孤儿化 — sh 即刻退出 (status() 回收防僵尸), caffeinate 重父到 launchd。
-// pidfile 缺失/内容非数字 (start.sh 尚未写好) → WARN 跳过, 下次重启再挂。
+// caffeinate companion: reads the service pidfile, orphaned via `sh -c 'caffeinate -i -w <pid> & ...'` —
+// sh exits immediately (status() reaps it to prevent zombies), caffeinate re-parents to launchd.
+// pidfile missing / non-numeric content (start.sh has not written it yet) → WARN + skip, attach again on the next restart.
 fn spawn_caffeinate(svc: &str, pidfile: &str) {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = pidfile.replace('~', &home);
     let pid = match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
         Err(e) => {
-            tracing::warn!(svc, pidfile = %path, err = %e, "caffeinate 陪护跳过: pidfile 不可读");
+            tracing::warn!(svc, pidfile = %path, err = %e, "caffeinate companion skipped: pidfile unreadable");
             return;
         }
     };
     if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
-        tracing::warn!(svc, pidfile = %path, "caffeinate 陪护跳过: pidfile 内容非法");
+        tracing::warn!(svc, pidfile = %path, "caffeinate companion skipped: pidfile content invalid");
         return;
     }
     let cmdline = format!("caffeinate -i -w {pid} >/dev/null 2>&1 &");
@@ -2039,22 +2047,22 @@ fn spawn_caffeinate(svc: &str, pidfile: &str) {
         .status()
     {
         Ok(_) => {
-            tracing::info!(svc, pid = %pid, "caffeinate 断言已挂 (防 idle sleep, 服务退出自动释放)")
+            tracing::info!(svc, pid = %pid, "caffeinate assertion attached (anti idle sleep, released when the service exits)")
         }
-        Err(e) => tracing::warn!(svc, err = %e, "caffeinate 陪护拉起失败"),
+        Err(e) => tracing::warn!(svc, err = %e, "caffeinate companion spawn failed"),
     }
 }
 
-// issue #51: 子进程 stderr 直接落服务日志文件 — 不再走 pipe + tail 线程。
-// 旧方案 (issue #47) 的 join 依赖 pipe EOF, 但 start.sh 后台化的服务进程 /
-// uvicorn worker 会继承 pipe 写端不关闭, child.wait() 返回后 join 永久阻塞,
-// up_all 持有核心 Mutex 饿死全部 RPC/HTTP (生产事故 2026-10-27, 见 issue #51)。
-// 失败 tail 改为 wait 后从日志文件回读末尾 N 行, 格式契约 "exit code=<n>" 不变。
+// issue #51: child stderr goes straight to the per-service log file — no more pipe + tail thread.
+// The old scheme (issue #47) joined on pipe EOF, but service processes backgrounded by start.sh /
+// uvicorn workers inherit the pipe write end without closing it, so join blocks forever after child.wait() returns,
+// with up_all holding the core Mutex starving all RPC/HTTP (production incident 2026-10-27, see issue #51).
+// The failure tail now reads the last N lines from the log file after wait; the "exit code=<n>" format contract is unchanged.
 const STDERR_TAIL_LINES: usize = 20;
 
-// issue #121: 自动重启前把上一轮服务日志换到 <name>.log.1 (保留一代)。
-// 旧实现 truncate 覆盖 — 进程在两次 spawn 之间死掉 (ProcessExit, 外部 TERM/
-// 内部 should_exit) 时死因证据随重启蒸发, 只能盲查。rotate 失败不阻断启动。
+// issue #121: before auto-restart, rotate the previous service log to <name>.log.1 (keep one generation).
+// The old implementation truncated in place — when a process died between two spawns (ProcessExit, external TERM /
+// internal should_exit), the cause-of-death evidence evaporated with the restart, leaving only blind debugging. A rotate failure does not block startup.
 fn rotate_svc_log(log_path: &std::path::Path) {
     let non_empty = std::fs::metadata(log_path)
         .map(|m| m.len() > 0)
@@ -2069,7 +2077,7 @@ fn rotate_svc_log(log_path: &std::path::Path) {
     }
 }
 
-// 子进程 stderr 重定向目标: 服务日志文件 (换代后 truncate 打开; 打不开退化为丢弃)。
+// Child stderr redirect target: the service log file (truncated open after rotation; if unopenable, degrade to discard).
 fn open_svc_stderr(svc: &str, log_path: &std::path::Path) -> std::process::Stdio {
     rotate_svc_log(log_path);
     match std::fs::OpenOptions::new()
@@ -2080,13 +2088,13 @@ fn open_svc_stderr(svc: &str, log_path: &std::path::Path) -> std::process::Stdio
     {
         Ok(f) => f.into(),
         Err(e) => {
-            tracing::warn!(svc, err = %e, log = %log_path.display(), "open svc log fail, stderr 丢弃");
+            tracing::warn!(svc, err = %e, log = %log_path.display(), "open svc log fail, stderr discarded");
             std::process::Stdio::null()
         }
     }
 }
 
-// 从服务日志文件回读末尾 N 行 (失败根因 tail; 文件缺失/读失败返回空串)。
+// Read back the last N lines of the service log file (failure root-cause tail; returns an empty string if the file is missing or unreadable).
 fn read_log_tail(log_path: &std::path::Path) -> String {
     let bytes = std::fs::read(log_path).unwrap_or_default();
     let content = String::from_utf8_lossy(&bytes);
@@ -2095,7 +2103,7 @@ fn read_log_tail(log_path: &std::path::Path) -> String {
     lines[start..].join("\n")
 }
 
-// issue #60: 服务子进程独立进程组 (unix)。windows 无此 API, 子进程保持默认组。
+// issue #60: service child processes get their own process group (unix). windows has no such API; children keep the default group.
 #[cfg(unix)]
 fn set_service_process_group(command: &mut std::process::Command) {
     command.process_group(0);
@@ -2103,9 +2111,9 @@ fn set_service_process_group(command: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn set_service_process_group(_command: &mut std::process::Command) {}
 
-// issue #29: 覆盖服务的启动分派。
-// Script: bash <script> <cmd> (trainer-bridge 自带 start/stop)。
-// Daemon: start → nohup 后台 + pidfile; stop → pidfile kill; restart 上游已退化为 stop+start。
+// issue #29: start dispatch for override services.
+// Script: bash <script> <cmd> (trainer-bridge ships its own start/stop).
+// Daemon: start → nohup background + pidfile; stop → pidfile kill; restart upstream has degenerated to stop+start.
 fn exec_start_spec(
     svc: &str,
     spec: &crate::start_map::StartSpec,
@@ -2116,27 +2124,29 @@ fn exec_start_spec(
         crate::start_map::StartSpec::Script(sh) => exec_bash_script(svc, sh, cmd, env_overrides),
         crate::start_map::StartSpec::Daemon { .. }
         | crate::start_map::StartSpec::Systemd { .. } => {
-            // issue #145: Systemd spec 与 Daemon 共用同一 spawn/退出码路径 —
-            // 差异只在命令构造 (systemctl 同步返回, unit 停稳才退出, 端口随
-            // 之释放; start.sh pidfile 路径对 systemd 进程失效见 config 注释)。
+            // issue #145: the Systemd spec shares the same spawn/exit-code path as Daemon —
+            // the only difference is command construction (systemctl returns synchronously, exiting only
+            // after the unit has stopped, releasing the port; see the config comment for why the start.sh
+            // pidfile path fails against systemd processes).
             let shell_cmd = match spec {
                 crate::start_map::StartSpec::Daemon { .. } => match cmd {
-                    "start" => crate::start_map::daemon_start_cmd(spec, svc)
-                        .ok_or_else(|| anyhow::anyhow!("daemon spec 缺 start 命令: {svc}"))?,
+                    "start" => crate::start_map::daemon_start_cmd(spec, svc).ok_or_else(|| {
+                        anyhow::anyhow!("daemon spec missing start command: {svc}")
+                    })?,
                     "stop" => crate::start_map::daemon_stop_cmd(
                         svc,
                         crate::manifest::registered_port(svc),
                     ),
                     other => {
                         anyhow::bail!(
-                            "daemon spec 不支持 {other} (restart 应为 stop+start): {svc}"
+                            "daemon spec does not support {other} (restart should be stop+start): {svc}"
                         );
                     }
                 },
                 crate::start_map::StartSpec::Systemd { unit } => {
                     crate::start_map::systemd_shell_cmd(unit, cmd)?
                 }
-                _ => unreachable!("外层 match 已排除 Script"),
+                _ => unreachable!("outer match already excluded Script"),
             };
             tracing::info!(svc, cmd, shell = %shell_cmd, env_n = env_overrides.len(), "exec start_map daemon cmd");
             let mut command = std::process::Command::new("bash");
@@ -2144,16 +2154,16 @@ fn exec_start_spec(
             for (k, v) in env_overrides {
                 command.env(k, v);
             }
-            // issue #39/#40: 剥离钉死快照的 env (如 fusion-mlx 的 FUSION_MLX_API_KEY),
-            // 让服务自己的 start.sh/配置现场解析。
+            // issue #39/#40: strip env vars pinned by stale snapshots (e.g. fusion-mlx's FUSION_MLX_API_KEY),
+            // letting the service's own start.sh/config resolve them live.
             for k in crate::env_map::strip_env_for(svc) {
                 command.env_remove(k);
             }
-            // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
-            // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
+            // issue #60: put the child in its own process group — when the daemon (launchd) reloads via bootout
+            // signals are broadcast per process group; inheriting the daemon group would take down the whole managed fleet.
             set_service_process_group(&mut command);
-            // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join,
-            // 后台化孙进程持有 fd 不再阻塞 exec — 见 open_svc_stderr 注释)。
+            // issue #51: stderr to the log file, failure tail read back from the file (no pipe / no join,
+            // backgrounded grandchildren holding the fd no longer block exec — see the open_svc_stderr comment).
             let log_path = crate::start_map::log_path(svc);
             std::fs::create_dir_all(log_path.parent().unwrap()).ok();
             let mut child = command
@@ -2166,7 +2176,7 @@ fn exec_start_spec(
                 .map_err(|e| anyhow::anyhow!("wait daemon cmd: {e}"))?;
             if !status.success() {
                 let tail = read_log_tail(&log_path);
-                // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
+                // Contract format "exit code=<n>" — runner.exit_code_of depends on it (changing one side requires syncing the other)
                 match status.code() {
                     Some(c) => anyhow::bail!("daemon cmd {cmd} exit code={c}: {tail}"),
                     None => anyhow::bail!("daemon cmd {cmd} killed by signal: {tail}"),
@@ -2177,7 +2187,7 @@ fn exec_start_spec(
     }
 }
 
-// bash <script> <cmd>, stderr → 每服务日志 (~/.fusion-sv/logs/<svc>.log)。
+// bash <script> <cmd>, stderr → per-service log (~/.fusion-sv/logs/<svc>.log).
 fn exec_bash_script(
     svc: &str,
     sh: &std::path::Path,
@@ -2185,27 +2195,27 @@ fn exec_bash_script(
     env_overrides: &[(String, String)],
 ) -> Result<()> {
     if !sh.exists() {
-        anyhow::bail!("脚本不存在: {}", sh.display());
+        anyhow::bail!("script not found: {}", sh.display());
     }
     std::fs::create_dir_all(crate::start_map::log_path(svc).parent().unwrap()).ok();
     let svc_log = crate::start_map::log_path(svc);
     tracing::info!(sh = %sh.display(), cmd, log = %svc_log.display(), env_n = env_overrides.len(), "exec start script");
     let mut command = std::process::Command::new("bash");
     command.arg(sh).arg(cmd);
-    // 注入 env (覆盖/新增), 继承父进程其余 env
+    // Inject env (override/add), inheriting the parent's remaining env
     for (k, v) in env_overrides {
         command.env(k, v);
     }
-    // issue #39/#40: 剥离钉死快照的 env (如 fusion-mlx 的 FUSION_MLX_API_KEY),
-    // 让服务自己的 start.sh 现场从 settings.json 解析, 防 supervisor 重启后旧 key 401 风暴。
+    // issue #39/#40: strip env vars pinned by stale snapshots (e.g. fusion-mlx's FUSION_MLX_API_KEY),
+    // letting the service's own start.sh resolve them live from settings.json, preventing a stale-key 401 storm after supervisor restarts.
     for k in crate::env_map::strip_env_for(svc) {
         command.env_remove(k);
     }
-    // issue #60: 子进程放独立进程组 — daemon (launchd) 重载 bootout 时
-    // 信号按进程组广播, 继承 daemon 组会把整个托管 fleet 连带杀掉。
+    // issue #60: put the child in its own process group — when the daemon (launchd) reloads via bootout
+    // signals are broadcast per process group; inheriting the daemon group would take down the whole managed fleet.
     set_service_process_group(&mut command);
-    // issue #51: stderr 落日志文件, 失败 tail 从文件回读 (无 pipe/无 join —
-    // 后台化孙进程持有 pipe 写端曾把 exec 永久挂死, 见 open_svc_stderr 注释)。
+    // issue #51: stderr to the log file, failure tail read back from the file (no pipe / no join —
+    // a backgrounded grandchild holding the pipe write end once hung exec permanently, see the open_svc_stderr comment).
     let mut child = command
         .stdout(std::process::Stdio::null())
         .stderr(open_svc_stderr(svc, &svc_log))
@@ -2216,7 +2226,7 @@ fn exec_bash_script(
         .map_err(|e| anyhow::anyhow!("wait start script: {e}"))?;
     if !status.success() {
         let tail = read_log_tail(&svc_log);
-        // 约定格式 "exit code=<n>" — runner.exit_code_of 依赖此格式 (改一处必须同步另一处)
+        // Contract format "exit code=<n>" — runner.exit_code_of depends on it (changing one side requires syncing the other)
         match status.code() {
             Some(c) => anyhow::bail!("script {cmd} exit code={c}: {tail}"),
             None => anyhow::bail!("script {cmd} killed by signal: {tail}"),
@@ -2225,7 +2235,7 @@ fn exec_bash_script(
     Ok(())
 }
 
-// 同步壳: tokio runtime 内 block_on probe。ServiceRunner.probe_fn 是同步闭包。
+// Sync wrapper: block_on probe inside the tokio runtime. ServiceRunner.probe_fn is a sync closure.
 fn real_probe_spec(s: &ProbeSpec) -> ProbeResult {
     let s = s.clone();
     tokio::task::block_in_place(|| {
@@ -2241,7 +2251,7 @@ mod tests {
     use crate::probe::ProbeResult;
     use std::sync::{Arc, Mutex};
 
-    // env 注入测试共用 env_map::tests::env_lock (单一全局锁, 避免双锁竞态)。
+    // env-injection tests share env_map::tests::env_lock (a single global lock, avoiding double-lock races).
     use crate::env_map::tests::env_lock;
 
     fn def(name: &str, layer: Layer, port: u16) -> ServiceDef {
@@ -2271,15 +2281,15 @@ mod tests {
         }
     }
 
-    // issue #39/#40: exec_bash_script 剥离 strip_env_for 列出的 env —
-    // fusion-mlx 子进程不得继承 daemon 的 FUSION_MLX_API_KEY 快照 (防旧 key 401),
-    // 其它服务照常继承。
+    // issue #39/#40: exec_bash_script strips the env vars listed by strip_env_for —
+    // the fusion-mlx child must not inherit the daemon's FUSION_MLX_API_KEY snapshot (preventing stale-key 401s),
+    // other services inherit as usual.
     #[test]
     fn test_exec_bash_script_strips_pinned_env() {
         let _guard = env_lock();
         let prev = std::env::var("FUSION_MLX_API_KEY").ok();
         unsafe { std::env::set_var("FUSION_MLX_API_KEY", "stale-snapshot-key") };
-        // 脚本: env 存在即 fail
+        // Script: fails if the env var exists
         let dir = tempfile::tempdir().unwrap();
         let sh = dir.path().join("probe.sh");
         std::fs::write(
@@ -2287,24 +2297,24 @@ mod tests {
             "#!/bin/bash\nif [ -n \"$FUSION_MLX_API_KEY\" ]; then exit 1; fi\nexit 0\n",
         )
         .unwrap();
-        // fusion-mlx: 剥离后脚本看不到 var → Ok
+        // fusion-mlx: after the strip the script cannot see the var → Ok
         assert!(
             exec_bash_script("fusion-mlx", &sh, "start", &[]).is_ok(),
-            "fusion-mlx 子进程应剥离 FUSION_MLX_API_KEY"
+            "fusion-mlx child should have FUSION_MLX_API_KEY stripped"
         );
-        // 其它服务: 继承 var → 脚本 fail
+        // Other services: inherit the var → script fails
         assert!(
             exec_bash_script("fusion-rag", &sh, "start", &[]).is_err(),
-            "其它服务照常继承 daemon env"
+            "other services inherit daemon env as usual"
         );
-        // 恢复进程 env
+        // Restore the process env
         match prev {
             Some(v) => unsafe { std::env::set_var("FUSION_MLX_API_KEY", v) },
             None => unsafe { std::env::remove_var("FUSION_MLX_API_KEY") },
         }
     }
 
-    // issue #47: exec_bash_script 失败信息携带退出码 + stderr tail (根因回传给告警/event)
+    // issue #47: exec_bash_script failure messages carry the exit code + stderr tail (root cause fed back to alerts/events)
     #[test]
     fn test_exec_bash_script_captures_exit_code_and_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -2316,45 +2326,51 @@ mod tests {
         .unwrap();
         let err = exec_bash_script("ut-tail-capture", &sh, "start", &[]).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("exit code=78"), "应携带约定格式退出码: {msg}");
+        assert!(
+            msg.contains("exit code=78"),
+            "should carry the contract exit code: {msg}"
+        );
         assert!(
             msg.contains("yaml: unmarshal errors: bad config"),
-            "应携带 stderr tail: {msg}"
+            "should carry the stderr tail: {msg}"
         );
-        // 日志文件也应收到同一 stderr (tail 线程写盘)
+        // The log file should also receive the same stderr (the tail thread writes it)
         let log = crate::start_map::log_path("ut-tail-capture");
         let log_content = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(log_content.contains("yaml: unmarshal errors: bad config"));
-        // 清理测试过程文件
+        // Clean up test artifact files
         let _ = std::fs::remove_file(&log);
     }
 
-    // issue #121: 服务日志换代 — 自动重启前保留上一轮 stderr 到 .log.1,
-    // ProcessExit (外部 TERM / 内部 should_exit) 死因证据不再随重启蒸发。
+    // issue #121: service log rotation — keep the previous round's stderr in .log.1 before auto-restart,
+    // so ProcessExit (external TERM / internal should_exit) cause-of-death evidence no longer evaporates on restart.
     #[test]
     fn test_issue121_rotate_svc_log_keeps_previous_stderr() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("ut-svc.log");
         std::fs::write(&log, "old run: Shutting down\n").unwrap();
         rotate_svc_log(&log);
-        assert!(!log.exists(), "rotate 后主文件让位给新一轮");
+        assert!(
+            !log.exists(),
+            "after rotate the main file yields to the new round"
+        );
         let rotated = tmp.path().join("ut-svc.log.1");
         assert_eq!(
             std::fs::read_to_string(&rotated).unwrap(),
             "old run: Shutting down\n"
         );
-        // 新一轮结束后再 rotate: .1 覆盖为最近一代
+        // Rotate again after a new round finishes: .1 is overwritten with the latest generation
         std::fs::write(&log, "new run\n").unwrap();
         rotate_svc_log(&log);
         assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "new run\n");
-        // 空文件不换代 (省无谓 rename)
+        // Empty files are not rotated (skips a pointless rename)
         std::fs::write(&log, "").unwrap();
         rotate_svc_log(&log);
-        assert!(log.exists(), "空文件不 rotate");
+        assert!(log.exists(), "empty file is not rotated");
     }
 
-    // issue #51 回归: start.sh 后台化的孙进程继承 stderr 不关闭 — exec 不得等它。
-    // 旧 pipe+join 实现会阻塞到 sleep 退出 (60s), 这里断言 <10s 内返回。
+    // issue #51 regression: a grandchild backgrounded by start.sh inherits stderr without closing it — exec must not wait for it.
+    // The old pipe+join implementation would block until the sleep exits (60s); assert a return within <10s.
     #[test]
     fn test_exec_returns_despite_lingering_grandchild() {
         let dir = tempfile::tempdir().unwrap();
@@ -2362,21 +2378,21 @@ mod tests {
         std::fs::write(&sh, "#!/bin/bash\nsleep 60 &\nexit 0\n").unwrap();
         let start = std::time::Instant::now();
         exec_bash_script("ut-linger", &sh, "start", &[])
-            .expect("exec 应在孙进程仍持有 stderr 时返回");
+            .expect("exec should return while the grandchild still holds stderr");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
-            "不得等待 pipe EOF (旧实现在此挂死, issue #51)"
+            "must not wait for pipe EOF (the old implementation hung here, issue #51)"
         );
-        // 清理测试过程文件 (孙进程 sleep 已被 tempdir 之外清理策略兜底: 60s 后自然退出)
+        // Clean up test artifact files (the grandchild sleep is covered by the cleanup policy outside tempdir: it exits naturally after 60s)
         let _ = std::fs::remove_file(crate::start_map::log_path("ut-linger"));
     }
 
-    // caffeinate 陪护: pidfile 指向活进程 → 断言挂上; 进程死 → caffeinate 退出
-    // (绝对路径直传, 不走 ~ 展开 — 避免 HOME 全局 env 竞态)
+    // caffeinate companion: a pidfile pointing at a live process → assertion attaches; process dies → caffeinate exits
+    // (absolute path passed directly, no ~ expansion — avoids the HOME global env race)
     #[test]
     fn test_spawn_caffeinate_attaches_and_releases() {
         let dir = tempfile::tempdir().unwrap();
-        // 陪护目标: sleep 进程
+        // Companion target: a sleep process
         let mut target = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -2385,7 +2401,7 @@ mod tests {
         let pidfile = dir.path().join("run.pid");
         std::fs::write(&pidfile, &pid).unwrap();
         spawn_caffeinate("ut-caffeinate", pidfile.to_str().unwrap());
-        // caffeinate 进程应存在且 -w 指向 target pid
+        // The caffeinate process should exist and -w should point at the target pid
         let mut attached = false;
         for _ in 0..40 {
             let out = std::process::Command::new("pgrep")
@@ -2398,8 +2414,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(attached, "caffeinate 断言应挂到目标 pid");
-        // 目标死亡 → caffeinate 自动退出 (-w 语义)
+        assert!(
+            attached,
+            "caffeinate assertion should attach to the target pid"
+        );
+        // Target dies → caffeinate exits automatically (-w semantics)
         let _ = target.kill();
         let _ = target.wait();
         let mut released = false;
@@ -2414,17 +2433,20 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(released, "目标进程死后 caffeinate 应自动退出");
+        assert!(
+            released,
+            "caffeinate should exit automatically after the target process dies"
+        );
     }
 
-    // caffeinate 陪护: pidfile 缺失 → 跳过不 panic
+    // caffeinate companion: pidfile missing → skip without panicking
     #[test]
     fn test_spawn_caffeinate_skips_bad_pidfile() {
         spawn_caffeinate("ut-caffeinate", "/nonexistent-ut-xyz/run.pid");
     }
 
-    // issue #145: Systemd spec exec — systemctl 替身 (shim) 验证命令透传 +
-    // 非零退出码浮出 (stop 失败不再被吞成假停止)。
+    // issue #145: Systemd spec exec — a systemctl shim verifies command pass-through +
+    // non-zero exit codes surfacing (stop failures are no longer swallowed into fake stops).
     #[test]
     fn test_issue145_systemd_exec_start_stop_and_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2450,24 +2472,24 @@ mod tests {
         let spec = crate::start_map::StartSpec::Systemd {
             unit: "ut-svc.service".to_string(),
         };
-        // start / stop 均透传 systemctl
+        // start / stop both pass through to systemctl
         exec_start_spec("ut-svc", &spec, "start", &[]).unwrap();
         exec_start_spec("ut-svc", &spec, "stop", &[]).unwrap();
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(calls, "start ut-svc.service\nstop ut-svc.service\n");
-        // systemctl 失败 → Err 携带退出码 (runner.exit_code_of 约定格式)
+        // systemctl failure → Err carries the exit code (runner.exit_code_of contract format)
         let _g3 = crate::env_map::tests::EnvGuard::set("FUSION_TEST_SHIM_RC", "1");
         let err = exec_start_spec("ut-svc", &spec, "stop", &[]).unwrap_err();
         assert!(err.to_string().contains("exit code=1"), "{err}");
-        // 未知 verb 拒绝
+        // Unknown verbs are rejected
         let _g4 = crate::env_map::tests::EnvGuard::set("FUSION_TEST_SHIM_RC", "0");
         assert!(exec_start_spec("ut-svc", &spec, "restart", &[]).is_err());
         let _ = std::fs::remove_file(crate::start_map::log_path("ut-svc"));
     }
 
-    // issue #60 回归: exec 启动的子进程必须落在独立进程组 — launchd bootout 按
-    // daemon 进程组广播 SIGTERM, 继承同组会把整个托管 fleet 连带杀掉。
-    // 断言: exec_bash_script 起的 bash pgid ≠ 测试进程 pgid; 普通继承 spawn 则 ==。
+    // issue #60 regression: child processes started via exec must land in their own process group — launchd bootout
+    // broadcasts SIGTERM per daemon process group; inheriting the same group would take down the whole managed fleet.
+    // Assert: the bash started by exec_bash_script has pgid ≠ the test process pgid; a plain inheriting spawn has ==.
     #[test]
     fn test_exec_child_gets_own_process_group() {
         let our_pgid = {
@@ -2491,19 +2513,19 @@ mod tests {
         .unwrap();
         exec_bash_script("ut-pgid", &sh, "start", &[]).unwrap();
         let child_pgid = std::fs::read_to_string(&pgid_file)
-            .expect("子进程应写出自身 pgid")
+            .expect("child should write out its own pgid")
             .trim()
             .to_string();
-        assert!(!child_pgid.is_empty(), "pgid 输出不得为空");
+        assert!(!child_pgid.is_empty(), "pgid output must not be empty");
         assert_ne!(
             child_pgid, our_pgid,
-            "exec 子进程应独立进程组 (issue #60), 实际与 daemon 同组"
+            "exec child should be in its own process group (issue #60), but shares the daemon's group"
         );
-        // 清理测试过程文件
+        // Clean up test artifact files
         let _ = std::fs::remove_file(crate::start_map::log_path("ut-pgid"));
     }
 
-    // issue #31: up_one/down_one — service 级操作只动目标服务
+    // issue #31: up_one/down_one — service-level ops touch only the target service
     #[tokio::test]
     async fn test_up_one_down_one_single_service() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -2534,7 +2556,7 @@ mod tests {
         assert_eq!(
             got,
             vec!["fusion-rag/start"],
-            "up_one 只应启动目标服务: {got:?}"
+            "up_one should start only the target service: {got:?}"
         );
         assert!(matches!(core.runners[1].state, runner::State::Starting));
 
@@ -2544,16 +2566,16 @@ mod tests {
         assert_eq!(
             got,
             vec!["fusion-rag/stop"],
-            "down_one 只应停目标服务: {got:?}"
+            "down_one should stop only the target service: {got:?}"
         );
         assert!(matches!(core.runners[1].state, runner::State::Stopped));
 
-        // 未知服务 → Err
+        // Unknown service → Err
         assert!(core.up_one("fusion-nope").await.is_err());
         assert!(core.down_one("fusion-nope").await.is_err());
     }
 
-    // issue #31: up_one 已健康跳过 (与 up_native 避双启一致)
+    // issue #31: up_one skips already-healthy (consistent with up_native's double-start avoidance)
     #[tokio::test]
     async fn test_up_one_skips_healthy() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -2569,11 +2591,14 @@ mod tests {
             },
         );
         core.up_one("fusion-mlx").await.unwrap();
-        assert!(calls.lock().unwrap().is_empty(), "已健康应跳过 start");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "already healthy should skip start"
+        );
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
     }
 
-    // issue #31: supervise: false 条目不建 runner — up/down/tick/status 全跳过
+    // issue #31: supervise: false entries get no runner — up/down/tick/status all skip them
     #[tokio::test]
     async fn test_unmanaged_services_excluded_from_runners() {
         let mut d1 = def("fusion-mlx", Layer::Core, 11434);
@@ -2588,15 +2613,19 @@ mod tests {
             |_| ProbeResult::Healthy { latency_ms: 1 },
             |_, _, _| Ok(()),
         );
-        assert_eq!(core.runners.len(), 1, "豁免条目不应建 runner");
+        assert_eq!(
+            core.runners.len(),
+            1,
+            "exempt entries must not create runners"
+        );
         assert_eq!(core.runners[0].def.name, "fusion-mlx");
         let status = core.status_all();
-        assert_eq!(status.len(), 1, "status 不含豁免条目");
+        assert_eq!(status.len(), 1, "status must not include exempt entries");
     }
 
     #[tokio::test]
     async fn test_up_all_skips_already_healthy() {
-        // 所有服务探活即健康 → 不调 start.sh
+        // All services healthy on probe → start.sh is not called
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
             def("fusion-rag", Layer::App, 11436),
@@ -2606,7 +2635,7 @@ mod tests {
         let mut core = SupervisorCore::new_with_fns(
             defs,
             fake_cfg(),
-            |_| ProbeResult::Healthy { latency_ms: 1 }, // 探活恒健康
+            |_| ProbeResult::Healthy { latency_ms: 1 }, // probe always healthy
             move |svc, cmd, _env| {
                 calls_p.lock().unwrap().push(format!("{svc}/{cmd}"));
                 Ok(())
@@ -2615,13 +2644,13 @@ mod tests {
         core.up_all().await.unwrap();
         assert!(
             calls.lock().unwrap().is_empty(),
-            "已健康应跳过不调 start.sh"
+            "already healthy should skip and not call start.sh"
         );
-        // I4: 跳过=已健康 的 runner 应标 Healthy
+        // I4: runners skipped as already-healthy should be marked Healthy
         for r in &core.runners {
             assert!(
                 matches!(r.state, runner::State::Healthy),
-                "skip 后应 Healthy"
+                "should be Healthy after skip"
             );
         }
     }
@@ -2634,7 +2663,7 @@ mod tests {
         // made these tests environment-dependent. Same fix as the trainer-bridge
         // tests in env_map.rs.
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
-        // 全不健康 → 按 layer 序起, 记录顺序
+        // All unhealthy → start in layer order, recording the order
         let defs = vec![
             def("fusion-rag", Layer::App, 11436),
             def("fusion-mlx", Layer::Core, 11434),
@@ -2654,13 +2683,13 @@ mod tests {
         );
         core.up_all().await.unwrap();
         let o = order.lock().unwrap();
-        assert_eq!(o[0], "fusion-mlx", "core 层先起");
-        assert_eq!(o[1], "fusion-rag", "app 层后起");
-        // I4: 启动过的 runner 应标 Starting
+        assert_eq!(o[0], "fusion-mlx", "core layer starts first");
+        assert_eq!(o[1], "fusion-rag", "app layer starts after");
+        // I4: runners that were started should be marked Starting
         for r in &core.runners {
             assert!(
                 matches!(r.state, runner::State::Starting),
-                "启动后应 Starting"
+                "should be Starting after start"
             );
         }
     }
@@ -2684,20 +2713,20 @@ mod tests {
         );
         core.down_all().await.unwrap();
         let o = order.lock().unwrap();
-        assert_eq!(o[0], "fusion-rag", "逆序: app 先停");
-        assert_eq!(o[1], "fusion-mlx", "core 最后停");
-        // I5: 停止过的 runner 应标 Stopped
+        assert_eq!(o[0], "fusion-rag", "reverse order: app stops first");
+        assert_eq!(o[1], "fusion-mlx", "core stops last");
+        // I5: runners stopped by down_all should be marked Stopped
         for r in &core.runners {
             assert!(
                 matches!(r.state, runner::State::Stopped),
-                "停止后应 Stopped"
+                "should be Stopped after stop"
             );
         }
     }
 
     #[tokio::test]
     async fn test_concurrency_cap_not_exceeded() {
-        // 4 服务同层, cap=2 → 任意时刻最多 2 并发 start
+        // 4 services in one layer, cap=2 → at most 2 concurrent starts at any moment
         let defs: Vec<ServiceDef> = (0..4)
             .map(|i| def(&format!("fusion-s{}", i), Layer::App, 11480 + i))
             .collect();
@@ -2725,11 +2754,11 @@ mod tests {
         );
         core.up_all().await.unwrap();
         let mx = *max_seen.lock().unwrap();
-        assert!(mx <= 2, "并发上限 2, 实测峰值 {mx}");
+        assert!(mx <= 2, "concurrency cap 2, observed peak {mx}");
     }
 
-    // C1: tick_all 驱动状态机 — Unhealthy+ConnectionRefused → 记 crash + 重启 →
-    // 翻探活为 Healthy → tick → 恢复 Healthy。证明 tick_all 接通监督回路。
+    // C1: tick_all drives the state machine — Unhealthy+ConnectionRefused → record crash + restart →
+    // flip the probe to Healthy → tick → back to Healthy. Proves tick_all completes the supervision loop.
     #[tokio::test]
     async fn test_tick_all_drives_recovery() {
         let probe_cell: Arc<Mutex<ProbeResult>> = Arc::new(Mutex::new(ProbeResult::Unhealthy {
@@ -2742,32 +2771,32 @@ mod tests {
             move |_: &ProbeSpec| pc.lock().unwrap().clone(),
             |_svc, _cmd, _env| Ok(()),
         );
-        // 起始: 已 Unhealthy。issue #31: 退避不再持锁 sleep —
-        // 首 tick 排期, 到点 tick (delay=1s) 重启 → Restarting
+        // Start: already Unhealthy. issue #31: backoff no longer sleeps under the lock —
+        // the first tick schedules, the due tick (delay=1s) restarts → Restarting
         core.runners[0].state = runner::State::Unhealthy;
-        // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
+        // issue #79: preset the consecutive-failure count (testing straight from Unhealthy)
         core.runners[0].fail_streak = 2;
         core.drive(1000).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Unhealthy),
-            "排期 tick 不应重启"
+            "scheduled tick must not restart"
         );
         core.drive(1001).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Restarting),
-            "tick_all 后应 Restarting"
+            "should be Restarting after tick_all"
         );
-        // 翻探活为健康 → tick_all 应恢复 Healthy
+        // Flip the probe to healthy → tick_all should recover to Healthy
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
         core.drive(1001).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Healthy),
-            "探活恢复后 tick_all 应 Healthy"
+            "tick_all should be Healthy after the probe recovers"
         );
     }
 
-    // issue #153: Timeout 走更高重启阈值 — 连续超时 3 次不排重启 (高负载
-    // GIL 饱和期健康引擎被误杀), 达 TIMEOUT_RESTART_STREAK 才升级。
+    // issue #153: Timeout uses a higher restart threshold — 3 consecutive timeouts do not schedule a restart
+    // (healthy engines were being killed during high-load GIL saturation); only reaching TIMEOUT_RESTART_STREAK escalates.
     #[tokio::test]
     async fn test_issue153_timeout_streak_gates_restart() {
         let mut core = SupervisorCore::new_with_fns(
@@ -2778,33 +2807,34 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
-        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
-        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        // Use a fake repo_dir — if the real machine happens to have a start.sh with the same name running
+        // (the #86 operator-race gate's pgrep -f match), the due-restart would be skipped and the test
+        // becomes an environment-sensitive false failure
         core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
-        // streak 3..=TIMEOUT_RESTART_STREAK-1: 连续超时远超旧 3 连败阈值, 不排重启
+        // streak 3..=TIMEOUT_RESTART_STREAK-1: consecutive timeouts far beyond the old 3-streak threshold, no restart scheduled
         for _ in 3..runner::TIMEOUT_RESTART_STREAK {
             core.drive(2000).await;
             assert!(
                 core.runners[0].restart_after.is_none(),
-                "Timeout 连败未达 {} 不应排重启",
+                "Timeout streak below {} must not schedule a restart",
                 runner::TIMEOUT_RESTART_STREAK
             );
             assert!(matches!(core.runners[0].state, runner::State::Unhealthy));
         }
-        // 达阈值 → 排期; 到点 tick → 真正重启
+        // Threshold reached → schedule; due tick → actual restart
         core.drive(2000).await;
         assert!(
             core.runners[0].restart_after.is_some(),
-            "Timeout 达阈值应排重启"
+            "Timeout reaching the threshold should schedule a restart"
         );
         core.drive(9_999_999).await;
         assert!(matches!(core.runners[0].state, runner::State::Restarting));
     }
 
-    // issue #153: ConnectionRefused 仍走 RESTART_FAIL_STREAK=3 快速重启
-    // (真死信号不因 Timeout 分流被拖慢)。
+    // issue #153: ConnectionRefused still uses the RESTART_FAIL_STREAK=3 fast restart
+    // (the true-death signal is not slowed by the Timeout triage).
     #[tokio::test]
     async fn test_issue153_refused_keeps_fast_restart() {
         let mut core = SupervisorCore::new_with_fns(
@@ -2815,22 +2845,23 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
-        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
-        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        // Use a fake repo_dir — if the real machine happens to have a start.sh with the same name running
+        // (the #86 operator-race gate's pgrep -f match), the due-restart would be skipped and the test
+        // becomes an environment-sensitive false failure
         core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         core.drive(1000).await;
         assert!(
             core.runners[0].restart_after.is_some(),
-            "ConnectionRefused 3 连败应排重启"
+            "ConnectionRefused 3-streak should schedule a restart"
         );
         core.drive(999_999).await;
         assert!(matches!(core.runners[0].state, runner::State::Restarting));
     }
 
-    // issue #153: 启动重试期 (start_retry) Timeout 不升级阈值 — 进程尚未
-    // 监听属预期, 维持 3 连败快速补拉, 否则启动期重试被拖慢一个数量级。
+    // issue #153: during start_retry, Timeout does not escalate the threshold — a process not yet
+    // listening is expected; keep the 3-streak fast relaunch, otherwise start-phase retries slow down by an order of magnitude.
     #[tokio::test]
     async fn test_issue153_timeout_during_start_retry_keeps_fast_threshold() {
         let mut core = SupervisorCore::new_with_fns(
@@ -2841,8 +2872,9 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
-        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
-        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        // Use a fake repo_dir — if the real machine happens to have a start.sh with the same name running
+        // (the #86 operator-race gate's pgrep -f match), the due-restart would be skipped and the test
+        // becomes an environment-sensitive false failure
         core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
@@ -2850,12 +2882,12 @@ mod tests {
         core.drive(1000).await;
         assert!(
             core.runners[0].restart_after.is_some(),
-            "start_retry 期 Timeout 应维持快速阈值排重启"
+            "Timeout during start_retry should keep the fast threshold and schedule a restart"
         );
     }
 
-    // issue #112: 自动恢复拉起成功后必须落 AutoRestart 审计事件 (带 old/new pid),
-    // 且 status_all 的 last_restart 列能查到它 — 事后可答 "这服务谁拉起的"
+    // issue #112: after a successful auto-recovery start, an AutoRestart audit event must be recorded (with old/new pid),
+    // and status_all's last_restart column must find it — afterwards answers "who started this service"
     #[tokio::test]
     async fn test_issue112_autorestart_event_and_status_last_restart() {
         let probe_cell: Arc<Mutex<ProbeResult>> = Arc::new(Mutex::new(ProbeResult::Unhealthy {
@@ -2868,14 +2900,15 @@ mod tests {
             move |_: &ProbeSpec| pc.lock().unwrap().clone(),
             |_svc, _cmd, _env| Ok(()),
         );
-        // repo_dir 用假名 — 真机恰有同名 start.sh 在跑时 (#86 操作员竞态闸门
-        // pgrep -f 匹配) due-restart 会被跳过, 测试变成环境敏感假失败
+        // Use a fake repo_dir — if the real machine happens to have a start.sh with the same name running
+        // (the #86 operator-race gate's pgrep -f match), the due-restart would be skipped and the test
+        // becomes an environment-sensitive false failure
         core.runners[0].def.repo_dir = "test-no-such-repo-153".into();
         core.runners[0].state = runner::State::Unhealthy;
         core.runners[0].fail_streak = 2;
         core.drive(1000).await;
-        core.drive(1001).await; // 到点重启, invoke_start Ok → AutoRestart 事件
-        // 事件落库: kind=AutoRestart, detail 带 pid 字段 (测试无 pidfile → "?")
+        core.drive(1001).await; // due restart, invoke_start Ok → AutoRestart event
+        // Event persisted: kind=AutoRestart, detail carries pid fields (tests have no pidfile → "?")
         let (kind, detail): (String, String) = core
             .store
             .conn
@@ -2886,23 +2919,32 @@ mod tests {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .expect("AutoRestart 事件应已落库");
-        assert!(detail.contains("old_pid="), "detail 应带 old_pid: {detail}");
-        assert!(detail.contains("new_pid="), "detail 应带 new_pid: {detail}");
-        // 翻探活为健康 → 恢复
+            .expect("AutoRestart event should be persisted");
+        assert!(
+            detail.contains("old_pid="),
+            "detail should carry old_pid: {detail}"
+        );
+        assert!(
+            detail.contains("new_pid="),
+            "detail should carry new_pid: {detail}"
+        );
+        // Flip the probe to healthy → recovery
         *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
         core.drive(1001).await;
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
-        // status enrichment: last_restart 列 = "AutoRestart ..."
+        // status enrichment: last_restart column = "AutoRestart ..."
         let status = core.status_all();
         let row = status.iter().find(|e| e.name == "fusion-rag").unwrap();
-        let lr = row.last_restart.as_deref().expect("last_restart 应有值");
+        let lr = row
+            .last_restart
+            .as_deref()
+            .expect("last_restart should have a value");
         assert!(lr.starts_with("AutoRestart"), "got: {lr}");
         let _ = kind;
     }
 
-    // issue #111: 探活通过但 pidfile 进程已死 (陈旧监听器占口) — Daemon spec
-    // 服务须转 Unhealthy (走重启流清掉陈旧监听); 活 pid / 无 pidfile 不误判
+    // issue #111: probe passes but the pidfile process is dead (a stale listener holds the port) — Daemon spec
+    // services must flip to Unhealthy (entering the restart flow to clear the stale listener); live pid / no pidfile are not misjudged
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_issue111_probe_pass_dead_pid_detected() {
@@ -2913,14 +2955,14 @@ mod tests {
         impl HomeGuard {
             fn set(val: &std::path::Path) -> Self {
                 let prev = std::env::var("HOME").ok();
-                // SAFETY: env_lock 串行化, 此测试期间无并发读 HOME 的被测代码
+                // SAFETY: env_lock serializes; no code under test reads HOME concurrently during this test
                 unsafe { std::env::set_var("HOME", val) };
                 Self { prev }
             }
         }
         impl Drop for HomeGuard {
             fn drop(&mut self) {
-                // SAFETY: 同上
+                // SAFETY: same as above
                 match &self.prev {
                     Some(v) => unsafe { std::env::set_var("HOME", v) },
                     None => unsafe { std::env::remove_var("HOME") },
@@ -2933,8 +2975,8 @@ mod tests {
         let _g1 = HomeGuard::set(&home);
         let pidfile = home.join(".fusion-sv/pids/fusion-cowork-web.pid");
 
-        // 场景 1: 死 pid — i32::MAX 永不存在 (macOS pid 上限 ~99998), 免
-        // 并行测试杀子进程后 pid 被即时复用的竞态
+        // Scenario 1: dead pid — i32::MAX never exists (macOS pid cap ~99998), avoiding the race where a
+        // parallel test kills a child process and the pid is instantly reused
         std::fs::write(&pidfile, i32::MAX.to_string()).unwrap();
         let mut core = SupervisorCore::new_with_fns(
             vec![def("fusion-cowork-web", Layer::App, 11461)],
@@ -2946,11 +2988,11 @@ mod tests {
         core.drive(1000).await;
         assert!(
             matches!(core.runners[0].state, runner::State::Unhealthy),
-            "探活通过但 pid 已死应转 Unhealthy"
+            "probe passing with a dead pid should flip to Unhealthy"
         );
         drop(core);
 
-        // 场景 2: 活 pid → 保持 Healthy
+        // Scenario 2: live pid → stays Healthy
         let mut live = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -2967,7 +3009,7 @@ mod tests {
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
         drop(core);
 
-        // 场景 3: pidfile 缺失 → 不误判, 保持 Healthy
+        // Scenario 3: pidfile missing → no misjudgment, stays Healthy
         let _ = std::fs::remove_file(&pidfile);
         let mut core = SupervisorCore::new_with_fns(
             vec![def("fusion-cowork-web", Layer::App, 11461)],
@@ -2983,8 +3025,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // issue #112: boot 对账发现常驻档 (非 T2) 服务死亡 — 落 ServiceDown 事件
-    // "found dead at daemon start", 事后告警流可见, 不再静默维持 Stopped
+    // issue #112: boot reconciliation finds a resident-tier (non-T2) service dead — records a ServiceDown event
+    // "found dead at daemon start", visible in the alert stream afterwards, no longer silently staying Stopped
     #[tokio::test]
     async fn test_issue112_reconcile_dead_resident_event() {
         let defs = vec![
@@ -3001,7 +3043,7 @@ mod tests {
         );
         let adopted = core.reconcile_on_boot().await;
         assert_eq!(adopted, 0);
-        // T1 死亡有事件, T2 (非常驻档) 无事件
+        // T1 death has an event, T2 (non-resident tier) does not
         let n: i64 = core
             .store
             .conn
@@ -3013,7 +3055,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1, "仅常驻档 (T1) 死亡落 reconcile 事件");
+        assert_eq!(
+            n, 1,
+            "only a resident-tier (T1) death records a reconcile event"
+        );
         let svc: String = core
             .store
             .conn
@@ -3028,9 +3073,9 @@ mod tests {
         assert_eq!(svc, "fusion-cowork-web");
     }
 
-    // issue #157: 操作员 down (事件表最近一次 restart 类事件 = ManualStop) 的
-    // 常驻档服务, daemon 重启后 reconcile 不再落 "found dead" 告警 — 刻意停的
-    // 不算死; 而无 ManualStop 记录的服务照旧落告警 (#111 语义不变)。
+    // issue #157: for a resident-tier service the operator downed (the event table's most recent restart-class
+    // event = ManualStop), reconcile after a daemon restart no longer emits the "found dead" alert — deliberately
+    // stopped does not count as dead; services without a ManualStop record still alert (#111 semantics unchanged).
     #[tokio::test]
     async fn test_issue157_reconcile_skips_operator_stopped_alert() {
         let defs = vec![
@@ -3045,7 +3090,7 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
-        // fusion-rag: 操作员 down 过 (ManualStop 事件); fusion-model-hub: 无记录
+        // fusion-rag: downed by the operator (ManualStop event); fusion-model-hub: no record
         core.store
             .record_event(
                 "fusion-rag",
@@ -3070,12 +3115,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             svc, "fusion-model-hub",
-            "只有非操作员停机 (无 ManualStop 记录) 的常驻档服务落 reconcile 告警"
+            "only a resident-tier service not operator-stopped (no ManualStop record) emits a reconcile alert"
         );
     }
 
-    // issue #157/#149: 操作员 down 的服务 daemon 重启后若残留活监听器,
-    // reconcile 不得采纳翻 Healthy — 保持 Stopped (#149 down-sticky 跨重启)。
+    // issue #157/#149: if an operator-downed service left a live listener behind and the daemon restarts,
+    // reconcile must not adopt it back to Healthy — stays Stopped (#149 down-sticky across restarts).
     #[tokio::test]
     async fn test_issue157_reconcile_keeps_operator_stopped_service_down() {
         let defs = vec![def_tier(
@@ -3101,11 +3146,14 @@ mod tests {
             )
             .unwrap();
         let adopted = core.reconcile_on_boot().await;
-        assert_eq!(adopted, 0, "操作员 down 的残留监听器不采纳");
+        assert_eq!(
+            adopted, 0,
+            "leftover listener of an operator-downed service must not be adopted"
+        );
         assert!(matches!(core.runners[0].state, runner::State::Stopped));
     }
 
-    // C1: poll_interval — 有 down 态返回 poll_unhealthy_sec, 否则 poll_healthy_sec
+    // C1: poll_interval — returns poll_unhealthy_sec when anything is down, else poll_healthy_sec
     #[test]
     fn test_poll_interval_switches_on_down_state() {
         let mut core = SupervisorCore::new_with_fns(
@@ -3114,18 +3162,18 @@ mod tests {
             |_| ProbeResult::Healthy { latency_ms: 1 },
             |_, _, _| Ok(()),
         );
-        // 全 Healthy → poll_healthy_sec
+        // All Healthy → poll_healthy_sec
         core.runners[0].state = runner::State::Healthy;
         assert_eq!(core.poll_interval(), core.cfg.poll_healthy_sec);
-        // 有 Unhealthy → poll_unhealthy_sec
+        // Any Unhealthy → poll_unhealthy_sec
         core.runners[0].state = runner::State::Unhealthy;
         assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
-        // Failed 也算 down
+        // Failed also counts as down
         core.runners[0].state = runner::State::Failed;
         assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
     }
 
-    // ---- compose 平面集成测试 ----
+    // ---- compose plane integration tests ----
     use crate::compose::{ContainerStatus, test_support::FakeCompose};
 
     fn mk_container(service: &str, state: &str, health: &str, port: u16) -> ContainerStatus {
@@ -3142,7 +3190,7 @@ mod tests {
         }
     }
 
-    // up_all: compose 启用时顺序 = sidecar → native → business
+    // up_all: with compose enabled the order is sidecar → native → business
     #[tokio::test]
     async fn test_up_all_compose_order_sidecar_native_business() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -3158,7 +3206,7 @@ mod tests {
         let native_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let no_p = native_order.clone();
         let fake = Box::new(FakeCompose::new());
-        // rag 依赖 qdrant (dep_map), 预置 qdrant Healthy 满足 dep-gate
+        // rag depends on qdrant (dep_map); preset qdrant Healthy to satisfy the dep-gate
         fake.set_containers(vec![mk_container("qdrant", "running", "healthy", 6333)]);
         let calls_ref = fake.calls.clone();
         let mut core = SupervisorCore::new_with_fns_and_compose(
@@ -3175,21 +3223,25 @@ mod tests {
         );
         core.up_all().await.unwrap();
         let calls = calls_ref.lock().unwrap();
-        // 顺序: up_sidecar 先, up_business 最后
-        assert_eq!(calls[0], "up_sidecar", "sidecar 先起");
-        assert_eq!(calls[calls.len() - 1], "up_business", "business 最后起");
-        // native 在中间: core 先于 platform
+        // Order: up_sidecar first, up_business last
+        assert_eq!(calls[0], "up_sidecar", "sidecar starts first");
+        assert_eq!(
+            calls[calls.len() - 1],
+            "up_business",
+            "business starts last"
+        );
+        // native in the middle: core before platform
         let no = native_order.lock().unwrap();
         let mlx_i = no.iter().position(|n| n == "fusion-mlx").unwrap();
         let rag_i = no.iter().position(|n| n == "fusion-rag").unwrap();
-        assert!(mlx_i < rag_i, "native core 先于 platform");
-        // sidecar 在 native 之前
+        assert!(mlx_i < rag_i, "native core before platform");
+        // sidecar before native
         let sidecar_i = calls.iter().position(|c| c == "up_sidecar").unwrap();
         let business_i = calls.iter().position(|c| c == "up_business").unwrap();
         assert!(sidecar_i < business_i);
     }
 
-    // compose 未启用 (None): up_all 不调任何 compose 方法, 仅 native
+    // compose disabled (None): up_all calls no compose methods, native only
     #[tokio::test]
     async fn test_up_all_no_compose_native_only() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3206,16 +3258,19 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(!core.compose_enabled(), "默认 compose 未启用");
+        assert!(
+            !core.compose_enabled(),
+            "compose should be disabled by default"
+        );
         core.up_all().await.unwrap();
         let c = called.lock().unwrap();
         assert!(
             c.iter().all(|x| x.contains("start")),
-            "仅 native start 调用"
+            "only native start calls"
         );
     }
 
-    // down_all: compose 启用时 compose down 先, native 逆序后
+    // down_all: with compose enabled, compose down first, then native in reverse order
     #[tokio::test]
     async fn test_down_all_compose_then_native_reverse() {
         let defs = vec![
@@ -3238,15 +3293,18 @@ mod tests {
         );
         core.down_all().await.unwrap();
         let calls = calls_ref.lock().unwrap();
-        assert_eq!(calls[0], "down", "compose down 先");
-        // native 逆序: platform 先停, core 后停
+        assert_eq!(calls[0], "down", "compose down first");
+        // native reverse order: platform stops first, core stops after
         let no = native_order.lock().unwrap();
         let rag_i = no.iter().position(|n| n == "fusion-rag").unwrap();
         let mlx_i = no.iter().position(|n| n == "fusion-mlx").unwrap();
-        assert!(rag_i < mlx_i, "native 逆序: platform 先停, core 后停");
+        assert!(
+            rag_i < mlx_i,
+            "native reverse order: platform stops first, core stops after"
+        );
     }
 
-    // status_all: compose 启用时合并 native + 容器行
+    // status_all: with compose enabled, native + container rows are merged
     #[test]
     fn test_status_all_merges_compose_rows() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3264,7 +3322,7 @@ mod tests {
         );
         core.runners[0].state = runner::State::Healthy;
         let st = core.status_all();
-        // 1 native + 2 compose
+        // 1 native + 2 compose rows
         assert_eq!(st.len(), 3);
         let native = st.iter().find(|e| e.plane == "native").unwrap();
         assert_eq!(native.name, "fusion-mlx");
@@ -3276,7 +3334,7 @@ mod tests {
         assert_eq!(qd.state, "Failed");
     }
 
-    // tick_all: compose 容器 exited → ServiceDown 告警
+    // tick_all: a compose container exited → ServiceDown alert
     #[tokio::test]
     async fn test_tick_all_compose_exited_alerts() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3294,13 +3352,16 @@ mod tests {
         );
         core.runners[0].state = runner::State::Healthy;
         core.drive(1000).await;
-        // 告警经由 tracing WARN + 可选 webhook; 此处验证不 panic + 状态表见 Failed
+        // Alerts go via tracing WARN + optional webhook; here verify no panic + the status table shows Failed
         let st = core.status_all();
         let redis = st.iter().find(|e| e.name == "redis").unwrap();
-        assert_eq!(redis.state, "Failed", "exited 容器应标 Failed");
+        assert_eq!(
+            redis.state, "Failed",
+            "an exited container should be marked Failed"
+        );
     }
 
-    // poll_interval: compose 容器 Failed → poll_unhealthy_sec
+    // poll_interval: a compose container Failed → poll_unhealthy_sec
     #[tokio::test]
     async fn test_poll_interval_compose_failed() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3314,14 +3375,14 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        // poll_interval 复用上轮 tick_compose 的 ps 快照 (不再现场重查)
+        // poll_interval reuses last round's tick_compose ps snapshot (no live re-query)
         core.tick_compose(1000).await;
         assert!(core.compose_any_failed);
-        // native 全 Healthy 但 compose 容器 Failed → poll_unhealthy_sec
+        // native all Healthy but a compose container Failed → poll_unhealthy_sec
         assert_eq!(core.poll_interval(), core.cfg.poll_unhealthy_sec);
     }
 
-    // compose_logs: compose 服务走 compose logs, native 服务返回 None
+    // compose_logs: compose services go through compose logs, native services return None
     #[test]
     fn test_compose_logs_dispatch() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3334,11 +3395,11 @@ mod tests {
             |_, _, _| Ok(()),
             Some(fake),
         );
-        // compose 服务 → Some
+        // compose service → Some
         assert!(core.compose_logs("postgres").is_some());
-        // native 服务 → None (走 native 日志路径)
+        // native service → None (goes through the native log path)
         assert!(core.compose_logs("fusion-mlx").is_none());
-        // compose 未启用 → None
+        // compose disabled → None
         let core2 = SupervisorCore::new_with_fns(
             vec![def("fusion-mlx", Layer::Core, 11434)],
             fake_cfg(),
@@ -3348,9 +3409,9 @@ mod tests {
         assert!(core2.compose_logs("postgres").is_none());
     }
 
-    // ---- dep-gate (issue #5) 集成测试 ----
+    // ---- dep-gate (issue #5) integration tests ----
 
-    // dep_gate: compose 启用且依赖容器 Healthy → native 服务正常起
+    // dep_gate: compose enabled and the dependency container Healthy → the native service starts normally
     #[tokio::test]
     async fn test_up_native_gates_on_sidecar_healthy() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -3361,7 +3422,7 @@ mod tests {
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
-            def("fusion-rag", Layer::Platform, 11436), // 依赖 qdrant
+            def("fusion-rag", Layer::Platform, 11436), // depends on qdrant
         ];
         let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let ns_p = native_started.clone();
@@ -3383,21 +3444,21 @@ mod tests {
         let started = native_started.lock().unwrap();
         assert!(
             started.contains(&"fusion-rag".to_string()),
-            "依赖 qdrant Healthy 时 rag 应启动"
+            "rag should start when qdrant is Healthy"
         );
     }
 
-    // dep_gate: 依赖容器未就绪 → 跳过该 native 服务启动 (标 Stopped, 不 Failed)
+    // dep_gate: dependency container not ready → skip starting that native service (mark Stopped, not Failed)
     #[tokio::test]
     async fn test_up_native_gate_skips_when_dep_unhealthy() {
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
-            def("fusion-rag", Layer::Platform, 11436), // 依赖 qdrant
+            def("fusion-rag", Layer::Platform, 11436), // depends on qdrant
         ];
         let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let ns_p = native_started.clone();
         let fake = Box::new(FakeCompose::new());
-        // qdrant exited (非 Healthy) → gate 未就绪
+        // qdrant exited (not Healthy) → gate not ready
         fake.set_containers(vec![mk_container("qdrant", "exited", "", 0)]);
         let mut core = SupervisorCore::new_with_fns_and_compose(
             defs,
@@ -3415,9 +3476,9 @@ mod tests {
         let started = native_started.lock().unwrap();
         assert!(
             !started.contains(&"fusion-rag".to_string()),
-            "qdrant 非 Healthy 时 rag 应被 gate 跳过, 不启动"
+            "rag should be gate-skipped when qdrant is not Healthy, not started"
         );
-        // rag runner 应标 Stopped (非 Failed, 依赖问题非崩溃)
+        // The rag runner should be marked Stopped (not Failed; a dependency problem is not a crash)
         let rag = core
             .runners
             .iter()
@@ -3425,17 +3486,17 @@ mod tests {
             .unwrap();
         assert!(
             matches!(rag.state, runner::State::Stopped),
-            "gate 跳过应标 Stopped, 实际: {:?}",
+            "gate skip should be marked Stopped, got: {:?}",
             rag.state
         );
-        // mlx 无依赖 → 照常起
+        // mlx has no deps → starts as usual
         assert!(
             started.contains(&"fusion-mlx".to_string()),
-            "无依赖服务不受 gate 影响"
+            "services without deps are unaffected by the gate"
         );
     }
 
-    // dep_gate: compose 未启用 → 无门, 所有 native 正常起
+    // dep_gate: compose disabled → no gate, all native services start normally
     #[tokio::test]
     async fn test_up_native_no_gate_when_compose_disabled() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -3446,7 +3507,7 @@ mod tests {
         let _ck = crate::env_map::tests::EnvGuard::set("FUSION_CLIENT_KEY", "ck-up-test");
         let defs = vec![
             def("fusion-mlx", Layer::Core, 11434),
-            def("fusion-rag", Layer::Platform, 11436), // 若有门会被拦 (无 qdrant 容器)
+            def("fusion-rag", Layer::Platform, 11436), // would be blocked if a gate existed (no qdrant container)
         ];
         let native_started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let ns_p = native_started.clone();
@@ -3466,14 +3527,14 @@ mod tests {
         let started = native_started.lock().unwrap();
         assert!(
             started.contains(&"fusion-rag".to_string()),
-            "compose 未启用时无 dep-gate, rag 应正常启动"
+            "with compose disabled there is no dep-gate, rag should start normally"
         );
     }
 
-    // ---- compose 容器告警节流 (issue #6) 集成测试 ----
-    // 4 场景经 tick_compose 驱动 compose_tracker, 验证快照/决策不 panic 且状态正确。
+    // ---- compose container alert throttling (issue #6) integration tests ----
+    // 4 scenarios driven through tick_compose → compose_tracker; verify snapshots/decisions do not panic and state is correct.
 
-    // 同容器 exited 连续 5 tick (去抖窗内) → fail_count 累计, 仅首 tick 记 last_alert
+    // The same container exited for 5 consecutive ticks (inside the dedup window) → fail_count accumulates, only the first tick sets last_alert
     #[tokio::test]
     async fn test_tick_compose_dedup_repeated_failed() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3487,16 +3548,19 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        // 5 tick, 去抖窗内 (默认 alert_dedup_sec=300, escalation=5)
+        // 5 ticks, inside the dedup window (default alert_dedup_sec=300, escalation=5)
         for ts in [1000u64, 1002, 1004, 1006, 1008] {
             core.drive(ts).await;
         }
         let rec = core.compose_tracker.record("redis").unwrap();
-        assert_eq!(rec.fail_count, 5, "连续 5 tick 失败应累计 5");
+        assert_eq!(
+            rec.fail_count, 5,
+            "5 consecutive failed ticks should accumulate to 5"
+        );
         assert_eq!(rec.state, "Failed");
     }
 
-    // docker state 变化 (restarting→exited) → tracker 记录 raw_state 变化
+    // docker state change (restarting→exited) → the tracker records the raw_state change
     #[tokio::test]
     async fn test_tick_compose_state_change_re_alerts() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3516,17 +3580,17 @@ mod tests {
             core.compose_tracker.record("redis").unwrap().raw_state,
             "restarting"
         );
-        // 切到 exited (经 Arc<Mutex> 内部可变, 无需借 core.compose)
+        // Switch to exited (via Arc<Mutex> interior mutability, no core.compose borrow needed)
         *containers.lock().unwrap() = vec![mk_container("redis", "exited", "", 6379)];
         core.drive(1002).await;
         assert_eq!(
             core.compose_tracker.record("redis").unwrap().raw_state,
             "exited",
-            "state 变化应更新快照"
+            "state change should update the snapshot"
         );
     }
 
-    // 失败→健康 → tracker 重置 fail_count, escalated 清零
+    // failure→healthy → the tracker resets fail_count and clears escalated
     #[tokio::test]
     async fn test_tick_compose_service_back() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3546,15 +3610,15 @@ mod tests {
             core.compose_tracker.record("redis").unwrap().state,
             "Failed"
         );
-        // 恢复 (经 Arc<Mutex> 内部可变)
+        // Recovery (via Arc<Mutex> interior mutability)
         *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
         core.drive(1010).await;
         let rec = core.compose_tracker.record("redis").unwrap();
-        assert_eq!(rec.state, "Healthy", "恢复应转 Healthy");
-        assert_eq!(rec.fail_count, 0, "恢复应重置 fail_count");
+        assert_eq!(rec.state, "Healthy", "recovery should flip to Healthy");
+        assert_eq!(rec.fail_count, 0, "recovery should reset fail_count");
     }
 
-    // 连续失败达阈值 → escalated=true (CrashLoop 升级)
+    // consecutive failures reach the threshold → escalated=true (CrashLoop escalation)
     #[tokio::test]
     async fn test_tick_compose_escalation() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3568,19 +3632,22 @@ mod tests {
             Some(fake),
         );
         core.runners[0].state = runner::State::Healthy;
-        // escalation=5 (fake_cfg 默认), 跑 5 tick
+        // escalation=5 (fake_cfg default), run 5 ticks
         for ts in [1000u64, 1002, 1004, 1006, 1008] {
             core.drive(ts).await;
         }
         let rec = core.compose_tracker.record("redis").unwrap();
-        assert!(rec.escalated, "达阈值应升级标记");
+        assert!(
+            rec.escalated,
+            "reaching the threshold should set the escalation flag"
+        );
         assert_eq!(rec.fail_count, 5);
     }
 
-    // ---- compose 容器持久化进 history.db (issue #7) ----
+    // ---- compose containers persisted into history.db (issue #7) ----
 
-    // issue #37: native 告警经 Alerter 事件 sink 落库 — kind/plane/severity 正确,
-    // 去抖窗内被抑制的告警不重复落库, alerts_emitted 计数只记真实发出。
+    // issue #37: native alerts persist via the Alerter event sink — kind/plane/severity correct,
+    // alerts suppressed inside the dedup window are not re-persisted, and alerts_emitted counts only real emissions.
     #[tokio::test]
     async fn test_native_alert_persists_event() {
         let mut core = SupervisorCore::new_with_fns(
@@ -3594,19 +3661,19 @@ mod tests {
         core.runners[0].state = runner::State::Healthy;
         core.drive(1000).await;
         let ev = core.store.recent_events("fusion-mlx", 10).unwrap();
-        assert_eq!(ev.len(), 1, "首次宕机 ServiceDown 应落库");
+        assert_eq!(ev.len(), 1, "the first ServiceDown should be persisted");
         assert_eq!(ev[0].kind, "ServiceDown");
         assert_eq!(ev[0].plane, "native");
         assert_eq!(ev[0].severity, "warn");
         assert_eq!(core.alerter.alerts_emitted(), 1);
-        // 去抖窗内第二次 ServiceDown: 不落库不计数 (tick 只排期重启, 不发新告警)
+        // Second ServiceDown inside the dedup window: not persisted, not counted (the tick only schedules a restart, no new alert)
         core.drive(1001).await;
         let ev2 = core.store.recent_events("fusion-mlx", 10).unwrap();
-        assert_eq!(ev2.len(), 1, "无新告警不应新增 event 行");
+        assert_eq!(ev2.len(), 1, "no new alert should not add an event row");
         assert_eq!(core.alerter.alerts_emitted(), 1);
     }
 
-    // issue #37: retention sweep 调度 — 到期裁剪过期行并计数, 未到期不执行。
+    // issue #37: retention sweep schedule — on due, prunes expired rows and counts; before due, does nothing.
     #[tokio::test]
     async fn test_check_retention_prunes_and_counts() {
         let mut core = SupervisorCore::new_with_fns(
@@ -3626,19 +3693,25 @@ mod tests {
         core.store
             .record_health("fusion-mlx", "healthy", 2, now, "native")
             .unwrap();
-        assert!(core.check_retention(now), "last_prune_ts=0 → 首次即到期");
-        assert_eq!(core.events_pruned_total, 2, "旧 health 行 + 旧 event 行");
+        assert!(
+            core.check_retention(now),
+            "last_prune_ts=0 → due on the first check"
+        );
+        assert_eq!(
+            core.events_pruned_total, 2,
+            "old health row + old event row"
+        );
         assert_eq!(
             core.store.recent_health("fusion-mlx", 10).unwrap().len(),
             1,
-            "近期行保留"
+            "recent rows are kept"
         );
-        // 调度间隔内未到期 → 不重复执行
+        // Inside the schedule interval, not due → does not run again
         assert!(!core.check_retention(now + 60));
         assert_eq!(core.events_pruned_total, 2);
     }
 
-    // 容器 exited → tick_compose 应写 event 行 plane=compose, kind=ServiceDown
+    // Container exited → tick_compose should write an event row with plane=compose, kind=ServiceDown
     #[tokio::test]
     async fn test_tick_compose_persists_down_event() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3654,16 +3727,19 @@ mod tests {
         core.runners[0].state = runner::State::Healthy;
         core.drive(1000).await;
         let ev = core.store.recent_events("redis", 10).unwrap();
-        assert!(!ev.is_empty(), "exited 容器应写 event 行");
+        assert!(
+            !ev.is_empty(),
+            "an exited container should write an event row"
+        );
         assert_eq!(ev[0].kind, "ServiceDown");
         assert_eq!(ev[0].plane, "compose");
-        // 健康行也应存在 plane=compose
+        // A health row should also exist with plane=compose
         let h = core.store.recent_health("redis", 10).unwrap();
-        assert!(!h.is_empty(), "应写 compose 健康行");
+        assert!(!h.is_empty(), "a compose health row should be written");
         assert_eq!(h[0].plane, "compose");
     }
 
-    // 容器 exited→running → tick_compose 应写 Back 事件 plane=compose
+    // Container exited→running → tick_compose should write a Back event with plane=compose
     #[tokio::test]
     async fn test_tick_compose_persists_back_event() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3679,20 +3755,23 @@ mod tests {
         );
         core.runners[0].state = runner::State::Healthy;
         core.drive(1000).await;
-        // 恢复
+        // Recovery
         *containers.lock().unwrap() = vec![mk_container("redis", "running", "healthy", 6379)];
         core.drive(1010).await;
         let ev = core.store.recent_events("redis", 10).unwrap();
         let has_back = ev
             .iter()
             .any(|e| e.kind == "ServiceBack" && e.plane == "compose");
-        assert!(has_back, "恢复应写 ServiceBack 事件 plane=compose");
+        assert!(
+            has_back,
+            "recovery should write a ServiceBack event with plane=compose"
+        );
     }
 
-    // issue #78: compose disabled (单节点开发) 也要注入 sidecar 连接 env —
-    // 此前 gate 在 compose.enabled 上, 默认 off 时 cowork 静默跑 SQLite。
-    // .env 有 FUSION_PG_PASSWORD → identity 收到 DATABASE_URL。
-    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    // issue #78: even with compose disabled (single-node dev), sidecar connection env must be injected —
+    // the gate previously sat on compose.enabled, so with the default off, cowork silently ran SQLite.
+    // .env has FUSION_PG_PASSWORD → identity receives DATABASE_URL.
+    // env_lock across await: the test body is short, only serializing process env reads/writes, not starving the executor.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_up_native_injects_env_when_compose_disabled() {
@@ -3706,7 +3785,7 @@ mod tests {
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
         let env_f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(env_f.path(), "FUSION_PG_PASSWORD=pw78\n").unwrap();
-        let mut cfg = fake_cfg(); // compose.enabled=false (默认)
+        let mut cfg = fake_cfg(); // compose.enabled=false (default)
         cfg.compose.env_file = env_f.path().to_path_buf();
         let defs = vec![def("fusion-identity", Layer::App, 11450)];
         let received_env: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3722,13 +3801,13 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(!core.compose_enabled(), "compose 应未启用");
+        assert!(!core.compose_enabled(), "compose should not be enabled");
         core.up_all().await.unwrap();
         let env = received_env.lock().unwrap();
         let db_url = env
             .iter()
             .find(|(k, _)| k == "DATABASE_URL")
-            .expect("compose off 也应注入 DATABASE_URL (issue #78)");
+            .expect("DATABASE_URL should be injected even with compose off (issue #78)");
         assert!(
             db_url.1.contains(":pw78@localhost:5432/"),
             "got {}",
@@ -3736,13 +3815,13 @@ mod tests {
         );
         assert!(
             matches!(core.runners[0].state, runner::State::Starting),
-            "注入成功服务应 Starting"
+            "a successfully injected service should be Starting"
         );
     }
 
-    // issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`) 注入 up 路径。
-    // HOME 重定向到临时目录, overlay 文件带 FUSION_LLM_TIMEOUT → start_fn 收到。
-    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    // issue #125: per-service env overlay (`~/.fusion-sv/env/<svc>.env`) injected on the up path.
+    // HOME is redirected to a temp dir; the overlay file carries FUSION_LLM_TIMEOUT → start_fn receives it.
+    // env_lock across await: the test body is short, only serializing process env reads/writes, not starving the executor.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_issue125_overlay_env_reaches_start_fn() {
@@ -3778,20 +3857,20 @@ mod tests {
         assert!(
             env.iter()
                 .any(|(k, v)| k == "FUSION_LLM_TIMEOUT" && v == "120"),
-            "overlay env 应到达 start_fn, 实际 {:?}",
+            "overlay env should reach start_fn, got {:?}",
             *env
         );
     }
 
-    // issue #8: compose enabled + 依赖 sidecar 的服务 + .env 缺 FUSION_PG_PASSWORD
-    // → fail-closed: 拒绝启动, 不调 start.sh, runner 标 Failed。
-    // env_lock 跨 await: 测试体短, 仅串行化进程 env 读写, 不致 executor 饥饿。
+    // issue #8: compose enabled + a service depending on sidecars + .env missing FUSION_PG_PASSWORD
+    // → fail-closed: refuse to start, do not call start.sh, mark the runner Failed.
+    // env_lock across await: the test body is short, only serializing process env reads/writes, not starving the executor.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_up_native_fail_closed_when_pg_password_missing() {
         let _g = env_lock();
         unsafe { std::env::remove_var("FUSION_PG_PASSWORD") };
-        // .env 只有 USER 无 PASSWORD → DATABASE_URL 构造不出
+        // .env has only USER, no PASSWORD → DATABASE_URL cannot be constructed
         let env_f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(env_f.path(), "FUSION_PG_USER=fusion\n").unwrap();
         let mut cfg = fake_cfg();
@@ -3801,8 +3880,9 @@ mod tests {
         let started: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let st_p = started.clone();
         let fake = Box::new(FakeCompose::new());
-        // dep-gate (#5): fusion-identity 依赖 postgres, 需 postgres Healthy 才过门,
-        // 过门后才走 env 注入 (fail-closed 路径)。无此容器 dep-gate 先跳过 → Stopped。
+        // dep-gate (#5): fusion-identity depends on postgres, which must be Healthy to pass the gate;
+        // env injection (the fail-closed path) happens only after passing. Without this container the
+        // dep-gate skips first → Stopped.
         fake.set_containers(vec![mk_container("postgres", "running", "healthy", 5432)]);
         let mut core = SupervisorCore::new_with_fns_and_compose(
             defs,
@@ -3816,18 +3896,21 @@ mod tests {
             },
             Some(fake),
         );
-        assert!(core.compose_enabled(), "compose 应启用");
+        assert!(core.compose_enabled(), "compose should be enabled");
         core.up_all().await.unwrap();
-        assert!(!*started.lock().unwrap(), "fail-closed 应拒绝调用 start.sh");
+        assert!(
+            !*started.lock().unwrap(),
+            "fail-closed should refuse to call start.sh"
+        );
         assert!(
             matches!(core.runners[0].state, runner::State::Failed),
-            "env 注入失败应标 Failed (非静默降级)"
+            "env injection failure should be marked Failed (no silent degradation)"
         );
     }
 
-    // ---- issue #90: 启动失败退避重试 ----
+    // ---- issue #90: start-failure backoff retry ----
 
-    // start 失败 (非 exit-78) 应排期重试而非标终态 Failed, 且不占 crash-window 名额
+    // A start failure (non exit-78) should schedule a retry instead of the terminal Failed state, without consuming a crash-window slot
     #[tokio::test]
     async fn test_issue90_start_fail_schedules_retry() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3843,14 +3926,18 @@ mod tests {
         let r = &core.runners[0];
         assert!(
             matches!(r.state, runner::State::Unhealthy),
-            "启动失败应 Unhealthy 等重试, 非终态 Failed"
+            "a start failure should be Unhealthy awaiting retry, not terminal Failed"
         );
-        assert!(r.restart_after.is_some(), "应排期重试");
-        assert!(r.last_start_ts.is_none(), "从未成功启动");
-        assert_eq!(r.policy.crash_count(), 0, "不占 crash-window 名额");
+        assert!(r.restart_after.is_some(), "a retry should be scheduled");
+        assert!(r.last_start_ts.is_none(), "never successfully started");
+        assert_eq!(
+            r.policy.crash_count(),
+            0,
+            "does not consume a crash-window slot"
+        );
     }
 
-    // exit-78 配置致命: 重试无救, 直接 Failed
+    // exit-78 config-fatal: retry cannot help, straight to Failed
     #[tokio::test]
     async fn test_issue90_start_fail_exit78_terminal() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3866,14 +3953,18 @@ mod tests {
         let r = &core.runners[0];
         assert!(
             matches!(r.state, runner::State::Failed),
-            "exit 78 应终态 Failed"
+            "exit 78 should be terminal Failed"
         );
-        assert!(r.restart_after.is_none(), "配置致命不排期重试");
+        assert!(
+            r.restart_after.is_none(),
+            "config-fatal does not schedule retries"
+        );
     }
 
-    // 重试封顶: start_fail_streak 达 START_FAIL_CAP → Failed + RestartCapHit 告警
-    // repo_dir 用 scaffold (同 #86 测试约定) — 真实 "fusion-mlx" 会撞本机在跑的
-    // start.sh 进程 (pgrep 阶段1 命中), 操作员竞态闸门误跳过重启致测试环境 flake
+    // Retry cap: start_fail_streak reaching START_FAIL_CAP → Failed + RestartCapHit alert
+    // repo_dir uses a scaffold (same #86 test convention) — a real "fusion-mlx" would collide with a
+    // start.sh process running on this machine (pgrep stage-1 hit), the operator-race gate would wrongly
+    // skip the restart and the test would flake with the environment
     #[tokio::test]
     async fn test_issue90_start_fail_cap_marks_failed() {
         let mut d = def("fusion-mlx", Layer::Core, 11434);
@@ -3897,17 +3988,20 @@ mod tests {
         }
         core.drive(1001).await;
         let r = &core.runners[0];
-        assert!(matches!(r.state, runner::State::Failed), "达 cap 应 Failed");
+        assert!(
+            matches!(r.state, runner::State::Failed),
+            "reaching the cap should be Failed"
+        );
         assert_eq!(r.start_fail_streak, runner::START_FAIL_CAP);
         let ev = core.store.recent_events("fusion-mlx", 10).unwrap();
         assert!(
             ev.iter()
                 .any(|e| e.kind == "RestartCapHit" && e.detail.contains("start-fail cap")),
-            "应记 start-fail cap 事件"
+            "a start-fail cap event should be recorded"
         );
     }
 
-    // 手动 down 应清掉待执行重试排期与计数
+    // A manual down should clear the pending retry schedule and counters
     #[tokio::test]
     async fn test_issue90_down_clears_retry_schedule() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3924,13 +4018,13 @@ mod tests {
         core.down_one("fusion-mlx").await.unwrap();
         let r = &core.runners[0];
         assert!(matches!(r.state, runner::State::Stopped));
-        assert!(r.restart_after.is_none(), "down 应清排期");
-        assert_eq!(r.start_fail_streak, 0, "down 应清计数");
+        assert!(r.restart_after.is_none(), "down should clear the schedule");
+        assert_eq!(r.start_fail_streak, 0, "down should clear the counter");
     }
 
     // ---- issue #9: drain / drain_all / rollout ----
 
-    // drain 单服务: Healthy → Draining
+    // drain a single service: Healthy → Draining
     #[tokio::test]
     async fn test_drain_single_service() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3943,10 +4037,10 @@ mod tests {
         core.runners[0].state = runner::State::Healthy;
         core.drain("fusion-mlx", 1000).unwrap();
         assert!(matches!(core.runners[0].state, runner::State::Draining));
-        assert_eq!(core.runners[0].drain_grace_until, Some(1030)); // grace=30 默认
+        assert_eq!(core.runners[0].drain_grace_until, Some(1030)); // grace=30 default
     }
 
-    // drain 未知服务 → Err
+    // drain an unknown service → Err
     #[tokio::test]
     async fn test_drain_unknown_service_err() {
         let defs = vec![def("fusion-mlx", Layer::Core, 11434)];
@@ -3959,7 +4053,7 @@ mod tests {
         assert!(core.drain("nope", 1000).is_err());
     }
 
-    // drain_all: 全部 Healthy → 全 Draining
+    // drain_all: all Healthy → all Draining
     #[tokio::test]
     async fn test_drain_all_services() {
         let defs = vec![
@@ -4001,9 +4095,9 @@ mod tests {
         assert!(core.runners[0].drain_grace_until.is_none());
     }
 
-    // rollout 全周期: drain→stop→start→prewarm(Healthy)→Healthy
-    // issue #96: 探活序列 = Healthy(停前) → Unhealthy(stop 验证通过) →
-    // Healthy(prewarm); start_fn 收到 stop+start 两个动词
+    // rollout full cycle: drain→stop→start→prewarm(Healthy)→Healthy
+    // issue #96: probe sequence = Healthy(before stop) → Unhealthy(stop verified) →
+    // Healthy(prewarm); start_fn receives both stop and start verbs
     #[tokio::test]
     async fn test_rollout_full_cycle() {
         let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
@@ -4039,19 +4133,19 @@ mod tests {
         core.rollout("fusion-mlx", 1000, 5, 10).await.unwrap();
         assert!(
             matches!(core.runners[0].state, runner::State::Healthy),
-            "rollout 成功后应 Healthy"
+            "should be Healthy after a successful rollout"
         );
         assert!(core.runners[0].drain_grace_until.is_none());
-        // issue #96: rollout 必须先 stop 旧进程再 start
+        // issue #96: rollout must stop the old process before starting
         let got = calls.lock().unwrap().clone();
         assert_eq!(
             got,
             vec!["fusion-mlx/stop", "fusion-mlx/restart"],
-            "rollout 应真正 stop + invoke_start"
+            "rollout should really stop + invoke_start"
         );
     }
 
-    // rollout prewarm 失败: 探活恒不健康 → 超时 → Err + 留 Stopped + 告警
+    // rollout prewarm failure: probes always unhealthy → timeout → Err + stays Stopped + alert
     #[tokio::test]
     async fn test_rollout_prewarm_fail_alerts() {
         let mut core = SupervisorCore::new_with_fns(
@@ -4063,18 +4157,18 @@ mod tests {
             |_, _, _| Ok(()),
         );
         core.runners[0].state = runner::State::Healthy;
-        // prewarm_timeout=3 → 很快超时
+        // prewarm_timeout=3 → times out quickly
         let res = core.rollout("fusion-mlx", 1000, 5, 3).await;
-        assert!(res.is_err(), "prewarm 超时应返回 Err");
+        assert!(res.is_err(), "prewarm timeout should return Err");
         assert!(
             matches!(core.runners[0].state, runner::State::Stopped),
-            "prewarm 失败应留 Stopped (不回滚)"
+            "prewarm failure should stay Stopped (no rollback)"
         );
     }
 
-    // ===== issue #96: restart/rollout 必须真正替换进程 =====
+    // ===== issue #96: restart/rollout must really replace the process =====
 
-    // restart_one: stop → 端口释放 (探活转不健康) → start, 动词顺序 stop+start
+    // restart_one: stop → port released (probe flips unhealthy) → start, verb order stop+start
     #[tokio::test]
     async fn test_issue96_restart_stops_then_starts() {
         let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
@@ -4106,19 +4200,19 @@ mod tests {
         );
         core.runners[0].state = runner::State::Healthy;
         let (old_pid, new_pid) = core.restart_one("fusion-mlx").await.unwrap();
-        assert_eq!(old_pid, None, "测试环境无 pidfile");
+        assert_eq!(old_pid, None, "no pidfile in the test environment");
         assert_eq!(new_pid, None);
         let got = calls.lock().unwrap().clone();
         assert_eq!(
             got,
             vec!["fusion-mlx/stop", "fusion-mlx/restart"],
-            "restart 应真正 stop + invoke_start"
+            "restart should really stop + invoke_start"
         );
         assert!(matches!(core.runners[0].state, runner::State::Starting));
     }
 
-    // issue #121: 人工 restart 必须清掉崩溃路径排定的 restart_after (单飞不变量) —
-    // 否则到期 tick 再 spawn 一次, 双实例抢端口败者秒死 (cowork-web 40281→42476 实证)。
+    // issue #121: a manual restart must clear the crash-path-scheduled restart_after (single-flight invariant) —
+    // otherwise the due tick spawns another instance and the port-race loser dies instantly (observed cowork-web 40281→42476).
     #[tokio::test]
     async fn test_issue121_restart_clears_scheduled_crash_restart() {
         let probe_q: Arc<Mutex<std::collections::VecDeque<ProbeResult>>> = Arc::new(Mutex::new(
@@ -4150,12 +4244,12 @@ mod tests {
         core.restart_one("fusion-mlx").await.unwrap();
         assert!(
             core.runners[0].restart_after.is_none(),
-            "restart 必须清掉排定的崩溃重启 (单飞)"
+            "restart must clear the scheduled crash restart (single-flight)"
         );
     }
 
-    // restart_one: stop 无效 (端口恒 Healthy) → 窗口内重发 stop ×2 (issue #134)
-    // 仍占用 → bail, 绝不 start、绝不返回 ok
+    // restart_one: stop ineffective (port stays Healthy) → re-issue stop ×2 inside the window (issue #134);
+    // still held → bail, never start, never return ok
     #[tokio::test(start_paused = true)]
     async fn test_issue96_restart_bails_when_stop_ineffective() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4171,21 +4265,21 @@ mod tests {
         );
         core.runners[0].state = runner::State::Healthy;
         let res = core.restart_one("fusion-mlx").await;
-        assert!(res.is_err(), "stop 无效应 bail");
+        assert!(res.is_err(), "an ineffective stop should bail");
         let got = calls.lock().unwrap().clone();
         assert_eq!(
             got,
             vec!["fusion-mlx/stop", "fusion-mlx/stop", "fusion-mlx/stop"],
-            "旧进程未死: 首轮 stop + 窗口内重发 ×2, 不得 start (防双启/防假替换)"
+            "old process not dead: first stop + 2 re-issues inside the window, no start (prevents double-start / fake replacement)"
         );
         assert!(matches!(core.runners[0].state, runner::State::Stopped));
     }
 
-    // issue #134: 脚本型 stop 慢于首轮验证 — 窗口内重发 stop 后端口释放,
-    // restart 正常完成 (容忍窗口语义)
+    // issue #134: a script-type stop is slower than the first verification — after the re-issued stop releases the port,
+    // the restart completes normally (tolerant-window semantics)
     #[tokio::test(start_paused = true)]
     async fn test_issue134_stop_reissue_recovers() {
-        // i=0..8 探活 Healthy (9 次), i=8 重发 stop, i=9 起端口释放
+        // i=0..8 probes Healthy (9 times), stop re-issued at i=8, port released from i=9
         let probe_n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pn = probe_n.clone();
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4214,17 +4308,17 @@ mod tests {
         assert_eq!(
             got,
             vec!["fusion-mlx/stop", "fusion-mlx/stop", "fusion-mlx/restart"],
-            "重发 stop 后端口释放 → 正常拉起新进程"
+            "after the re-issued stop releases the port → the new process starts normally"
         );
     }
 
-    // issue #134: 端口 0 (未注册/探活无口) 不查 lsof, 占口 PID 查询返回 None
+    // issue #134: port 0 (unregistered / probe has no port) skips the lsof query; the port-holder PID query returns None
     #[test]
     fn test_issue134_port_holder_pid_zero_port() {
         assert_eq!(port_holder_pid(0), None);
     }
 
-    // restart_one: 未知服务 bail
+    // restart_one: unknown service bails
     #[tokio::test]
     async fn test_issue96_restart_unknown_service() {
         let mut core = SupervisorCore::new_with_fns(
@@ -4237,9 +4331,9 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ===== PRD app-tiering (issue #62) boot API 单测 =====
+    // ===== PRD app-tiering (issue #62) boot API unit tests =====
 
-    // up_boot_set 只拉 T0 + pin=auto — T1/T2 无 pin 不参与
+    // up_boot_set starts only T0 + pin=auto — T1/T2 without a pin do not participate
     #[tokio::test]
     async fn test_up_boot_set_only_t0_and_pin_auto() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -4267,12 +4361,12 @@ mod tests {
                 Ok(())
             },
         );
-        // pin fusion-rag 成 auto — 应进入 boot 集
+        // pin fusion-rag to auto — should join the boot set
         core.set_boot_pin("fusion-rag", Some(PinMode::Auto))
             .unwrap();
         core.up_boot_set().await.unwrap();
         let got: Vec<String> = calls.lock().unwrap().clone();
-        // 顺序: 层序 (fixed/layer) — mlx, gateway (Core), rag (Platform)
+        // Order: layer order (fixed/layer) — mlx, gateway (Core), rag (Platform)
         assert_eq!(
             got,
             vec![
@@ -4281,11 +4375,11 @@ mod tests {
                 "fusion-rag/start"
             ]
         );
-        // health (T2, 无 pin) 不参与
+        // health (T2, no pin) does not participate
         assert!(!got.iter().any(|s| s.starts_with("fusion-health")));
     }
 
-    // boot_group T1 up: 部分失败汇总正确
+    // boot_group T1 up: partial-failure summary is correct
     #[tokio::test]
     async fn test_boot_group_t1_up_partial_summary() {
         // Pin FUSION_CLIENT_KEY: issue #85 inverts client-key injection onto every
@@ -4315,14 +4409,20 @@ mod tests {
             },
         );
         let res = core.boot_group("T1", "up").await.unwrap();
-        assert_eq!(res["started"], 1, "rag 起了");
-        assert_eq!(res["failed"], 0, "issue #90: 启动失败不再直接 Failed");
-        assert_eq!(res["retrying"], 1, "cowork start 失败应排期重试");
+        assert_eq!(res["started"], 1, "rag started");
+        assert_eq!(
+            res["failed"], 0,
+            "issue #90: start failures no longer go straight to Failed"
+        );
+        assert_eq!(
+            res["retrying"], 1,
+            "cowork start failure should schedule a retry"
+        );
         assert_eq!(res["group"], "T1");
         assert_eq!(res["action"], "up");
     }
 
-    // pin 覆盖注册表: T0 unpin 成 manual 后不进 boot 集
+    // pin overrides the registry: a T0 unpinned to manual no longer joins the boot set
     #[tokio::test]
     async fn test_boot_pin_overrides_registry() {
         let defs = vec![def_tier("fusion-mlx", Layer::Core, 11434, BootTier::T0)];
@@ -4339,14 +4439,14 @@ mod tests {
                 Ok(())
             },
         );
-        // T0 unpin 成 manual — 不再进 boot 集
+        // T0 unpinned to manual — no longer joins the boot set
         core.set_boot_pin("fusion-mlx", Some(PinMode::Manual))
             .unwrap();
         assert!(!core.boot_auto(&core.runners[0].def));
         assert_eq!(calls.lock().unwrap().len(), 0);
     }
 
-    // boot_status: tier 分组序 + pinned 字段
+    // boot_status: tier group order + pinned field
     #[tokio::test]
     async fn test_boot_status_entries() {
         let defs = vec![
@@ -4371,11 +4471,11 @@ mod tests {
         assert_eq!(rows[1].tier, "T1");
         assert_eq!(rows[2].name, "fusion-health");
         assert_eq!(rows[2].pinned.as_deref(), Some("auto"));
-        // 状态字符串非空
+        // The state string is non-empty
         assert!(!rows[0].state.is_empty());
     }
 
-    // T2 分组 (APP · 按需面板): down 批量停 T2 服务, 不碰 T0
+    // T2 group (APP · on-demand panel): down batch-stops T2 services, never touches T0
     #[tokio::test]
     async fn test_boot_group_t2_down_skips_core() {
         let defs = vec![
@@ -4400,13 +4500,13 @@ mod tests {
         assert!(calls.contains(&"fusion-finance/stop".to_string()));
         assert!(
             !calls.iter().any(|c| c.starts_with("fusion-mlx/")),
-            "T0 不动"
+            "T0 untouched"
         );
         assert_eq!(res["group"], "T2");
         assert_eq!(res["action"], "down");
     }
 
-    // issue #106: app 联合组 (T1∪T2) — down 停两层, 不碰 T0
+    // issue #106: app joint group (T1∪T2) — down stops both tiers, never touches T0
     #[tokio::test]
     async fn test_boot_group_app_down_covers_t1_and_t2() {
         let defs = vec![
@@ -4427,18 +4527,24 @@ mod tests {
         );
         let res = core.boot_group("app", "down").await.unwrap();
         let calls = calls.lock().unwrap().clone();
-        assert!(calls.contains(&"fusion-cowork/stop".to_string()), "T1 停");
-        assert!(calls.contains(&"fusion-health/stop".to_string()), "T2 停");
+        assert!(
+            calls.contains(&"fusion-cowork/stop".to_string()),
+            "T1 stopped"
+        );
+        assert!(
+            calls.contains(&"fusion-health/stop".to_string()),
+            "T2 stopped"
+        );
         assert!(
             !calls.iter().any(|c| c.starts_with("fusion-mlx/")),
-            "T0 不动"
+            "T0 untouched"
         );
         assert_eq!(res["group"], "app");
         assert_eq!(res["action"], "down");
     }
 
-    // issue #107 D2: 冷启动对账 — 探活通过的幸存进程采纳为 Healthy (复位计数),
-    // 探活失败的维持 Stopped; 幂等, 第二轮无新增
+    // issue #107 D2: cold-start reconciliation — surviving processes that pass probing are adopted as Healthy (counters reset),
+    // those failing probing stay Stopped; idempotent, a second round adds nothing
     #[tokio::test]
     async fn test_reconcile_on_boot_adopts_live_services() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4452,7 +4558,7 @@ mod tests {
             defs,
             fake_cfg(),
             move |_spec: &crate::probe::ProbeSpec| {
-                // 第 1 个 runner (cowork-web) 探活通过, 第 2 个 (health) 拒连
+                // The 1st runner (cowork-web) passes probing, the 2nd (health) refuses connection
                 if n_p.fetch_add(1, Ordering::SeqCst) == 0 {
                     ProbeResult::Healthy { latency_ms: 1 }
                 } else {
@@ -4464,19 +4570,19 @@ mod tests {
             |_svc, _cmd, _env| Ok(()),
         );
         let adopted = core.reconcile_on_boot().await;
-        assert_eq!(adopted, 1, "仅探活通过的服务被采纳");
+        assert_eq!(adopted, 1, "only services passing probing are adopted");
         assert!(matches!(core.runners[0].state, runner::State::Healthy));
         assert!(matches!(core.runners[1].state, runner::State::Stopped));
-        // 幂等: 已 Healthy 的服务第二轮不计入
+        // Idempotent: already-Healthy services are not counted in the second round
         let adopted2 = core.reconcile_on_boot().await;
         assert_eq!(adopted2, 0);
     }
 
-    // issue #110 验收: 管理的子进程被外部击杀后 daemon 重启 — 对账必须
-    // adopt-or-retire 而不双启。探活拒连 (进程已死) → 保持 Stopped、不复位
-    // 不排期重启 (tick 对 Stopped 不重启), 不会出现旧实例 + 新实例并存。
-    // issue #149: exec 在飞期间操作员 down — 在飞重启结果必须丢弃,
-    // 不得把 Stopped 翻回 Healthy/Starting (down 被静默撤销)。
+    // issue #110 acceptance: a managed child killed externally, then the daemon restarts — reconciliation must
+    // adopt-or-retire without double-starting. Probe refuses connection (process dead) → stays Stopped, no reset,
+    // no restart scheduled (tick does not restart Stopped), so an old + new instance can never coexist.
+    // issue #149: the operator downs a service while exec is in flight — the in-flight restart result must be
+    // discarded, never flipping Stopped back to Healthy/Starting (silently undoing the down).
     #[tokio::test]
     async fn test_issue149_down_during_inflight_exec_discards_result() {
         let defs = vec![def("fusion-site", Layer::App, 11481)];
@@ -4488,16 +4594,16 @@ mod tests {
             },
             |_svc, _cmd, _env| Ok(()),
         );
-        // 风暴期到点重启作业已收走 (exec 锁外在飞)
+        // A due restart job was collected during the storm (exec in flight outside the lock)
         core.runners[0].state = runner::State::Restarting;
         core.runners[0].pending_exec = Some(true);
         core.runners[0].exec_in_flight = true;
         let execs = core.collect_pending_execs();
         assert_eq!(execs.len(), 1);
-        // 操作员在 exec 在飞窗口 down (ManualStop)
+        // The operator downs it during the in-flight exec window (ManualStop)
         core.runners[0].mark_stopped();
         assert!(matches!(core.runners[0].state, runner::State::Stopped));
-        // exec 完成, 结果落账 — 必须被丢弃, 状态保持 Stopped
+        // exec completes and its result is settled — it must be discarded, the state stays Stopped
         let results = vec![("fusion-site".to_string(), runner::ExecOutcome::Ran(Ok(())))];
         core.finish_pending_execs(2000, results).await;
         assert!(matches!(core.runners[0].state, runner::State::Stopped));
@@ -4514,7 +4620,7 @@ mod tests {
             defs,
             fake_cfg(),
             |spec: &crate::probe::ProbeSpec| {
-                // 两个目标都已死 (外部 kill): 全部拒连
+                // Both targets already dead (external kill): all refuse connection
                 let _ = spec;
                 ProbeResult::Unhealthy {
                     reason: crate::probe::UnhealthyReason::ConnectionRefused,
@@ -4523,20 +4629,23 @@ mod tests {
             |_svc, _cmd, _env| Ok(()),
         );
         let adopted = core.reconcile_on_boot().await;
-        assert_eq!(adopted, 0, "死服务不得被采纳");
+        assert_eq!(adopted, 0, "a dead service must not be adopted");
         for r in &core.runners {
             assert!(matches!(r.state, runner::State::Stopped));
-            assert!(r.restart_after.is_none(), "不得排期重启 (会双启)");
+            assert!(
+                r.restart_after.is_none(),
+                "no restart must be scheduled (would double-start)"
+            );
             assert!(!r.start_retry);
             assert_eq!(r.fail_streak, 0);
         }
-        // 复核: reconcile 不触发任何 start 调用 (start_fn 未被记录到崩溃窗口)
+        // Double-check: reconcile triggers no start calls (start_fn never recorded into the crash window)
         for r in &core.runners {
-            assert_eq!(r.policy.crash_count(), 0, "对账不算 crash");
+            assert_eq!(r.policy.crash_count(), 0, "reconciliation is not a crash");
         }
     }
 
-    // 非法 group/action 直接 bail, 不动任何服务
+    // Invalid group/action bails immediately, touching no services
     #[tokio::test]
     async fn test_boot_group_invalid_args() {
         let defs = vec![def_tier("fusion-rag", Layer::Platform, 11436, BootTier::T1)];
@@ -4551,7 +4660,7 @@ mod tests {
         assert!(core.set_boot_pin("nope", Some(PinMode::Auto)).is_err());
     }
 
-    // load_boot_pins: 从 store 重载 pin (重启不丢语义, 存取持久化由 store.rs 测)
+    // load_boot_pins: reload pins from the store (semantics survive restart; persistence itself is tested in store.rs)
     #[test]
     fn test_load_boot_pins_reads_store() {
         use crate::store::HistoryStore;

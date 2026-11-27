@@ -1,25 +1,25 @@
-// issue #29: shell-ecosystem 模块服务的启动方式覆盖表。
-// 默认启动路径是 bash <repo>/start.sh <cmd>; 下列服务的启动命令不同:
-//   - fusion-trainer-bridge: 自带 scripts/trainer-bridge.sh (start|stop, nohup+pidfile)
-//   - fusion-cowork-web: `fusion-cowork web serve --port 11461` (前台 uvicorn, 需 daemonize)
-//   - fusion-plugins-ecosystem-console: `fusion-plugin-console --port 8795` (同上)
-// 上游 repo 的 start.sh 归属各自项目, supervisor 只封装不改写 (治理边界)。
+// issue #29: start-method override table for shell-ecosystem module services.
+// The default start path is bash <repo>/start.sh <cmd>; the services below start differently:
+//   - fusion-trainer-bridge: ships its own scripts/trainer-bridge.sh (start|stop, nohup+pidfile)
+//   - fusion-cowork-web: `fusion-cowork web serve --port 11461` (foreground uvicorn, needs daemonizing)
+//   - fusion-plugins-ecosystem-console: `fusion-plugin-console --port 8795` (same as above)
+// Upstream repos' start.sh belongs to each project; supervisor only wraps it, never rewrites (governance boundary).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-// 启动方式
+// Start method
 #[derive(Debug, Clone, PartialEq)]
 pub enum StartSpec {
-    // bash <script> <cmd> — 自带生命周期的脚本 (start/stop 子命令)
+    // bash <script> <cmd> — a script with its own lifecycle (start/stop subcommands)
     Script(PathBuf),
-    // nohup <bin> <args> >> log 2>&1 & echo $! > pidfile — 前台进程 daemonize
-    // (stop 用 pidfile kill; restart 由 restart_cmd_for 退化为 stop+start)
-    // issue #45: cwd 相对 FUSION_ROOT (None=继承 daemon cwd);
-    // env 为 app 内部固定 env (如 config 路径), 非 secret — secret 走 env_map 注入。
-    // issue #49: env_file 相对 FUSION_ROOT 的 dotenv 文件, start 前 set -a source
-    // 注入 (服务自身 .env 是唯一真源, 覆盖 daemon 进程 env 快照里的旧值);
-    // 文件缺失 fail-closed 拒启 (bash exit 1)。
+    // nohup <bin> <args> >> log 2>&1 & echo $! > pidfile — daemonize a foreground process
+    // (stop kills via pidfile; restart degrades to stop+start via restart_cmd_for)
+    // issue #45: cwd is relative to FUSION_ROOT (None=inherit daemon cwd);
+    // env holds app-internal fixed env (e.g. config paths), not secrets — secrets go through env_map injection.
+    // issue #49: env_file is a dotenv file relative to FUSION_ROOT, sourced with set -a before start
+    // (the service's own .env is the single source of truth, overriding stale values in the daemon process env snapshot);
+    // a missing file fails closed and refuses to start (bash exit 1).
     Daemon {
         bin: String,
         args: Vec<String>,
@@ -27,19 +27,19 @@ pub enum StartSpec {
         env: Vec<(String, String)>,
         env_file: Option<String>,
     },
-    // issue #145: systemd 托管服务 (config systemd_units 表声明, VPS 部署) —
-    // 生命周期经 systemctl start/stop 驱动, unit 本身就是进程权威 (start.sh
-    // 的 pidfile 对 systemd 拉起的进程失效)。restart = stop+start 流不变。
+    // issue #145: systemd-managed service (declared in the config systemd_units table, VPS deployment) —
+    // lifecycle driven via systemctl start/stop; the unit itself is the process authority (start.sh
+    // pidfiles do not work for systemd-spawned processes). restart = stop+start flow unchanged.
     Systemd {
         unit: String,
     },
 }
 
-// issue #145: config 注入的 systemd 托管表 (OnceLock, PORT_MAP 同款模式 —
-// daemon 启动时灌入一次, 运行期只读)。
+// issue #145: systemd-managed table injected from config (OnceLock, same pattern as PORT_MAP —
+// filled once at daemon start, read-only at runtime).
 static SYSTEMD_UNITS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
 
-// daemon 启动时注册 (Config::load 校验已保证 unit 名字符白名单)。
+// Registered at daemon start (Config::load validation already guarantees the unit-name character whitelist).
 pub fn register_systemd_units(map: HashMap<String, String>) {
     let _ = SYSTEMD_UNITS.set(map);
 }
@@ -48,16 +48,18 @@ fn systemd_unit_for(name: &str) -> Option<String> {
     SYSTEMD_UNITS.get()?.get(name).cloned()
 }
 
-// issue #145: systemctl 命令构造 (纯函数可测)。仅 start/stop — restart 由
-// restart_one 的 stop+start 流承载, 与 Daemon spec 同语义。
+// issue #145: systemctl command construction (pure function, testable). start/stop only — restart is
+// carried by restart_one's stop+start flow, same semantics as the Daemon spec.
 pub fn systemd_shell_cmd(unit: &str, verb: &str) -> anyhow::Result<String> {
     match verb {
         "start" | "stop" => Ok(format!("systemctl {verb} {unit}")),
-        other => anyhow::bail!("systemd spec 不支持 {other} (restart 应为 stop+start): {unit}"),
+        other => anyhow::bail!(
+            "systemd spec does not support {other} (restart should be stop+start): {unit}"
+        ),
     }
 }
 
-// 无 cwd/env 的便捷构造 (既有覆盖服务全用此形态)
+// Convenience constructor without cwd/env (all existing override services use this form)
 fn daemon(bin: &str, args: &[&str]) -> StartSpec {
     StartSpec::Daemon {
         bin: bin.into(),
@@ -68,16 +70,16 @@ fn daemon(bin: &str, args: &[&str]) -> StartSpec {
     }
 }
 
-// repo 相对路径下的脚本/二进制解析根: FUSION_ROOT 优先, 否则当前目录。
+// Script/binary resolution root for repo-relative paths: FUSION_ROOT first, else the current directory.
 fn fusion_root() -> PathBuf {
     std::env::var("FUSION_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-// 服务名 → 启动方式。不在表内 → None (走默认 start.sh 路径)。
+// Service name → start method. Not in the table → None (default start.sh path).
 pub fn start_spec_for(name: &str) -> Option<StartSpec> {
-    // issue #145: config 声明的 systemd 托管优先 (VPS 部署 systemd 是权威)
+    // issue #145: config-declared systemd management wins first (on VPS deployments systemd is authoritative)
     if let Some(unit) = systemd_unit_for(name) {
         return Some(StartSpec::Systemd { unit });
     }
@@ -85,17 +87,18 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         "fusion-trainer-bridge" => Some(StartSpec::Script(
             fusion_root().join("fusion-trainer/scripts/trainer-bridge.sh"),
         )),
-        // issue #81: fusion-office 根 start.sh 只管 11485 shell (shell-serve.mjs),
-        // api (registry :11492) 的生命周期脚本在嵌套 services/office-api/ 下
-        // (start|stop|restart|status|log, 自带 pidfile + /healthz 健康等待)。
-        // 走 Script 编排脚本原样, 不改上游 (只能修改本工程, 上游问题提 issue)。
+        // issue #81: the fusion-office root start.sh only manages the 11485 shell (shell-serve.mjs);
+        // the api (registry :11492) lifecycle script lives under the nested services/office-api/
+        // (start|stop|restart|status|log, with its own pidfile + /healthz health wait).
+        // Orchestrate the script as-is via Script, no upstream edits (only this project may be modified; upstream problems get issues).
         "fusion-office-api" => Some(StartSpec::Script(
             fusion_root().join("fusion-office/services/office-api/start.sh"),
         )),
-        // issue #100: cowork-web 需读根 .env 的 FUSION_COWORK_WEBHOOK_SECRET
-        // (decision webhook 签名验证, unset 时每笔回调 503)。daemon env 快照
-        // 拿不到它 (改 plist 要全量 daemon reload) — env_file 在 start 前 set -a
-        // source 注入, restart 单服务即生效。缺 key 不 fail (端点自带 503 自描述)。
+        // issue #100: cowork-web needs FUSION_COWORK_WEBHOOK_SECRET from the root .env
+        // (decision webhook signature verification; when unset every callback 503s). The daemon env
+        // snapshot cannot get it (changing the plist requires a full daemon reload) — env_file is
+        // sourced with set -a before start; a single-service restart takes effect. A missing key does
+        // not fail (the endpoint 503s with a self-describing message).
         "fusion-cowork-web" => Some(StartSpec::Daemon {
             bin: "fusion-cowork".into(),
             args: vec![
@@ -111,46 +114,46 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
         "fusion-plugins-ecosystem-console" => {
             Some(daemon("fusion-plugin-console", &["--port", "8795"]))
         }
-        // issue #31: MCP server 主入口 (registry :8765), 前台 sse 进程 daemonize
+        // issue #31: MCP server main entry (registry :8765), foreground sse process daemonized
         "fusion-plugins-ecosystem" => Some(daemon(
             "fusion-plugin-server",
             &["--transport", "sse", "--port", "8765"],
         )),
-        // issue #33: fusion-store 仓库根无 start.sh; deploy/start.sh 有上游 bug
-        // (BINARY 指向不存在的 target/release/fusion-store, 实际产物是 fs-serve,
-        //  上游 issue dahai80/fusion-store#5) — 直接 daemonize fs-serve 二进制
-        // (自带默认口/环回监听, 探活见 probe_map)
+        // issue #33: fusion-store repo root has no start.sh; deploy/start.sh has an upstream bug
+        // (BINARY points to a nonexistent target/release/fusion-store; the actual artifact is fs-serve,
+        //  upstream issue dahai80/fusion-store#5) — daemonize the fs-serve binary directly
+        // (has default port/loopback listen, see probe_map for the probe)
         "fusion-store" => Some(daemon("fusion-store/target/release/fs-serve", &[])),
-        // issue #33: fusion-smallbusiness 无 start.sh, CLI 入口直接跑 uvicorn
-        // (口由 FSB env 决定, 探活见 probe_map)
+        // issue #33: fusion-smallbusiness has no start.sh; the CLI entry runs uvicorn directly
+        // (port decided by FSB env, see probe_map for the probe)
         "fusion-smallbusiness" => Some(daemon("fusion-smallbusiness", &[])),
-        // osagent issue#6: serve-metrics 迁 9100→11571 后由 supervisor 接管 —
-        // fusion-osagent 无 start.sh, serve-metrics 是前台 CLI 进程 (proctitle
-        // `fusion-osagent serve-metrics :11571`), daemonize 接管
+        // osagent issue#6: after serve-metrics moved 9100→11571, supervisor takes over —
+        // fusion-osagent has no start.sh; serve-metrics is a foreground CLI process (proctitle
+        // `fusion-osagent serve-metrics :11571`), daemonized takeover
         "fusion-osagent-metrics" => Some(daemon(
             "fusion-osagent",
             &["serve-metrics", "--port", "11571"],
         )),
-        // issue #33: fusion-simulation 无 start.sh, `fusion-sim service start`
-        // 前台阻塞进程 (gRPC :11447 + metrics :11456, --gui 起 Web GUI :11455);
-        // registry 的 -gui/-metrics 条目由该进程内嵌服务, 已 supervise:false
+        // issue #33: fusion-simulation has no start.sh; `fusion-sim service start` is a foreground
+        // blocking process (gRPC :11447 + metrics :11456, --gui starts the Web GUI :11455);
+        // the registry's -gui/-metrics entries are served embedded by this process, already supervise:false
         "fusion-simulation" => Some(daemon(
             "fusion-sim",
             &["service", "start", "--host", "127.0.0.1", "--gui"],
         )),
-        // issue #34: fusion-cowork-ws = `fusion-cowork remote serve` 前台 WebSocket
-        // 服务 (registry :11439), cowork start.sh 只管主 desk RPC 不含它
+        // issue #34: fusion-cowork-ws = `fusion-cowork remote serve` foreground WebSocket
+        // service (registry :11439); cowork start.sh only manages the main desk RPC, not this
         "fusion-cowork-ws" => Some(daemon("fusion-cowork", &["remote", "serve"])),
-        // issue #34: fusion-bench start.sh 引用已删除的 fusion_bench.api.server
-        // 模块 (上游已迁 api.app, 上游 issue dahai80/fusion-bench#27) —
-        // 直接 daemonize `fusion-bench serve` (前台 uvicorn, 默认口 11467)
+        // issue #34: fusion-bench start.sh references the removed fusion_bench.api.server
+        // module (upstream moved to api.app, upstream issue dahai80/fusion-bench#27) —
+        // daemonize `fusion-bench serve` directly (foreground uvicorn, default port 11467)
         "fusion-bench" => Some(daemon("fusion-bench", &["serve"])),
-        // issue #34/#49: fusion-k12-teacher start.sh `start` 子命令前台 exec (上游
-        // dahai80/fusion-k12-teacher#31 已修但脚本路径仍前台阻塞) — daemonize
-        // `fusion-k12 serve` (默认口 11448)。issue #49: bare serve 不加载项目自身
-        // .env (FUSION_MLX_API_KEY 等), 继承 daemon env 快照里的旧 key → gateway
-        // 401 → /api/health 503 backend down → 探活重启循环。env_file 指向项目
-        // .env (唯一真源), start 前 set -a source 注入, 覆盖旧值。
+        // issue #34/#49: fusion-k12-teacher start.sh `start` subcommand foreground execs (upstream
+        // dahai80/fusion-k12-teacher#31 fixed it but the script path still blocks in the foreground) — daemonize
+        // `fusion-k12 serve` (default port 11448). issue #49: a bare serve does not load the project's own
+        // .env (FUSION_MLX_API_KEY etc.), inheriting stale keys from the daemon env snapshot → gateway
+        // 401 → /api/health 503 backend down → probe restart loop. env_file points at the project's
+        // .env (single source of truth), sourced with set -a before start, overriding the stale values.
         "fusion-k12-teacher" => Some(StartSpec::Daemon {
             bin: "fusion-k12".into(),
             args: vec!["serve".into()],
@@ -158,20 +161,20 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: Some("fusion-k12-teacher/.env".into()),
         }),
-        // issue #34: fusion-code-modenization start.sh 用 `python -m ...server.runner`
-        // — runner 无 __main__ 入口, 导入即退出 0 (入口已迁 server/__main__.py,
-        // 上游 issue dahai80/fusion-code-modelization#21) — 直接 daemonize 正确入口
+        // issue #34: fusion-code-modenization start.sh uses `python -m ...server.runner`
+        // — runner has no __main__ entry, imports and exits 0 (the entry moved to server/__main__.py,
+        // upstream issue dahai80/fusion-code-modelization#21) — daemonize the correct entry directly
         "fusion-code-modenization" => Some(daemon(
             ".venv/bin/python",
             &["-m", "fusion_code_modelization.server"],
         )),
-        // issue #45: business 平台三个 arg-less start.sh (exec 前台进程, 不解析
-        // start/stop 参数) — `bash start.sh stop` 会反向启动服务, 走不了脚本路径,
-        // 与 bench/k12/modenization 同款 daemonize。FUSION_CLIENT_KEY (secret) 不在
-        // 此表 — 走 env_map 注入 (进程 env → .env → gateway config 兜底)。
-        // issue #55: registry key + dir 均已改名 ai-fit; start.sh 前台 exec
-        // uvicorn server.main:app (cwd=repo 根, 无 --app-dir — 旧 fit-ai spec 的
-        // --app-dir server 是错的, 此前靠端口上残留进程探活掩盖)。
+        // issue #45: three business-platform arg-less start.sh scripts (exec foreground processes, they
+        // ignore start/stop args) — `bash start.sh stop` would start the service in reverse; the script
+        // path is unusable, same daemonize as bench/k12/modenization. FUSION_CLIENT_KEY (secret) is not
+        // in this table — it goes through env_map injection (process env → .env → gateway config fallback).
+        // issue #55: registry key + dir both renamed to ai-fit; start.sh foreground execs
+        // uvicorn server.main:app (cwd=repo root, no --app-dir — the old fit-ai spec's
+        // --app-dir server was wrong; previously masked by a leftover process holding the port).
         "ai-fit" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -201,15 +204,15 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
                 "11560".into(),
             ],
             cwd: Some("business/ai-speech-exam".into()),
-            // start.sh 在 cd backend 前以 $PWD 解析 config → 相对 cwd (=repo 根) 恰好等价
+            // start.sh resolves config with $PWD before cd backend → relative to cwd (=repo root) is exactly equivalent
             env: vec![(
                 "FUSION_AI_SPEECH_EXAM_CONFIG".into(),
                 "config/config.yaml".into(),
             )],
             env_file: None,
         }),
-        // issue #55: 上游 start.sh 已从静态 http.server 改为 FastAPI 后端
-        // (uvicorn server.app:app, 11520); web 静态分发拆到 ai-apparelmockup-web。
+        // issue #55: upstream start.sh changed from a static http.server to a FastAPI backend
+        // (uvicorn server.app:app, 11520); web static serving split off to ai-apparelmockup-web.
         "ai-apparelmockup" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -225,10 +228,10 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // ---- issue #55: 2026-10-27/28 端口治理批量登记的 business 条目 ----
-        // 约定 1 标准 start.sh 全部前台 exec → 同款 daemonize; 端口逐一钉死
-        // (上游 config 默认值多为迁移前旧口, TASK-PORT-PROC-2026-10-27 未落地)。
-        // FUSION_CLIENT_KEY 一律走 env_map 注入, 不在此表。
+        // ---- issue #55: business entries registered in the 2026-10-27/28 port governance batch ----
+        // Convention 1: standard start.sh all foreground exec → same daemonize; ports pinned one by one
+        // (upstream config defaults are mostly pre-migration stale ports, TASK-PORT-PROC-2026-10-27 not landed).
+        // FUSION_CLIENT_KEY always goes through env_map injection, never in this table.
         "ai-ads-videobuilder" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -259,7 +262,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // backend.app 无 CLI 参数, 端口读 FUSION_AI_INFORMATION_SEARCH_PORT
+        // backend.app takes no CLI args; the port reads FUSION_AI_INFORMATION_SEARCH_PORT
         "ai-information-search" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec!["-m".into(), "backend.app".into()],
@@ -267,7 +270,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: vec![("FUSION_AI_INFORMATION_SEARCH_PORT".into(), "11595".into())],
             env_file: None,
         }),
-        // fusion_ai_operabase.main 端口读 FUSION_AI_OPERABASE_PORT
+        // fusion_ai_operabase.main port reads FUSION_AI_OPERABASE_PORT
         "ai-OperaBase" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec!["-m".into(), "fusion_ai_operabase.main".into()],
@@ -275,7 +278,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: vec![("FUSION_AI_OPERABASE_PORT".into(), "11504".into())],
             env_file: None,
         }),
-        // charactervoice 无 start.sh; config 默认口仍是迁移前 11480/11481 → 显式钉口
+        // charactervoice has no start.sh; config default ports are still the pre-migration 11480/11481 → pin explicitly
         "ai-charactervoice" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -306,8 +309,8 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // customer-insight 双条目共享同一 repo: web 静态分发 (11594) +
-        // API 预留口 (11501, API 未实现前先托管静态, API 落地后换入口)
+        // customer-insight dual entries share one repo: web static serving (11594) +
+        // reserved API port (11501, hosts static until the API lands, then switch the entry point)
         "customer-insight" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -338,7 +341,7 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // apparelmockup 拆出的 web 静态分发 (无 /health → TCP 探活)
+        // web static serving split out of apparelmockup (no /health → TCP probe)
         "ai-apparelmockup-web" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -354,15 +357,16 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // issue #88: venv 重建后 fleet 审计发现的另两条 — start.sh 前台 exec 且
-        // 忽略子命令 (bash start.sh stop 会 START), 同款 Daemon 接管。
-        // 端口钉 registry 值 (start.sh 默认同值, 防上游 config 漂移)
-        // issue #143: ai-assistant-agent 条目已移除 — 服务自身调度器有意周期性
-        // 自愈重启 (~5m10s 优雅退出换 PID, 上游 dahai80-business/ai-assistant-agent#5),
-        // supervisor 托管会把它当宕机自动复活并制造 Down/Back 告警风暴 (#142 实证)。
-        // registry 已标 supervise: false, 生命周期交还其自有工具。
-        // issue #94: 同 #88 类 — start.sh `start` case 前台 exec uvicorn,
-        // 默认脚本路径会挂住 exec; Daemon 接管, 端口钉 registry 11516
+        // issue #88: two more entries found by the post-venv-rebuild fleet audit — start.sh foreground
+        // execs and ignores subcommands (bash start.sh stop would START), same Daemon takeover.
+        // Ports pinned to registry values (start.sh defaults are the same, guarding against upstream config drift)
+        // issue #143: the ai-assistant-agent entry was removed — the service's own scheduler deliberately
+        // self-heal restarts periodically (~5m10s graceful exit and PID change, upstream
+        // dahai80-business/ai-assistant-agent#5); supervisor management would treat each as a crash,
+        // auto-revive and create a Down/Back alert storm (proven in #142).
+        // registry is marked supervise: false; its lifecycle returns to its own tooling.
+        // issue #94: same as #88 — start.sh `start` case foreground execs uvicorn,
+        // the default script path would hang exec; Daemon takeover, port pinned to registry 11516
         "ai-booking-agent" => Some(StartSpec::Daemon {
             bin: ".venv/bin/python".into(),
             args: vec![
@@ -395,12 +399,12 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             env: Vec::new(),
             env_file: None,
         }),
-        // issue #131: fusion-site 仓库无 start.sh — Next standalone 前台 node
-        // 进程 (cwd .next/standalone, server.js 读 PORT/HOSTNAME env)。此前只能
-        // 手工 nohup 注入 env, 外部重启/接管必丢 env (auth callback 401 实证)。
-        // 端口钉死 registry :11481 (3000 是保留端口, 上游 fusion-site#54 迁移)。
-        // NEXT_PUBLIC_SITE_URL 随部署而变 (公网 origin / 本地口) 且 key 语义
-        // 属部署 — 走 ~/.fusion-sv/env/fusion-site.env overlay (#125), 不钉死。
+        // issue #131: fusion-site repo has no start.sh — Next standalone foreground node
+        // process (cwd .next/standalone, server.js reads PORT/HOSTNAME env). Previously only
+        // manual nohup with injected env; any external restart/takeover lost the env (auth callback 401 observed).
+        // Port pinned to registry :11481 (3000 is a reserved port, upstream fusion-site#54 migration).
+        // NEXT_PUBLIC_SITE_URL varies by deployment (public origin / local port) and the key's semantics
+        // belong to the deployment — routed through the ~/.fusion-sv/env/fusion-site.env overlay (#125), not pinned.
         "fusion-site" => Some(StartSpec::Daemon {
             bin: "node".into(),
             args: vec!["server.js".into()],
@@ -412,15 +416,15 @@ pub fn start_spec_for(name: &str) -> Option<StartSpec> {
             ],
             env_file: None,
         }),
-        // issue #140: fusion-ops Mac 侧注册已移除 (服务迁 VPS systemd, fusion-ops#5) —
-        // 此处不再接管, 避免状态表常驻 Stopped 假象。
+        // issue #140: fusion-ops Mac-side registration removed (service moved to VPS systemd, fusion-ops#5) —
+        // no longer managed here, avoiding a permanent Stopped facade in the status table.
         _ => None,
     }
 }
 
-// 共享 venv 内的 CLI 入口优先 (daemon 通常不在 venv shell 里跑);
-// 不存在则退回裸名交给 PATH。
-// 含路径分隔符的 bin (如 fusion-store/target/release/fs-serve) 相对 FUSION_ROOT 解析。
+// CLI entries inside the shared venv preferred (the daemon usually does not run inside a venv shell);
+// fall back to the bare name for PATH resolution when absent.
+// A bin containing a path separator (e.g. fusion-store/target/release/fs-serve) resolves relative to FUSION_ROOT.
 pub fn resolve_bin(bin: &str) -> String {
     if bin.contains('/') {
         let candidate = fusion_root().join(bin);
@@ -437,7 +441,7 @@ pub fn resolve_bin(bin: &str) -> String {
     }
 }
 
-// supervisor 托管 pidfile 目录 (~/.fusion-sv/pids/)
+// Supervisor-managed pidfile directory (~/.fusion-sv/pids/)
 pub fn pid_path(svc: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home)
@@ -445,7 +449,7 @@ pub fn pid_path(svc: &str) -> PathBuf {
         .join(format!("{svc}.pid"))
 }
 
-// supervisor 托管服务日志 (~/.fusion-sv/logs/<svc>.log)
+// Supervisor-managed service log (~/.fusion-sv/logs/<svc>.log)
 pub fn log_path(svc: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home)
@@ -453,12 +457,13 @@ pub fn log_path(svc: &str) -> PathBuf {
         .join(format!("{svc}.log"))
 }
 
-// 防 idle sleep 陪护: launchd 迁 supervisor 后, 原 plist 的 caffeinate -i 随迁
-// 丢失 (2026-10-30)。fusion-gupiao 凌晨 01:00 daily_suggest 长扫描会被系统
-// idle sleep 打断。start/restart 成功后以 `caffeinate -i -w <服务 pid>` 挂
-// 系统断言 — 服务退出/被停时 caffeinate 自动退出释放断言, 无需 stop 路径配合。
-// 上游正解是 gupiao start.sh 自带 caffeinate 选项 (fusion-gupiao#6),
-// 此表为 supervisor 侧过渡补丁。
+// Idle-sleep prevention companion: after the launchd→supervisor migration, the original plist's
+// caffeinate -i was lost in the move (2026-10-30). fusion-gupiao's 01:00 daily_suggest long scan
+// gets interrupted by system idle sleep. After a successful start/restart, attach a system assertion
+// with `caffeinate -i -w <service pid>` — when the service exits or is stopped, caffeinate exits
+// automatically and releases the assertion; no stop-path cooperation needed.
+// The upstream proper fix is a caffeinate option in gupiao start.sh (fusion-gupiao#6);
+// this table is a supervisor-side transitional patch.
 pub fn caffeinate_pidfile(svc: &str) -> Option<&'static str> {
     match svc {
         "fusion-gupiao" => Some("~/.fusion-gupiao/run.pid"),
@@ -466,13 +471,14 @@ pub fn caffeinate_pidfile(svc: &str) -> Option<&'static str> {
     }
 }
 
-// daemonize start 命令 (bash -c 执行): nohup 后台 + 日志重定向 + pidfile。
-// 注意 mkdir/cd/export 用 `;` 分隔而非 `&&`: `A && B &` 会把整个列表后台化为
-// 子 shell, $! 拿到的是子 shell pid 而非真实进程 pid — stop 时 kill 掉的是壳,
-// 服务进程变孤儿继续占口。`;` 分隔后 nohup 单独后台, $! 即 nohup exec 后的真实 pid。
-// issue #45: cd 用 `|| exit 1` 守护 (cwd 不存在时拒启, 不在错误目录裸跑)。
-// issue #49: env_file 在 cd 之后 set -a source (dotenv 覆盖 daemon env 快照旧值),
-// 文件缺失 `|| exit 1` fail-closed 拒启。
+// Daemonized start command (run via bash -c): nohup background + log redirect + pidfile.
+// Note mkdir/cd/export are joined with `;` rather than `&&`: `A && B &` backgrounds the whole list as
+// a subshell, so $! gets the subshell pid, not the real process pid — stop would kill the shell,
+// leaving the service process orphaned and still holding the port. With `;` separators nohup
+// backgrounds alone, and $! is the real pid after nohup exec.
+// issue #45: cd is guarded with `|| exit 1` (refuse to start when cwd does not exist, never run bare in a wrong directory).
+// issue #49: env_file is sourced with set -a after cd (dotenv overrides stale daemon env snapshot values);
+// a missing file fails closed with `|| exit 1`.
 pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     let StartSpec::Daemon {
         bin,
@@ -502,9 +508,10 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     for (k, v) in env {
         pre.push_str(&format!("export {k}='{v}'; "));
     }
-    // issue #110: set -m (job control) 让后台化的服务进程自成一组
-    // (pgid == 自身 pid, 已实证 macOS bash) — stop 侧才能按进程组整树击杀,
-    // uvicorn worker 等子孙不落单。nohup 已防 HUP, set -m 不改变该保护。
+    // issue #110: set -m (job control) makes the backgrounded service process its own process group
+    // (pgid == its own pid, proven on macOS bash) — only then can the stop side kill the whole tree by
+    // process group, so uvicorn workers and other descendants are not left behind. nohup already blocks
+    // HUP; set -m does not change that.
     Some(format!(
         "{pre}set -m; nohup '{bin}' {args} >> '{log}' 2>&1 & echo $! > '{pid}'",
         args = args.join(" "),
@@ -513,22 +520,26 @@ pub fn daemon_start_cmd(spec: &StartSpec, svc: &str) -> Option<String> {
     ))
 }
 
-// daemonize stop 命令: pidfile kill + 宽限等待 + 升级 SIGKILL + 清理。
-// 部分前台化服务 (如 fusion-k12-teacher) 忽略 SIGTERM (优雅关闭卡死), 只 TERM
-// 会出现 down 返回 ok / pidfile 已删 / 进程仍存活的假停止 — 必须 -9 兜底。
-// 宽限 5s (25×0.2s), 正常进程 <1s 退出即提前跳出; 死循环等价 5s 阻塞, 逐服务串行可接受。
-// issue #96: port 锚定兜底 — pidfile 失联 (换 PID/丢失) 的孤儿监听器用
-// lsof -sTCP:LISTEN 按注册端口补杀, 否则 restart/rollout 新进程撞口死掉、
-// 探活命中旧监听 → "ok" 但代码从未被替换。仅 Daemon spec 服务走此路径
-// (supervisor 全权托管该端口), start.sh 服务不受影响。
-// issue #110 (t3code kill-safety): 两条击杀纪律 —
-// 1) pidfile 分支先查 pgid, pgid == pid (start 侧 set -m 保证) 时按进程组
-//    `kill -TERM -<pid>` 整树击杀 (子孙 worker 不落单); 查不到/不等 (旧版
-//    存量进程) 回落单 pid 击杀, 行为与旧版一致。ESRCH 由 kill -0 轮询兜底。
-// 2) port 兜底补杀前必验归属: lsof 读候选 pid 的 cwd + ps 读 cmdline,
-//    仅命中本服务 repo 目录名才击杀; 无关监听器跳过留痕, 绝不按端口盲杀
-//    (t3code 教训: 按 argv/端口模式匹配会误伤无关进程)。
-//    本仓库无 pkill/grep 模式击杀路径 — pgrep 仅用于只读检测 (runner.rs)。
+// Daemonized stop command: pidfile kill + grace wait + SIGKILL escalation + cleanup.
+// Some foreground-converted services (e.g. fusion-k12-teacher) ignore SIGTERM (graceful shutdown hangs);
+// TERM alone yields a fake stop — down returns ok / pidfile removed / process still alive — so a -9
+// fallback is mandatory.
+// Grace is 5s (25×0.2s); a normal process exiting <1s breaks out early; an endless loop equals a 5s
+// block, acceptable serially per service.
+// issue #96: port-anchored fallback — orphan listeners whose pidfile is lost (PID changed/missing) are
+// killed by registered port via lsof -sTCP:LISTEN; otherwise restart/rollout new processes die on port
+// collision and the probe hits the old listener → "ok" but the code was never replaced. Only Daemon spec
+// services take this path (the supervisor owns that port outright); start.sh services are unaffected.
+// issue #110 (t3code kill-safety): two killing disciplines —
+// 1) the pidfile branch checks pgid first; when pgid == pid (guaranteed by start-side set -m) kill the
+//    whole tree by process group with `kill -TERM -<pid>` (descendant workers are not left behind); when
+//    not found/unequal (legacy processes), fall back to single-pid kill, matching the old behavior.
+//    ESRCH is covered by the kill -0 polling.
+// 2) the port fallback must verify ownership before killing: lsof reads the candidate pid's cwd + ps
+//    reads cmdline, kill only when the service's repo directory name matches; unrelated listeners are
+//    skipped with a trace, never blindly killed by port
+//    (t3code lesson: argv/port pattern matching kills unrelated processes).
+//    This repo has no pkill/grep pattern-kill paths — pgrep is used for read-only detection only (runner.rs).
 pub fn daemon_stop_cmd(svc: &str, port: Option<u16>) -> String {
     let pid = pid_path(svc);
     let repo_dir = crate::manifest::name_to_dir(svc);
@@ -580,7 +591,7 @@ pub fn daemon_stop_cmd(svc: &str, port: Option<u16>) -> String {
 mod tests {
     use super::*;
 
-    // caffeinate 陪护表: gupiao 有, 其他服务无
+    // caffeinate companion table: gupiao has it, other services do not
     #[test]
     fn test_caffeinate_pidfile_table() {
         assert_eq!(
@@ -591,8 +602,8 @@ mod tests {
         assert_eq!(caffeinate_pidfile("unknown-svc"), None);
     }
 
-    // issue #145: config systemd 托管表 — 注册后 start_spec_for 返回 Systemd,
-    // 命令构造仅 start/stop, restart 语义留给 stop+start 流
+    // issue #145: config systemd-managed table — after registration start_spec_for returns Systemd,
+    // command construction is start/stop only, restart semantics left to the stop+start flow
     #[test]
     fn test_issue145_systemd_spec_and_cmd() {
         assert!(start_spec_for("svc-not-registered").is_none());
@@ -606,7 +617,7 @@ mod tests {
             Some(StartSpec::Systemd { unit }) => {
                 assert_eq!(unit, "fusion-identity.service");
             }
-            other => panic!("应为 Systemd spec: {other:?}"),
+            other => panic!("expected a Systemd spec: {other:?}"),
         }
         assert_eq!(
             systemd_shell_cmd("fusion-identity.service", "start").unwrap(),
@@ -625,7 +636,7 @@ mod tests {
         assert!(matches!(spec, StartSpec::Script(_)));
     }
 
-    // issue #81: office-api 走嵌套 services/office-api/start.sh (非仓库根脚本)
+    // issue #81: office-api uses the nested services/office-api/start.sh (not the repo-root script)
     #[test]
     fn test_office_api_uses_script() {
         let spec = start_spec_for("fusion-office-api").unwrap();
@@ -633,15 +644,15 @@ mod tests {
             StartSpec::Script(p) => {
                 assert!(
                     p.ends_with("fusion-office/services/office-api/start.sh"),
-                    "office-api 脚本路径错误: {:?}",
+                    "office-api script path wrong: {:?}",
                     p
                 );
             }
-            _ => panic!("office-api 应为 Script spec"),
+            _ => panic!("office-api should be a Script spec"),
         }
     }
 
-    // issue #34: cowork-ws 用 remote serve 前台进程 daemonize
+    // issue #34: cowork-ws daemonizes the remote serve foreground process
     #[test]
     fn test_cowork_ws_daemon_spec() {
         let spec = start_spec_for("fusion-cowork-ws").unwrap();
@@ -650,11 +661,11 @@ mod tests {
                 assert_eq!(bin, "fusion-cowork");
                 assert_eq!(args, vec!["remote".to_string(), "serve".to_string()]);
             }
-            _ => panic!("cowork-ws 应为 Daemon spec"),
+            _ => panic!("cowork-ws should be a Daemon spec"),
         }
     }
 
-    // issue #34: bench/k12/modenization start.sh 上游破损, Daemon spec 直跑正确入口
+    // issue #34: bench/k12/modenization start.sh upstream-broken, Daemon specs run the correct entries directly
     #[test]
     fn test_issue34_broken_start_sh_daemon_specs() {
         let spec = start_spec_for("fusion-bench").unwrap();
@@ -663,7 +674,7 @@ mod tests {
                 assert_eq!(bin, "fusion-bench");
                 assert_eq!(args, &vec!["serve".to_string()]);
             }
-            _ => panic!("fusion-bench 应为 Daemon spec"),
+            _ => panic!("fusion-bench should be a Daemon spec"),
         }
 
         let spec = start_spec_for("fusion-k12-teacher").unwrap();
@@ -672,7 +683,7 @@ mod tests {
                 assert_eq!(bin, "fusion-k12");
                 assert_eq!(args, &vec!["serve".to_string()]);
             }
-            _ => panic!("fusion-k12-teacher 应为 Daemon spec"),
+            _ => panic!("fusion-k12-teacher should be a Daemon spec"),
         }
 
         // issue #100: cowork-web must carry env_file pointing at root .env so a
@@ -716,11 +727,14 @@ mod tests {
                     ]
                 );
             }
-            _ => panic!("fusion-code-modenization 应为 Daemon spec"),
+            _ => panic!("fusion-code-modenization should be a Daemon spec"),
         }
-        // resolve_bin 路径形式: .venv/bin/python 必须解析到 FUSION_ROOT 下
+        // resolve_bin path form: .venv/bin/python must resolve under FUSION_ROOT
         let r = resolve_bin(".venv/bin/python");
-        assert!(r.contains(".venv/bin/python"), "解析结果异常: {r}");
+        assert!(
+            r.contains(".venv/bin/python"),
+            "unexpected resolution result: {r}"
+        );
     }
 
     #[test]
@@ -731,7 +745,7 @@ mod tests {
                 assert_eq!(bin, "fusion-cowork");
                 assert!(args.contains(&"11461".to_string()));
             }
-            _ => panic!("cowork-web 应为 Daemon spec"),
+            _ => panic!("cowork-web should be a Daemon spec"),
         }
     }
 
@@ -744,19 +758,25 @@ mod tests {
     #[test]
     fn test_daemon_start_cmd_shape() {
         let Some(spec) = start_spec_for("fusion-cowork-web") else {
-            panic!("cowork-web 应有 spec");
+            panic!("cowork-web should have a spec");
         };
         let cmd = daemon_start_cmd(&spec, "fusion-cowork-web").unwrap();
-        assert!(cmd.contains("nohup"), "应 nohup 后台: {cmd}");
+        assert!(
+            cmd.contains("nohup"),
+            "should run in background via nohup: {cmd}"
+        );
         assert!(
             cmd.contains("web serve --port 11461"),
-            "应带完整参数: {cmd}"
+            "should carry full args: {cmd}"
         );
         assert!(
             cmd.contains(".fusion-sv/pids/fusion-cowork-web.pid"),
-            "应写 pidfile: {cmd}"
+            "should write the pidfile: {cmd}"
         );
-        assert!(cmd.contains("echo $!"), "应记录后台 pid: {cmd}");
+        assert!(
+            cmd.contains("echo $!"),
+            "should record the background pid: {cmd}"
+        );
     }
 
     #[test]
@@ -765,21 +785,21 @@ mod tests {
         assert!(daemon_start_cmd(&spec, "fusion-trainer-bridge").is_none());
     }
 
-    // issue #31: pidfile 必须记真实进程 pid — mkdir 不得与 nohup 用 && 连接
-    // (`&& ... &` 整列表后台化, $! = 子 shell pid, stop kill 掉壳留孤儿进程)
+    // issue #31: the pidfile must record the real process pid — mkdir must not be joined with nohup via &&
+    // (`&& ... &` backgrounds the whole list, $! = subshell pid; stop kills the shell and leaves an orphan)
     #[test]
     fn test_daemon_start_cmd_no_subshell_pid() {
         let Some(spec) = start_spec_for("fusion-cowork-web") else {
-            panic!("cowork-web 应有 spec");
+            panic!("cowork-web should have a spec");
         };
         let cmd = daemon_start_cmd(&spec, "fusion-cowork-web").unwrap();
         assert!(
             !cmd.contains("&& nohup"),
-            "mkdir 与 nohup 不得用 && 连接 (pidfile 会记子 shell pid): {cmd}"
+            "mkdir and nohup must not be joined with && (the pidfile would record a subshell pid): {cmd}"
         );
         assert!(
             cmd.contains("; nohup"),
-            "mkdir 应以 ; 分隔, nohup 单独后台: {cmd}"
+            "mkdir should be joined with ; and nohup backgrounded alone: {cmd}"
         );
     }
 
@@ -794,55 +814,67 @@ mod tests {
                 assert!(args.contains(&"sse".to_string()));
                 assert!(args.contains(&"8765".to_string()));
             }
-            _ => panic!("plugins-ecosystem 应为 Daemon spec"),
+            _ => panic!("plugins-ecosystem should be a Daemon spec"),
         }
         let cmd = daemon_start_cmd(&spec, "fusion-plugins-ecosystem").unwrap();
         assert!(
             cmd.contains("--transport sse --port 8765"),
-            "应带 MCP server 参数: {cmd}"
+            "should carry MCP server args: {cmd}"
         );
     }
 
-    // issue #33: fusion-store 直接 daemonize fs-serve 二进制 (deploy/start.sh 上游
-    // BINARY 名不匹配, 走不了); 含路径的 bin 相对 FUSION_ROOT 解析
+    // issue #33: fusion-store daemonizes the fs-serve binary directly (deploy/start.sh upstream
+    // BINARY name mismatch, script path unusable); a bin with a path resolves relative to FUSION_ROOT
     #[test]
     fn test_fusion_store_daemon_spec() {
         let spec = start_spec_for("fusion-store").unwrap();
         match &spec {
             StartSpec::Daemon { bin, args, .. } => {
                 assert_eq!(bin, "fusion-store/target/release/fs-serve");
-                assert!(args.is_empty(), "零参启动, 口走 fs-serve 内置默认");
+                assert!(
+                    args.is_empty(),
+                    "zero-arg start, port uses the fs-serve built-in default"
+                );
             }
-            _ => panic!("fusion-store 应为 Daemon spec"),
+            _ => panic!("fusion-store should be a Daemon spec"),
         }
         let cmd = daemon_start_cmd(&spec, "fusion-store").unwrap();
-        assert!(cmd.contains("fs-serve"), "应启动 fs-serve 二进制: {cmd}");
+        assert!(
+            cmd.contains("fs-serve"),
+            "should start the fs-serve binary: {cmd}"
+        );
     }
 
-    // 含路径分隔符的 bin 相对 FUSION_ROOT 解析; 纯名走 .venv/bin
+    // A bin with a path separator resolves relative to FUSION_ROOT; a bare name goes through .venv/bin
     #[test]
     fn test_resolve_bin_path_form() {
-        // 存在与否都不得拼进 .venv/bin (路径带 / 拼接语义错误)
+        // must never be joined into .venv/bin whether or not it exists (joining a path with / is semantically wrong)
         let r = resolve_bin("fusion-store/target/release/fs-serve");
-        assert!(!r.contains(".venv"), "路径形式 bin 不得走 .venv 解析: {r}");
+        assert!(
+            !r.contains(".venv"),
+            "path-form bin must not resolve through .venv: {r}"
+        );
         assert!(r.contains("fs-serve"));
     }
 
-    // issue #33: fusion-smallbusiness CLI 直接跑 uvicorn (:11490)
+    // issue #33: fusion-smallbusiness CLI runs uvicorn directly (:11490)
     #[test]
     fn test_fusion_smallbusiness_daemon_spec() {
         let spec = start_spec_for("fusion-smallbusiness").unwrap();
         match &spec {
             StartSpec::Daemon { bin, args, .. } => {
                 assert_eq!(bin, "fusion-smallbusiness");
-                assert!(args.is_empty(), "零参启动, 口走 FSB env 默认值");
+                assert!(
+                    args.is_empty(),
+                    "zero-arg start, port uses the FSB env default"
+                );
             }
-            _ => panic!("fusion-smallbusiness 应为 Daemon spec"),
+            _ => panic!("fusion-smallbusiness should be a Daemon spec"),
         }
     }
 
-    // issue #33: fusion-sim service start 前台阻塞, daemonize + --gui
-    // (gui :11455 / metrics :11456 由同一进程内嵌, registry 已 supervise:false)
+    // issue #33: fusion-sim service start blocks in the foreground; daemonize + --gui
+    // (gui :11455 / metrics :11456 embedded in the same process; registry already supervise:false)
     #[test]
     fn test_fusion_simulation_daemon_spec() {
         let spec = start_spec_for("fusion-simulation").unwrap();
@@ -853,13 +885,16 @@ mod tests {
                 assert!(args.contains(&"start".to_string()));
                 assert!(args.contains(&"--gui".to_string()));
             }
-            _ => panic!("fusion-simulation 应为 Daemon spec"),
+            _ => panic!("fusion-simulation should be a Daemon spec"),
         }
         let cmd = daemon_start_cmd(&spec, "fusion-simulation").unwrap();
-        assert!(cmd.contains("service start"), "应带 service start: {cmd}");
+        assert!(
+            cmd.contains("service start"),
+            "should carry service start: {cmd}"
+        );
     }
 
-    // issue #45: business 平台三个 arg-less start.sh → daemonize + cwd + env
+    // issue #45: business platform's three arg-less start.sh → daemonize + cwd + env
     #[test]
     fn test_issue42_business_daemon_specs() {
         let spec = start_spec_for("ai-fit").unwrap();
@@ -875,12 +910,15 @@ mod tests {
                 assert!(args.contains(&"server.main:app".to_string()));
                 assert!(
                     !args.contains(&"--app-dir".to_string()),
-                    "uvicorn 应从 repo 根导入"
+                    "uvicorn should import from the repo root"
                 );
                 assert_eq!(cwd.as_deref(), Some("business/ai-fit"));
-                assert!(env.is_empty(), "ai-fit 无固定 env (key 走 env_map)");
+                assert!(
+                    env.is_empty(),
+                    "ai-fit has no fixed env (key goes through env_map)"
+                );
             }
-            _ => panic!("ai-fit 应为 Daemon spec"),
+            _ => panic!("ai-fit should be a Daemon spec"),
         }
 
         let spec = start_spec_for("ai-speech-exam").unwrap();
@@ -892,13 +930,13 @@ mod tests {
                     env.iter()
                         .any(|(k, v)| k == "FUSION_AI_SPEECH_EXAM_CONFIG"
                             && v == "config/config.yaml"),
-                    "应带 config 相对路径 env: {env:?}"
+                    "should carry the config relative-path env: {env:?}"
                 );
             }
-            _ => panic!("ai-speech-exam 应为 Daemon spec"),
+            _ => panic!("ai-speech-exam should be a Daemon spec"),
         }
 
-        // issue #55: apparelmockup 上游改 FastAPI — 不再是 http.server
+        // issue #55: apparelmockup upstream switched to FastAPI — no longer http.server
         let spec = start_spec_for("ai-apparelmockup").unwrap();
         match &spec {
             StartSpec::Daemon { args, cwd, .. } => {
@@ -907,12 +945,12 @@ mod tests {
                 assert!(!args.contains(&"http.server".to_string()));
                 assert_eq!(cwd.as_deref(), Some("business/ai-apparelmockup"));
             }
-            _ => panic!("ai-apparelmockup 应为 Daemon spec"),
+            _ => panic!("ai-apparelmockup should be a Daemon spec"),
         }
     }
 
-    // issue #55: 批量登记条目 — 端口钉死 (上游 config 默认口未迁移),
-    // 无 CLI 端口参数的走 env, 共享 repo 双条目 cwd 一致
+    // issue #55: batch-registered entries — ports pinned (upstream config default ports not migrated),
+    // entries without CLI port args use env, shared-repo dual entries share cwd
     #[test]
     fn test_issue55_business_batch_specs() {
         for (name, module, port) in [
@@ -925,11 +963,11 @@ mod tests {
                     assert!(args.contains(&module.to_string()), "{name}: {args:?}");
                     assert!(
                         args.contains(&"--port".to_string()) && args.contains(&port.to_string()),
-                        "{name} 端口须钉死 {port}: {args:?}"
+                        "{name} port must be pinned to {port}: {args:?}"
                     );
                     assert_eq!(cwd.as_deref(), Some("business/ai-charactervoice"));
                 }
-                _ => panic!("{name} 应为 Daemon spec"),
+                _ => panic!("{name} should be a Daemon spec"),
             }
         }
 
@@ -942,7 +980,7 @@ mod tests {
                 );
                 assert_eq!(cwd.as_deref(), Some("business/ai-information-search"));
             }
-            _ => panic!("ai-information-search 应为 Daemon spec"),
+            _ => panic!("ai-information-search should be a Daemon spec"),
         }
 
         let spec = start_spec_for("ai-OperaBase").unwrap();
@@ -954,7 +992,7 @@ mod tests {
                 );
                 assert_eq!(cwd.as_deref(), Some("business/ai-OperaBase"));
             }
-            _ => panic!("ai-operabase 应为 Daemon spec"),
+            _ => panic!("ai-operabase should be a Daemon spec"),
         }
 
         for (name, port) in [
@@ -970,7 +1008,7 @@ mod tests {
                     assert!(args.contains(&"web/dist".to_string()));
                     assert!(cwd.is_some());
                 }
-                _ => panic!("{name} 应为 Daemon spec"),
+                _ => panic!("{name} should be a Daemon spec"),
             }
         }
 
@@ -981,13 +1019,13 @@ mod tests {
                     assert!(args.contains(&"serve".to_string()), "{name}: {args:?}");
                     assert!(args.contains(&"--port".to_string()));
                 }
-                _ => panic!("{name} 应为 Daemon spec"),
+                _ => panic!("{name} should be a Daemon spec"),
             }
         }
 
-        // issue #88: fleet 审计收编的另两条 business 条目 (start.sh 前台 exec
-        // 且忽略子命令), 端口钉 registry 值
-        // issue #143: ai-assistant-agent 已移除 (自愈型服务不再托管) — 断言注销
+        // issue #88: two more business entries absorbed by the fleet audit (start.sh foreground exec
+        // and ignores subcommands), ports pinned to registry values
+        // issue #143: ai-assistant-agent removed (self-healing service no longer managed) — assert deregistration
         assert!(start_spec_for("ai-assistant-agent").is_none());
         let spec = start_spec_for("ai-lead-qualifier").unwrap();
         match &spec {
@@ -1006,10 +1044,10 @@ mod tests {
                 );
                 assert_eq!(cwd.as_deref(), Some("business/ai-lead-qualifier"));
             }
-            _ => panic!("ai-lead-qualifier 应为 Daemon spec"),
+            _ => panic!("ai-lead-qualifier should be a Daemon spec"),
         }
 
-        // osagent issue#6: serve-metrics Daemon spec (9100→11571 迁移后接管)
+        // osagent issue#6: serve-metrics Daemon spec (takeover after the 9100→11571 migration)
         let spec = start_spec_for("fusion-osagent-metrics").unwrap();
         match &spec {
             StartSpec::Daemon {
@@ -1023,31 +1061,37 @@ mod tests {
                 assert_eq!(args, &["serve-metrics", "--port", "11571"]);
                 assert!(cwd.is_none() && env.is_empty() && env_file.is_none());
             }
-            _ => panic!("fusion-osagent-metrics 应为 Daemon spec"),
+            _ => panic!("fusion-osagent-metrics should be a Daemon spec"),
         }
     }
 
-    // issue #45: cwd/env 进 start 命令 — cd 带 || exit 1 守护, export 前置,
-    // 且不破坏 `; nohup` pid 纪律 (pidfile 记真实进程 pid)
+    // issue #45: cwd/env enter the start command — cd guarded with || exit 1, export prefixed,
+    // without breaking the `; nohup` pid discipline (the pidfile records the real process pid)
     #[test]
     fn test_issue42_daemon_cmd_cwd_env_shape() {
         let spec = start_spec_for("ai-speech-exam").unwrap();
         let cmd = daemon_start_cmd(&spec, "ai-speech-exam").unwrap();
         assert!(
             cmd.contains("business/ai-speech-exam"),
-            "应 cd 到 repo: {cmd}"
+            "should cd into the repo: {cmd}"
         );
-        assert!(cmd.contains("|| exit 1;"), "cd 失败应拒启: {cmd}");
+        assert!(
+            cmd.contains("|| exit 1;"),
+            "cd failure should refuse to start: {cmd}"
+        );
         assert!(
             cmd.contains("export FUSION_AI_SPEECH_EXAM_CONFIG='config/config.yaml';"),
-            "应 export config 路径: {cmd}"
+            "should export the config path: {cmd}"
         );
-        assert!(!cmd.contains("&& nohup"), "不得破坏 pid 纪律: {cmd}");
-        assert!(cmd.contains("; nohup"), "nohup 须 ; 分隔: {cmd}");
+        assert!(
+            !cmd.contains("&& nohup"),
+            "must not break the pid discipline: {cmd}"
+        );
+        assert!(cmd.contains("; nohup"), "nohup must be ; separated: {cmd}");
     }
 
     // issue #131: fusion-site Next standalone — node server.js @ .next/standalone,
-    // 端口/主机/NODE_ENV 钉死 registry 值, NEXT_PUBLIC_SITE_URL 走 overlay 不在此表
+    // port/host/NODE_ENV pinned to registry values, NEXT_PUBLIC_SITE_URL via overlay not in this table
     #[test]
     fn test_issue131_fusion_site_daemon_spec() {
         let spec = start_spec_for("fusion-site").expect("fusion-site spec missing");
@@ -1059,7 +1103,7 @@ mod tests {
             env_file,
         } = &spec
         else {
-            panic!("应为 Daemon spec");
+            panic!("expected a Daemon spec");
         };
         assert_eq!(bin, "node");
         assert_eq!(args, &vec!["server.js".to_string()]);
@@ -1071,14 +1115,17 @@ mod tests {
         let cmd = daemon_start_cmd(&spec, "fusion-site").unwrap();
         assert!(
             cmd.contains("fusion-site/.next/standalone"),
-            "应 cd standalone: {cmd}"
+            "should cd into standalone: {cmd}"
         );
-        assert!(cmd.contains("|| exit 1;"), "cd 失败应拒启: {cmd}");
+        assert!(
+            cmd.contains("|| exit 1;"),
+            "cd failure should refuse to start: {cmd}"
+        );
         assert!(
             cmd.contains("export PORT='11481';"),
-            "应 export 端口: {cmd}"
+            "should export the port: {cmd}"
         );
-        assert!(cmd.contains("; nohup"), "nohup 须 ; 分隔: {cmd}");
+        assert!(cmd.contains("; nohup"), "nohup must be ; separated: {cmd}");
         assert_eq!(
             crate::probe_map::restart_cmd_for("fusion-site"),
             "stop+start"
@@ -1088,86 +1135,108 @@ mod tests {
     #[test]
     fn test_daemon_stop_cmd_kills_pidfile() {
         let cmd = daemon_stop_cmd("fusion-cowork-web", Some(11461));
-        assert!(cmd.contains("kill"), "stop 应 kill: {cmd}");
+        assert!(cmd.contains("kill"), "stop should kill: {cmd}");
         assert!(
             cmd.contains("fusion-cowork-web.pid"),
-            "stop 应读 pidfile: {cmd}"
+            "stop should read the pidfile: {cmd}"
         );
-        assert!(cmd.contains("kill -9"), "stop 应升级 SIGKILL: {cmd}");
-        assert!(cmd.contains("rm -f"), "stop 应清 pidfile: {cmd}");
+        assert!(
+            cmd.contains("kill -9"),
+            "stop should escalate to SIGKILL: {cmd}"
+        );
+        assert!(
+            cmd.contains("rm -f"),
+            "stop should clean the pidfile: {cmd}"
+        );
     }
 
-    // 忽略 SIGTERM 的服务必须被升级击杀 (生产 bug: k12 down 后进程仍存活)
+    // Services that ignore SIGTERM must be killed with escalation (production bug: k12 still alive after down)
     #[test]
     fn test_daemon_stop_cmd_sigterm_escalation() {
         let cmd = daemon_stop_cmd("fusion-k12-teacher", None);
-        assert!(cmd.contains("kill -0 \"$p\""), "应轮询进程存活: {cmd}");
-        assert!(cmd.contains("kill -9 \"$p\""), "TERM 后仍存活应 -9: {cmd}");
-        assert!(cmd.contains("rm -f"), "击杀后清 pidfile: {cmd}");
+        assert!(
+            cmd.contains("kill -0 \"$p\""),
+            "should poll process liveness: {cmd}"
+        );
+        assert!(
+            cmd.contains("kill -9 \"$p\""),
+            "still alive after TERM should -9: {cmd}"
+        );
+        assert!(
+            cmd.contains("rm -f"),
+            "clean the pidfile after killing: {cmd}"
+        );
     }
 
-    // issue #96: port 锚定孤儿监听兜底 — 有 port 时附 lsof LISTEN 补杀段
-    // issue #110: 补杀前必须验归属 (cwd/cmdline 命中 repo 目录名), 不再盲杀
+    // issue #96: port-anchored orphan-listener fallback — with a port, append the lsof LISTEN kill segment
+    // issue #110: ownership must be verified before the kill (cwd/cmdline matches the repo directory name), no more blind kills
     #[test]
     fn test_daemon_stop_cmd_port_fallback() {
         let cmd = daemon_stop_cmd("fusion-cowork-web", Some(11461));
         assert!(
             cmd.contains("lsof -ti tcp:11461 -sTCP:LISTEN"),
-            "应有 port 锚定补杀: {cmd}"
+            "should have the port-anchored kill segment: {cmd}"
         );
         assert!(
             cmd.contains("*'fusion-cowork'*"),
-            "归属校验应匹配 repo 目录名: {cmd}"
+            "ownership check should match the repo directory name: {cmd}"
         );
         assert!(
             cmd.contains("not owned by fusion-cowork"),
-            "无关监听器应跳过留痕: {cmd}"
+            "unrelated listeners should be skipped with a trace: {cmd}"
         );
-        assert!(cmd.contains("kill -9 \"$q\""), "命中归属仍 -9 兜底: {cmd}");
+        assert!(
+            cmd.contains("kill -9 \"$q\""),
+            "a matched owner still gets the -9 fallback: {cmd}"
+        );
         let no_port = daemon_stop_cmd("fusion-cowork-web", None);
         assert!(
             !no_port.contains("lsof"),
-            "无 port 不得带 lsof 段: {no_port}"
+            "without a port the lsof segment must be absent: {no_port}"
         );
     }
 
-    // issue #110: start 命令带 set -m — 服务进程 pgid == 自身 pid, stop 侧才能组杀
+    // issue #110: the start command carries set -m — service process pgid == its own pid so the stop side can group-kill
     #[test]
     fn test_daemon_start_cmd_sets_process_group() {
         let spec = start_spec_for("fusion-cowork-web").unwrap();
         let cmd = daemon_start_cmd(&spec, "fusion-cowork-web").unwrap();
         assert!(
             cmd.contains("set -m; nohup"),
-            "start 命令应带 set -m 使后台进程自成组: {cmd}"
+            "the start command should carry set -m so the background process forms its own group: {cmd}"
         );
     }
 
-    // issue #110: pidfile 分支先查 pgid, pgid==pid 时整树组杀 (TERM → 轮询 → -9);
-    // pgid 不等 (旧版存量) 回落单 pid 击杀
+    // issue #110: the pidfile branch checks pgid first, group-kills the whole tree when pgid==pid (TERM → poll → -9);
+    // when pgid differs (legacy processes) falls back to single-pid kill
     #[test]
     fn test_daemon_stop_cmd_group_kill() {
         let cmd = daemon_stop_cmd("fusion-cowork-web", None);
         assert!(
             cmd.contains("g=$(ps -o pgid= -p \"$p\""),
-            "应先查进程组: {cmd}"
+            "should check the process group first: {cmd}"
         );
         assert!(
             cmd.contains("kill -TERM -\"$p\""),
-            "pgid==pid 时应组杀 TERM: {cmd}"
+            "should group-kill TERM when pgid==pid: {cmd}"
         );
-        assert!(cmd.contains("kill -9 -\"$p\""), "组杀也应升级 -9: {cmd}");
+        assert!(
+            cmd.contains("kill -9 -\"$p\""),
+            "group kill should also escalate to -9: {cmd}"
+        );
         assert!(
             cmd.contains("kill \"$p\" 2>/dev/null || true"),
-            "pgid 不等回落单 pid 击杀: {cmd}"
+            "fall back to single-pid kill when pgid differs: {cmd}"
         );
     }
 
-    // issue #49: k12 daemonize 前必须 source 项目自身 .env (唯一真源, 覆盖 daemon
-    // env 快照旧 key); 文件缺失 fail-closed 拒启; 其他 Daemon 服务不带该段
+    // issue #49: k12 must source the project's own .env before daemonizing (single source of truth,
+    // overriding the daemon env snapshot's stale keys); a missing file fails closed; other Daemon
+    // services do not carry this segment
     #[test]
     fn test_issue49_k12_env_file_source_segment() {
-        // fusion_root() 读 FUSION_ROOT env — 与 config/runner 测试的 EnvGuard
-        // 互斥 (#134 CI flake: FUSION_ROOT 被并发改写时 seg 路径漂移)。
+        // fusion_root() reads the FUSION_ROOT env — mutually exclusive with the config/runner tests'
+        // EnvGuard (#134 CI flake: seg paths drift when FUSION_ROOT is concurrently rewritten).
         let _env = crate::env_map::tests::env_lock();
         let spec = start_spec_for("fusion-k12-teacher").unwrap();
         let StartSpec::Daemon {
@@ -1175,7 +1244,7 @@ mod tests {
             ..
         } = &spec
         else {
-            panic!("fusion-k12-teacher 应为带 env_file 的 Daemon spec");
+            panic!("fusion-k12-teacher should be a Daemon spec with env_file");
         };
         assert_eq!(env_file, "fusion-k12-teacher/.env");
 
@@ -1184,20 +1253,26 @@ mod tests {
             "set -a; [ -f '{p}' ] || exit 1; source '{p}'; set +a; ",
             p = fusion_root().join(env_file).display(),
         );
-        assert!(cmd.contains(&seg), "应带 fail-closed source 段: {cmd}");
-        // source 段须在 nohup 之前 (env 注入先于进程启动)
+        assert!(
+            cmd.contains(&seg),
+            "should carry the fail-closed source segment: {cmd}"
+        );
+        // the source segment must come before nohup (env injection precedes process start)
         assert!(
             cmd.find(&seg).unwrap() < cmd.find("nohup").unwrap(),
-            "source 段应在 nohup 前: {cmd}"
+            "the source segment should come before nohup: {cmd}"
         );
-        assert!(!cmd.contains("&& nohup"), "不得破坏 pid 纪律: {cmd}");
+        assert!(
+            !cmd.contains("&& nohup"),
+            "must not break the pid discipline: {cmd}"
+        );
 
-        // 无 env_file 的 Daemon 服务命令不含 source 段
+        // Daemon services without env_file must not contain the source segment
         let plain =
             daemon_start_cmd(&start_spec_for("fusion-bench").unwrap(), "fusion-bench").unwrap();
         assert!(
             !plain.contains("set -a;"),
-            "无 env_file 服务不应 source: {plain}"
+            "services without env_file should not source: {plain}"
         );
     }
 }

@@ -1,27 +1,30 @@
-// 依赖门: native 服务 → 其依赖的 compose sidecar 容器服务名。
-// up_native 启动前显式校验依赖容器 supervisor_state == Healthy, 不靠 layer 隐式顺序。
-// compose.enabled=false 时调用方跳过门 (无 compose 后端, 无依赖可等)。
+// Dependency gate: native service → compose sidecar container service names it depends on.
+// up_native explicitly validates each dependency container supervisor_state == Healthy
+// before starting; does not rely on implicit layer ordering.
+// When compose.enabled=false the caller skips the gate (no compose backend, nothing to wait on).
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-// native 服务名 → 依赖的 compose 容器服务名列表。
-// 仅列依赖 sidecar 的服务; 不在此表的 native 服务无门 (保持原行为)。
+// Native service name → dependent compose container service names.
+// Only lists services that depend on sidecars; native services not in this
+// table have no gate (existing behavior preserved).
 fn build_table() -> HashMap<&'static str, Vec<&'static str>> {
     let mut m = HashMap::new();
-    // app 层: identity 依赖 postgres
+    // app layer: identity depends on postgres
     m.insert("fusion-identity", vec!["postgres"]);
-    // platform 层: rag 依赖 qdrant
+    // platform layer: rag depends on qdrant
     m.insert("fusion-rag", vec!["qdrant"]);
-    // app 层: cowork 依赖 postgres + redis
+    // app layer: cowork depends on postgres + redis
     m.insert("fusion-cowork", vec!["postgres", "redis"]);
-    // platform 层: model-hub 依赖 postgres + redis
+    // platform layer: model-hub depends on postgres + redis
     m.insert("fusion-model-hub", vec!["postgres", "redis"]);
     m
 }
 
 static TABLE: OnceLock<HashMap<&'static str, Vec<&'static str>>> = OnceLock::new();
 
-// 返回该 native 服务依赖的 compose 容器服务名。无依赖返回空切片。
+// Returns the compose container service names this native service depends on.
+// Returns an empty slice when there are no dependencies.
 pub fn deps_for(name: &str) -> &'static [&'static str] {
     let table = TABLE.get_or_init(build_table);
     table.get(name).map(|v| v.as_slice()).unwrap_or(&[])

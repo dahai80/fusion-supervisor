@@ -11,8 +11,9 @@ pub enum Layer {
     Cluster,
 }
 
-// PRD fusion-supervisor-app-tiering-1029: 启动分级 (boot tier), 与 Layer 正交 —
-// Layer 管启动顺序, Tier 管是否开机自启。缺省 T2 (新服务不抢开机资源)。
+// PRD fusion-supervisor-app-tiering-1029: boot tiering, orthogonal to Layer —
+// Layer governs start order, Tier governs whether the service auto-starts on
+// boot. Default T2 (new services do not grab boot resources).
 #[derive(
     Debug,
     Clone,
@@ -49,18 +50,22 @@ pub struct ServiceDef {
     pub repo_dir: String,
     pub purpose: String,
     pub fixed: bool,
-    // issue #31: supervise: false 条目 (dev-only/k8s artifact/未建) 不进 runner,
-    // up/down/tick/status 全跳过 — 注册表噪声与真实故障分离。
+    // issue #31: supervise: false entries (dev-only/k8s artifact/not built) get
+    // no runner, up/down/tick/status all skip them — separating registry noise
+    // from real failures.
     pub managed: bool,
     pub layer: Layer,
-    // PRD app-tiering: 启动分级, 缺省 T2; supervise:false 豁免条目照常标注但不进 tier 操作面
+    // PRD app-tiering: boot tier, default T2; supervise:false exempt entries are
+    // still labeled but excluded from tier operations
     pub boot_tier: BootTier,
 }
 
 #[derive(Deserialize)]
 struct RegistryFile {
-    // 保留 YAML 源序: 同层同 fixed 时按注册表书写顺序启动 (mlx 先于 gateway)。
-    // BTreeMap 按键名字母序会颠倒核心基座顺序, 故用 IndexMap。
+    // Preserve YAML source order: with the same layer and fixed flag, services
+    // start in registry written order (mlx before gateway).
+    // BTreeMap's alphabetical key sort would invert the core base order, hence
+    // IndexMap.
     services: indexmap::IndexMap<String, ServiceEntry>,
 }
 
@@ -70,10 +75,11 @@ struct ServiceEntry {
     purpose: String,
     #[serde(default)]
     fixed: bool,
-    // issue #31: 显式豁免标记。默认 true (可托管); false = 不建 runner。
+    // issue #31: explicit exemption flag. Default true (managed); false = no runner.
     #[serde(default = "default_supervise")]
     supervise: bool,
-    // PRD app-tiering: 缺省 T2 (新注册服务默认不抢开机资源)
+    // PRD app-tiering: default T2 (newly registered services do not grab boot
+    // resources by default)
     #[serde(default)]
     boot: BootTier,
 }
@@ -82,20 +88,25 @@ fn default_supervise() -> bool {
     true
 }
 
-// registry key → 本地 repo 目录。绝大多数 key==dir, 例外在此。
-// sub-service key (fusion-cowork-ws) → 父 repo (fusion-cowork)。
+// Registry key -> local repo dir. Most keys equal their dir; exceptions here.
+// Sub-service key (fusion-cowork-ws) -> parent repo (fusion-cowork).
 pub fn name_to_dir(name: &str) -> &str {
-    // 已知拼写差异例外 + business 平台目录前缀 (issue #45: registry key 无 fusion-
-    // 前缀, 实际 repo 在 monorepo 根 business/ 子目录下, 默认映射 ~/fusion/<name> 不存在)
+    // Known spelling-difference exceptions + business-plane directory prefixes
+    // (issue #45: registry keys lack the fusion- prefix; the actual repos live
+    // under the monorepo root's business/ subdirectory, so the default
+    // ~/fusion/<name> mapping does not exist)
     static EXCEPTIONS: &[(&str, &str)] = &[
         ("fusion-code-modelization", "fusion-code-modenization"),
-        // issue #57: registry key 单数, 磁盘实际 repo 目录复数 fusion-multi-nodes
-        // (active v0.20.2, start.sh master 127.0.0.1:11452); 默认映射目录不存在
-        // → start 路径 fail-closed 长期 Failed
+        // issue #57: registry key singular, actual on-disk repo dir plural
+        // fusion-multi-nodes (active v0.20.2, start.sh master 127.0.0.1:11452);
+        // the default-mapped dir does not exist -> start path fail-closed,
+        // long-term Failed
         ("fusion-multi-node", "fusion-multi-nodes"),
-        // registry key 无 s, 磁盘 repo 目录带 s (fusion-models-hub, active v1.2.10,
-        // start.sh 11444) — 旧默认映射指向已不存在的 fusion-model-hub/, start 路径
-        // fail-closed, 服务长期只能手工拉起 (2026-10-31 11444 孤儿进程即手工残留)
+        // registry key without s, on-disk repo dir with s (fusion-models-hub,
+        // active v1.2.10, start.sh 11444) — the old default mapping pointed at the
+        // nonexistent fusion-model-hub/, start path fail-closed, the service could
+        // only be started manually (the 2026-10-31 11444 orphan process was such a
+        // manual leftover)
         ("fusion-model-hub", "fusion-models-hub"),
         ("ai-family", "business/ai-family"),
         // ai-fit: registry key + actual dir are both ai-fit (issue: boot
@@ -104,9 +115,11 @@ pub fn name_to_dir(name: &str) -> &str {
         ("ai-fit", "business/ai-fit"),
         ("ai-speech-exam", "business/ai-speech-exam"),
         ("ai-apparelmockup", "business/ai-apparelmockup"),
-        // issue #55: 2026-10-27/28 端口治理批量登记的 business 条目 — 默认映射
-        // ~/fusion/<key> 不存在, 全部落在 business/ 子目录 (charactervoice 双条目
-        // 与 customer-insight 双条目各自共享同一 repo; ai-OperaBase 目录大小写特殊)。
+        // issue #55: business entries batch-registered in the 2026-10-27/28 port
+        // governance sweep — the default ~/fusion/<key> mapping does not exist;
+        // they all live under the business/ subdirectory (the two charactervoice
+        // entries and the two customer-insight entries each share one repo;
+        // ai-OperaBase has a case-unusual directory name).
         ("ai-ads-videobuilder", "business/ai-ads-videobuilder"),
         ("ai-doc-automation", "business/ai-doc-automation"),
         ("ai-information-search", "business/ai-information-search"),
@@ -116,16 +129,18 @@ pub fn name_to_dir(name: &str) -> &str {
         ("customer-insight", "business/ai-customer-insight"),
         ("customer-insight-api", "business/ai-customer-insight"),
         ("ai-apparelmockup-web", "business/ai-apparelmockup"),
-        // issue #83: AI 试衣后端 (11515), repo 在 business/ai-trysuite;
-        // 根 start.sh 是 wrapper, exec 委托 server/start.sh
+        // issue #83: AI try-on backend (11515), repo at business/ai-trysuite;
+        // the root start.sh is a wrapper whose exec delegates to server/start.sh
         ("ai-trysuite", "business/ai-trysuite"),
-        // issue #88: venv 重建后 fleet 审计发现的两条 business 条目 —
-        // 默认映射 ~/fusion/<key> 不存在, start fail-closed (脚本不存在),
-        // registry key 无 fusion- 前缀, repo 落在 business/ 子目录
+        // issue #88: two business entries found by the post-venv-rebuild fleet
+        // audit — the default ~/fusion/<key> mapping does not exist, start
+        // fail-closed (script missing); registry keys lack the fusion- prefix,
+        // repos live under the business/ subdirectory
         ("ai-assistant-agent", "business/ai-assistant-agent"),
         ("ai-lead-qualifier", "business/ai-lead-qualifier"),
-        // issue #94: 同 #88 类 — registry key 无前缀, repo 在 business/ 子目录,
-        // 默认映射 ~/fusion/<key> 不存在, start fail-closed "脚本不存在"
+        // issue #94: same class as #88 — registry key without prefix, repo under
+        // the business/ subdirectory, default ~/fusion/<key> mapping does not
+        // exist, start fail-closed "script missing"
         ("ai-booking-agent", "business/ai-booking-agent"),
     ];
     for (key, dir) in EXCEPTIONS {
@@ -133,34 +148,41 @@ pub fn name_to_dir(name: &str) -> &str {
             return dir;
         }
     }
-    // 子服务 key: fusion-cowork-ws / fusion-security-svc / fusion-multi-node-agent 等 → 父 repo。
-    // (prefix, dir) 二元组: prefix 匹配子服务 key, dir 是父 repo 实际目录 —
-    // issue #57: fusion-multi-node-agent 等 supervise:false 条目若被 logs/start_sh_path
-    // 解析, 也要落进真实存在的 fusion-multi-nodes 目录而非不存在的单数目录
+    // Sub-service keys: fusion-cowork-ws / fusion-security-svc /
+    // fusion-multi-node-agent etc -> parent repo.
+    // (prefix, dir) pairs: prefix matches the sub-service key, dir is the parent
+    // repo's actual directory —
+    // issue #57: supervise:false entries like fusion-multi-node-agent, if resolved
+    // by logs/start_sh_path, must land in the real fusion-multi-nodes directory,
+    // not the nonexistent singular one
     for (parent, dir) in &[
         ("fusion-cowork", "fusion-cowork"),
         ("fusion-security", "fusion-security"),
-        // issue #57: 父 repo 目录复数, prefix 仍按 registry key 单数匹配
+        // issue #57: parent repo dir is plural, prefix still matches the singular
+        // registry key
         ("fusion-multi-node", "fusion-multi-nodes"),
         ("fusion-agent-studio", "fusion-agent-studio"),
         ("fusion-simulation", "fusion-simulation"),
         ("fusion-bench", "fusion-bench"),
-        // issue #29: fusion-trainer-bridge → fusion-trainer;
-        // fusion-plugins-ecosystem-console → fusion-plugins-ecosystem
+        // issue #29: fusion-trainer-bridge -> fusion-trainer;
+        // fusion-plugins-ecosystem-console -> fusion-plugins-ecosystem
         ("fusion-trainer", "fusion-trainer"),
         ("fusion-plugins-ecosystem", "fusion-plugins-ecosystem"),
-        // osagent issue#6: registry 只有 fusion-osagent-metrics 子服务 key,
-        // 磁盘 repo 是 fusion-osagent (无 start.sh, 启动见 start_map Daemon spec)
+        // osagent issue#6: the registry only has the fusion-osagent-metrics
+        // sub-service key; the on-disk repo is fusion-osagent (no start.sh, see
+        // the start_map Daemon spec for startup)
         ("fusion-osagent", "fusion-osagent"),
-        // issue #81: fusion-office-api 子服务 → 父 repo fusion-office。
-        // 根 start.sh 只管 11485 shell; api 生命周期脚本在 services/office-api/
-        // (启动走 start_map Script spec), name_to_dir 默认映射指向不存在的
-        // fusion-office-api/ 目录 (logs/start_sh_path 兜底路径 fail-closed)
+        // issue #81: fusion-office-api sub-service -> parent repo fusion-office.
+        // The root start.sh only manages the 11485 shell; the api lifecycle script
+        // lives in services/office-api/ (started via the start_map Script spec);
+        // name_to_dir's default mapping points at the nonexistent
+        // fusion-office-api/ directory (logs/start_sh_path fallback fail-closed)
         ("fusion-office", "fusion-office"),
-        // issue #147: fusion-drama-backend 子服务 → 父 repo fusion-drama。
-        // registry key 是子服务 (fusion-drama#14 打开 supervise), 磁盘 repo 是
-        // fusion-drama (根 start.sh start|stop|restart|status|log + pidfile +
-        // /api/v1/health wait), 默认映射指向不存在的 fusion-drama-backend/ 目录
+        // issue #147: fusion-drama-backend sub-service -> parent repo fusion-drama.
+        // The registry key is the sub-service (supervise turned on by
+        // fusion-drama#14); the on-disk repo is fusion-drama (root start.sh
+        // start|stop|restart|status|log + pidfile + /api/v1/health wait); the
+        // default mapping points at the nonexistent fusion-drama-backend/ directory
         ("fusion-drama", "fusion-drama"),
     ] {
         if name.starts_with(parent) && name.len() > parent.len() {
@@ -210,9 +232,10 @@ fn is_domain(name: &str) -> bool {
 
 pub struct ServiceManifest;
 
-// issue #96: 服务名→注册端口快照 (daemon 启动时 new() 灌入)。daemon_stop_cmd
-// 的端口锚定孤儿兜底 (lsof kill) 需要 port, 而 exec 路径 (free fn) 拿不到
-// ServiceDef — 走 dep_map/probe_map 同款 OnceLock 全局表模式。
+// issue #96: service-name -> registered-port snapshot (populated by new() at
+// daemon start). daemon_stop_cmd's port-anchored orphan fallback (lsof kill)
+// needs the port, but exec paths (free fns) cannot reach ServiceDef — hence the
+// dep_map/probe_map-style OnceLock global table.
 static PORT_MAP: std::sync::OnceLock<std::collections::HashMap<String, u16>> =
     std::sync::OnceLock::new();
 
@@ -229,15 +252,15 @@ pub fn registered_port(svc: &str) -> Option<u16> {
 impl ServiceManifest {
     pub fn load(path: &Path) -> Result<Vec<ServiceDef>> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("读注册表失败: {}", path.display()))?;
+            .with_context(|| format!("failed to read registry: {}", path.display()))?;
         let reg: RegistryFile = serde_yaml::from_str(&text)
-            .with_context(|| format!("解析注册表失败: {}", path.display()))?;
+            .with_context(|| format!("failed to parse registry: {}", path.display()))?;
         let defs = reg
             .services
             .into_iter()
             .map(|(name, entry)| {
                 if !entry.supervise {
-                    tracing::info!(svc = %name, "registry 标记 supervise: false, 跳过托管 (dev-only/external/planned)");
+                    tracing::info!(svc = %name, "registry marked supervise: false, skipping management (dev-only/external/planned)");
                 }
                 ServiceDef {
                     repo_dir: name_to_dir(&name).to_string(),
@@ -256,7 +279,7 @@ impl ServiceManifest {
 
     pub fn sort_by_layer(mut defs: Vec<ServiceDef>) -> Vec<ServiceDef> {
         defs.sort_by(|a, b| {
-            // fixed 强制最先, 然后 layer
+            // fixed forces first, then layer
             match (a.fixed, b.fixed) {
                 (true, false) => return std::cmp::Ordering::Less,
                 (false, true) => return std::cmp::Ordering::Greater,
@@ -298,27 +321,27 @@ mod tests {
 services:
   fusion-mlx:
     port: 11434
-    purpose: 本地推理引擎
+    purpose: local inference engine
     fixed: true
   fusion-gateway:
     port: 11432
-    purpose: 网关
+    purpose: gateway
     fixed: true
   fusion-rag:
     port: 11436
-    purpose: 向量知识库
+    purpose: vector knowledge base
     fixed: false
   fusion-code-modelization:
     port: 11459
-    purpose: 代码建模
+    purpose: code modelization
     fixed: false
   fusion-multi-node:
     port: 11452
-    purpose: 集群 Master
+    purpose: cluster master
     fixed: false
   fusion-web-shell:
     port: 11430
-    purpose: 样例豁免条目
+    purpose: sample exempt entry
     fixed: false
     supervise: false
 reserved: []
@@ -352,26 +375,27 @@ external_tools: []
         assert_eq!(load_or_empty(tmp.path()).len(), 6);
     }
 
-    // issue #31: supervise 标记 — 默认 true, 显式 false 豁免
+    // issue #31: supervise flag — default true, explicit false exempts
     #[test]
     fn test_supervise_flag_default_and_exemption() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), FAKE_REGISTRY).unwrap();
         let defs = ServiceManifest::load(tmp.path()).unwrap();
         let rag = defs.iter().find(|d| d.name == "fusion-rag").unwrap();
-        assert!(rag.managed, "未标 supervise 的条目默认可托管");
+        assert!(rag.managed, "entries without supervise default to managed");
         let web_shell = defs.iter().find(|d| d.name == "fusion-web-shell").unwrap();
-        assert!(!web_shell.managed, "supervise: false 应豁免");
+        assert!(!web_shell.managed, "supervise: false should exempt");
     }
 
-    // issue #91: boot tier 解析 — 显式 T1 生效, 缺省 T2 (菜单常驻服务需开机自启)
+    // issue #91: boot tier parsing — explicit T1 takes effect, default T2
+    // (menu-resident services need boot autostart)
     #[test]
     fn test_boot_tier_parse_default_and_explicit() {
         const REG: &str = r#"
 services:
   fusion-mlx:
     port: 11434
-    purpose: 推理
+    purpose: inference
     fixed: true
     boot: T0
   fusion-trainer-bridge:
@@ -380,7 +404,7 @@ services:
     boot: T1
   fusion-health:
     port: 11471
-    purpose: 健康助手
+    purpose: health assistant
 reserved: []
 external_tools: []
 "#;
@@ -393,9 +417,13 @@ external_tools: []
             .iter()
             .find(|d| d.name == "fusion-trainer-bridge")
             .unwrap();
-        assert_eq!(bridge.boot_tier, BootTier::T1, "显式 boot: T1 应生效");
+        assert_eq!(
+            bridge.boot_tier,
+            BootTier::T1,
+            "explicit boot: T1 should take effect"
+        );
         let health = defs.iter().find(|d| d.name == "fusion-health").unwrap();
-        assert_eq!(health.boot_tier, BootTier::T2, "缺省应 T2");
+        assert_eq!(health.boot_tier, BootTier::T2, "default should be T2");
     }
 
     #[test]
@@ -406,42 +434,46 @@ external_tools: []
         );
         assert_eq!(name_to_dir("fusion-mlx"), "fusion-mlx");
         assert_eq!(name_to_dir("fusion-cowork-ws"), "fusion-cowork");
-        // issue #81: office-api 落父 repo fusion-office (默认映射目录不存在)
+        // issue #81: office-api lands in parent repo fusion-office (default
+        // mapped directory does not exist)
         assert_eq!(name_to_dir("fusion-office-api"), "fusion-office");
     }
 
-    // issue #45: business 平台服务 → business/ 子目录
+    // issue #45: business-plane services -> business/ subdirectory
     #[test]
     fn test_name_to_dir_business_plane() {
         assert_eq!(name_to_dir("ai-family"), "business/ai-family");
         assert_eq!(name_to_dir("ai-fit"), "business/ai-fit");
         assert_eq!(name_to_dir("ai-speech-exam"), "business/ai-speech-exam");
         assert_eq!(name_to_dir("ai-apparelmockup"), "business/ai-apparelmockup");
-        // issue #55: 2026-10-27/28 批量登记条目 (含大小写特殊与共享 repo 双条目)
+        // issue #55: batch-registered entries from 2026-10-27/28 (including the
+        // case-unusual dir and shared-repo dual entries)
         assert_eq!(
             name_to_dir("ai-OperaBase"),
             "business/ai-OperaBase",
-            "目录大小写特殊"
+            "directory name has unusual casing"
         );
         assert_eq!(
             name_to_dir("ai-charactervoice-session"),
             "business/ai-charactervoice",
-            "session 与 api 共享 repo"
+            "session and api share one repo"
         );
         assert_eq!(
             name_to_dir("customer-insight-api"),
             "business/ai-customer-insight",
-            "api 与 web 共享 repo"
+            "api and web share one repo"
         );
         assert_eq!(
             name_to_dir("ai-ads-videobuilder"),
             "business/ai-ads-videobuilder"
         );
-        // issue #83: AI 试衣后端, 根 start.sh 是 wrapper 委托 server/start.sh
+        // issue #83: AI try-on backend; the root start.sh is a wrapper delegating
+        // to server/start.sh
         assert_eq!(name_to_dir("ai-trysuite"), "business/ai-trysuite");
     }
 
-    // issue #29: shell-ecosystem 子服务 → 父 repo; 父名本身 → 自身
+    // issue #29: shell-ecosystem sub-services -> parent repo; a parent name itself
+    // -> itself
     #[test]
     fn test_name_to_dir_shell_ecosystem() {
         assert_eq!(name_to_dir("fusion-trainer-bridge"), "fusion-trainer");
@@ -456,9 +488,10 @@ external_tools: []
         );
     }
 
-    // issue #57: registry key fusion-multi-node 单数, 磁盘 repo 目录复数
-    // fusion-multi-nodes — 裸 key 走 EXCEPTIONS, 子服务 key 走 prefix 循环, 两者都必须
-    // 落进真实存在的复数目录 (否则 start 路径 fail-closed 长期 Failed)
+    // issue #57: registry key fusion-multi-node is singular, the on-disk repo dir
+    // is plural (fusion-multi-nodes) — the bare key goes through EXCEPTIONS, the
+    // sub-service keys through the prefix loop; both must land in the real plural
+    // directory (otherwise the start path fail-closes as long-term Failed)
     #[test]
     fn test_name_to_dir_multi_node_plural_dir() {
         assert_eq!(name_to_dir("fusion-multi-node"), "fusion-multi-nodes");
@@ -466,15 +499,17 @@ external_tools: []
         assert_eq!(name_to_dir("fusion-multi-node-mcp"), "fusion-multi-nodes");
     }
 
-    // fusion-model-hub: registry key 无 s, 磁盘 repo 目录带 s — 默认映射指向
-    // 不存在的 fusion-model-hub/, start 路径 fail-closed
+    // fusion-model-hub: registry key without s, on-disk repo dir with s — the
+    // default mapping points at the nonexistent fusion-model-hub/, start path
+    // fail-closed
     #[test]
     fn test_name_to_dir_model_hub_plural_dir() {
         assert_eq!(name_to_dir("fusion-model-hub"), "fusion-models-hub");
     }
 
-    // issue #88: fleet 审计发现的两条 business 条目 — 默认映射指向不存在的
-    // 根目录 <key>/, repo 实际在 business/ 子目录下
+    // issue #88: two business entries found by the fleet audit — the default
+    // mapping points at the nonexistent root <key>/ dirs; the repos actually live
+    // under the business/ subdirectory
     #[test]
     fn test_name_to_dir_issue88_business_entries() {
         assert_eq!(
@@ -485,26 +520,30 @@ external_tools: []
             name_to_dir("ai-lead-qualifier"),
             "business/ai-lead-qualifier"
         );
-        // issue #94: booking agent 同类 (默认映射 start fail-closed "脚本不存在")
+        // issue #94: booking agent, same class (default-mapped start fail-closed
+        // "script missing")
         assert_eq!(name_to_dir("ai-booking-agent"), "business/ai-booking-agent");
     }
 
-    // osagent issue#6: fusion-osagent-metrics 子服务 key 落真实 repo 目录
-    // fusion-osagent (start 路径不再指向不存在的 fusion-osagent-metrics/)
+    // osagent issue#6: the fusion-osagent-metrics sub-service key lands in the
+    // real repo directory fusion-osagent (start path no longer points at the
+    // nonexistent fusion-osagent-metrics/)
     #[test]
     fn test_name_to_dir_osagent_metrics_parent() {
         assert_eq!(name_to_dir("fusion-osagent-metrics"), "fusion-osagent");
     }
 
-    // issue #147: fusion-drama-backend 子服务 key → 父 repo fusion-drama
-    // (start 路径不再指向不存在的 fusion-drama-backend/ 目录)
+    // issue #147: fusion-drama-backend sub-service key -> parent repo
+    // fusion-drama (start path no longer points at the nonexistent
+    // fusion-drama-backend/ directory)
     #[test]
     fn test_name_to_dir_drama_backend_parent() {
         assert_eq!(name_to_dir("fusion-drama-backend"), "fusion-drama");
     }
 
-    // issue #29: 四个 shell 模块服务应落 App 层 (gateway 在 Core 层先起,
-    // 满足 "gateway 先于模块" 的注册依赖顺序)
+    // issue #29: the four shell module services should land in the App layer
+    // (gateway starts first in the Core layer, satisfying the "gateway before
+    // modules" registration order dependency)
     #[test]
     fn test_shell_ecosystem_layer_app_after_core() {
         assert!(matches!(layer_of("fusion-cowork-web"), Layer::App));
@@ -556,7 +595,8 @@ external_tools: []
         );
     }
 
-    // PRD app-tiering: boot 字段解析 — 缺省 T2, 显式 T0/T1 生效, 非法值报错
+    // PRD app-tiering: boot field parsing — default T2, explicit T0/T1 take
+    // effect, illegal values error
     #[test]
     fn test_boot_tier_default_t2() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -564,7 +604,11 @@ external_tools: []
         let defs = ServiceManifest::load(tmp.path()).unwrap();
         for name in ["fusion-mlx", "fusion-rag", "fusion-multi-node"] {
             let d = defs.iter().find(|d| d.name == name).unwrap();
-            assert_eq!(d.boot_tier, BootTier::T2, "{name} 无 boot 字段应缺省 T2");
+            assert_eq!(
+                d.boot_tier,
+                BootTier::T2,
+                "{name} without a boot field should default to T2"
+            );
         }
     }
 
@@ -574,16 +618,16 @@ external_tools: []
 services:
   fusion-mlx:
     port: 11434
-    purpose: 推理
+    purpose: inference
     fixed: true
     boot: T0
   fusion-rag:
     port: 11436
-    purpose: 知识库
+    purpose: knowledge base
     boot: T1
   fusion-health:
     port: 11471
-    purpose: 健康
+    purpose: health
     boot: T2
 reserved: []
 external_tools: []
@@ -605,7 +649,7 @@ external_tools: []
 services:
   fusion-mlx:
     port: 11434
-    purpose: 推理
+    purpose: inference
     boot: T9
 reserved: []
 external_tools: []
@@ -614,7 +658,7 @@ external_tools: []
         std::fs::write(tmp.path(), yaml).unwrap();
         assert!(
             ServiceManifest::load(tmp.path()).is_err(),
-            "T9 非法枚举应解析失败"
+            "T9 is an illegal enum value and should fail to parse"
         );
     }
 
