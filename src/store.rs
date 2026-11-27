@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
-// Connection 是 Send 但 !Sync (内含 RefCell)。tick (async) 持 &HistoryStore 跨 .await,
-// 需 &HistoryStore: Send → HistoryStore: Sync。包 std::sync::Mutex 使其 Send+Sync,
-// 解锁 daemon tick 循环的 tokio::spawn (C1)。SQLite 连接本就单线程访问, Mutex 显式化。
+// Connection is Send but !Sync (contains a RefCell). The tick loop (async) holds
+// &HistoryStore across .await, which requires &HistoryStore: Send → HistoryStore: Sync.
+// Wrap in std::sync::Mutex to make it Send+Sync, unlocking the tokio::spawn in the
+// daemon tick loop (C1). SQLite connections are inherently single-threaded; the
+// Mutex makes that explicit.
 pub struct HistoryStore {
     pub conn: std::sync::Mutex<Connection>,
 }
@@ -24,11 +26,12 @@ pub struct EventRow {
     pub kind: String,
     pub detail: String,
     pub plane: String,
-    // issue #37: 事件严重级 (warn/error/info), 旧库迁移默认 warn
+    // issue #37: event severity (warn/error/info), defaults to warn on old-DB migration
     pub severity: String,
 }
 
-// PRD app-tiering: 个人启动覆盖。pin 覆盖 > 注册表 boot: 字段; 存本机 SQLite, 重启不丢。
+// PRD app-tiering: per-service boot override. Pin override > registry boot: field;
+// stored in local SQLite, survives restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinMode {
     Auto,
@@ -83,7 +86,7 @@ impl HistoryStore {
                  service TEXT PRIMARY KEY,
                  mode TEXT NOT NULL
              );
-             -- issue #113: 跨重启持久化调度元数据 (last_backup_ts 等), 防 reload 重触发。
+             -- issue #113: persist scheduling metadata (last_backup_ts etc.) across restarts.
              CREATE TABLE IF NOT EXISTS meta (
                  key TEXT PRIMARY KEY,
                  value INTEGER NOT NULL
@@ -91,10 +94,12 @@ impl HistoryStore {
              CREATE INDEX IF NOT EXISTS idx_health_svc ON health_check(service, ts);
              CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
         )?;
-        // 迁移: 旧库表无 plane 列 → ALTER 补列 (幂等, SQLite 无 ADD COLUMN IF NOT EXISTS,
-        // 靠错误吞掉重复列)。旧行默认 'native' (DEFAULT 子句)。
+        // Migration: old DBs lack the plane column → ALTER ADD COLUMN (idempotent; SQLite
+        // has no ADD COLUMN IF NOT EXISTS, so we swallow the duplicate-column error).
+        // Existing rows default to 'native' via the DEFAULT clause.
         migrate_add_plane(&conn)?;
-        // issue #37: 旧库 event 表无 severity 列 → 同法补列, 旧行默认 'warn'。
+        // issue #37: old DBs' event table lacks the severity column → same approach,
+        // existing rows default to 'warn'.
         migrate_add_severity(&conn)?;
         tracing::info!(db = %path.display(), "history store open (WAL)");
         Ok(Self {
@@ -102,7 +107,8 @@ impl HistoryStore {
         })
     }
 
-    // issue #113: meta 读写 — daemon 重启后恢复 last_backup_ts 等调度游标。
+    // issue #113: meta read/write — restore last_backup_ts and other scheduling cursors
+    // after a daemon restart.
     pub fn get_meta(&self, key: &str) -> Option<u64> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(
@@ -161,9 +167,10 @@ impl HistoryStore {
         Ok(())
     }
 
-    // issue #112: 每服务最近一次 restart 类事件 (AutoRestart/ManualStart/ManualStop)。
-    // status 表 last_restart 列数据源 — 事后可答 "这服务最近谁拉起的/谁停的"。
-    // detail 截 80 字符防表格爆行; 无记录的服务不在 map 里。
+    // issue #112: most recent restart-kind event per service (AutoRestart/ManualStart/ManualStop).
+    // Data source for the status table's last_restart column — answers "who last started/stopped
+    // this service" after the fact. Detail truncated to 80 chars to keep table rows short;
+    // services without a record are absent from the map.
     pub fn last_restart_map(&self) -> std::collections::HashMap<String, String> {
         let mut out = std::collections::HashMap::new();
         let conn = self.conn.lock().unwrap();
@@ -246,7 +253,8 @@ impl HistoryStore {
             .map_err(Into::into)
     }
 
-    // PRD app-tiering: 写/清个人启动覆盖。None = 清除 (回到注册表 boot: 字段语义)。
+    // PRD app-tiering: write/clear a boot pin override. None = clear (fall back to the
+    // registry boot: field semantics).
     pub fn set_boot_pin(&self, service: &str, mode: Option<PinMode>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         match mode {
@@ -286,7 +294,8 @@ impl HistoryStore {
             .collect())
     }
 
-    // issue #25: 全局事件流 (web 告警列表数据源) — 跨服务最近事件, 时间升序返回。
+    // issue #25: global event stream (data source for the web alerts list) — recent
+    // events across services, returned in ascending time order.
     pub fn recent_events_all(&self, limit: u32) -> Result<Vec<EventRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -310,8 +319,9 @@ impl HistoryStore {
     }
 }
 
-// 迁移: 旧库表无 plane 列 → ALTER ADD COLUMN。SQLite 无 IF NOT EXISTS,
-// 靠吞 "duplicate column name" 错误实现幂等。旧行 DEFAULT 'native'。
+// Migration: old DBs lack the plane column → ALTER ADD COLUMN. SQLite has no
+// IF NOT EXISTS for columns; idempotency comes from swallowing the
+// "duplicate column name" error. Existing rows get DEFAULT 'native'.
 fn migrate_add_plane(conn: &Connection) -> Result<()> {
     for table in ["health_check", "event"] {
         let sql = format!("ALTER TABLE {table} ADD COLUMN plane TEXT NOT NULL DEFAULT 'native'");
@@ -319,11 +329,12 @@ fn migrate_add_plane(conn: &Connection) -> Result<()> {
             Ok(_) => {
                 tracing::info!(%table, "migrate: add plane column");
             }
-            // SQLite 无 ADD COLUMN IF NOT EXISTS, 重复列报 "duplicate column name" → 吞掉
+            // SQLite has no ADD COLUMN IF NOT EXISTS; a duplicate column reports
+            // "duplicate column name" → swallow it
             Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
                 if msg.contains("duplicate column") =>
             {
-                tracing::debug!(%table, "migrate: plane column 已存在, 跳过");
+                tracing::debug!(%table, "migrate: plane column already exists, skipping");
             }
             Err(e) => return Err(e.into()),
         }
@@ -331,8 +342,8 @@ fn migrate_add_plane(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// issue #37: 旧库 event 表无 severity 列 → ALTER ADD COLUMN, 同 migrate_add_plane 模式。
-// 旧行默认 'warn' (DEFAULT 子句)。
+// issue #37: old DBs' event table lacks the severity column → ALTER ADD COLUMN,
+// same pattern as migrate_add_plane. Existing rows default to 'warn' (DEFAULT clause).
 fn migrate_add_severity(conn: &Connection) -> Result<()> {
     match conn.execute(
         "ALTER TABLE event ADD COLUMN severity TEXT NOT NULL DEFAULT 'warn'",
@@ -342,7 +353,7 @@ fn migrate_add_severity(conn: &Connection) -> Result<()> {
             tracing::info!("migrate: add severity column");
         }
         Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {
-            tracing::debug!("migrate: severity column 已存在, 跳过");
+            tracing::debug!("migrate: severity column already exists, skipping");
         }
         Err(e) => return Err(e.into()),
     }
@@ -358,8 +369,8 @@ mod tests {
         HistoryStore::open(tmp.path()).unwrap()
     }
 
-    // issue #112: last_restart_map — 只取 restart 类 kind, 每服务留最新一条,
-    // detail 截断, 其他 kind 不入 map
+    // issue #112: last_restart_map — only restart-kind kinds, newest entry per service,
+    // detail truncated, other kinds excluded from the map
     #[test]
     fn test_last_restart_map() {
         let s = open_mem();
@@ -373,7 +384,7 @@ mod tests {
             .unwrap();
         let m = s.last_restart_map();
         assert_eq!(m.len(), 2);
-        // svc-a 取 MAX(ts)=200 的 AutoRestart 行, detail 截 80 字符
+        // svc-a picks the MAX(ts)=200 AutoRestart row, detail truncated at 80 chars
         let a = &m["svc-a"];
         assert!(
             a.starts_with("AutoRestart auto-recovery restart ok"),
@@ -381,16 +392,21 @@ mod tests {
         );
         assert!(
             a.contains("new_pid=2"),
-            "应是 ts=200 的 AutoRestart 行: {a}"
+            "expected the ts=200 AutoRestart row: {a}"
         );
-        assert!(a.len() <= 11 + 1 + 80, "detail 应截 80: len={}", a.len());
+        assert!(
+            a.len() <= 11 + 1 + 80,
+            "detail should truncate at 80: len={}",
+            a.len()
+        );
         assert_eq!(m["svc-b"], "ManualStart cli up");
-        // 空库 → 空 map
+        // empty DB → empty map
         let s2 = open_mem();
         assert!(s2.last_restart_map().is_empty());
     }
 
-    // issue #113: meta 读写 + 重开库持久化 — reload 恢复 last_backup_ts 不重触发备份
+    // issue #113: meta read/write + persistence across reopen — reload restores
+    // last_backup_ts without re-triggering a backup
     #[test]
     fn test_meta_roundtrip_and_persist() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -398,14 +414,14 @@ mod tests {
         assert_eq!(s.get_meta("last_backup_ts"), None);
         s.set_meta("last_backup_ts", 123456);
         assert_eq!(s.get_meta("last_backup_ts"), Some(123456));
-        // 覆盖写
+        // overwrite
         s.set_meta("last_backup_ts", 234567);
         assert_eq!(s.get_meta("last_backup_ts"), Some(234567));
-        // 重开 (同一文件) → 值仍在
+        // reopen (same file) → value persists
         drop(s);
         let s2 = HistoryStore::open(tmp.path()).unwrap();
         assert_eq!(s2.get_meta("last_backup_ts"), Some(234567));
-        // 无关 key 不串
+        // unrelated keys stay isolated
         assert_eq!(s2.get_meta("other"), None);
     }
 
@@ -484,7 +500,8 @@ mod tests {
         assert_eq!(rows[0].latency_ms, 2);
     }
 
-    // issue #37: 过期 event 行也被 sweep 清除, 近期行保留 (health+event 两表都裁)
+    // issue #37: expired event rows are also swept, recent rows retained (both
+    // health and event tables are pruned)
     #[test]
     fn test_cleanup_old_prunes_events_too() {
         let s = open_mem();
@@ -497,9 +514,9 @@ mod tests {
         s.record_health("fusion-rag", "healthy", 1, old, "native")
             .unwrap();
         let deleted = s.cleanup_old(now, 7).unwrap();
-        assert_eq!(deleted, 2, "旧 health 行 + 旧 event 行");
+        assert_eq!(deleted, 2, "old health row + old event row");
         let ev = s.recent_events("fusion-rag", 10).unwrap();
-        assert_eq!(ev.len(), 1, "近期 event 行保留");
+        assert_eq!(ev.len(), 1, "recent event row retained");
         assert_eq!(ev[0].detail, "new");
     }
 
@@ -516,7 +533,7 @@ mod tests {
         assert_eq!(rows.len(), 0);
     }
 
-    // compose plane 写入与 native 并存, 查询应正确返回各自 plane
+    // compose-plane writes coexist with native; queries must return each plane correctly
     #[test]
     fn test_history_query_merges_planes() {
         let s = open_mem();
@@ -526,15 +543,15 @@ mod tests {
             .unwrap();
         s.record_health("fusion-mlx", "healthy", 3, 150, "native")
             .unwrap();
-        // compose 容器健康行
+        // compose container health rows
         let compose_rows = s.recent_health("redis", 10).unwrap();
         assert_eq!(compose_rows.len(), 2);
         assert_eq!(compose_rows[0].plane, "compose");
-        // native 健康行
+        // native health rows
         let native_rows = s.recent_health("fusion-mlx", 10).unwrap();
         assert_eq!(native_rows.len(), 1);
         assert_eq!(native_rows[0].plane, "native");
-        // event 跨 plane
+        // events across planes
         s.record_event(
             "redis",
             "ContainerCrashLoop",
@@ -559,12 +576,12 @@ mod tests {
         assert_eq!(ev_native[0].plane, "native");
     }
 
-    // 旧库 (无 plane 列) 打开后迁移应补列, 旧行默认 native
+    // opening an old DB (no plane column) should migrate and add the column, existing rows default to native
     #[test]
     fn test_migration_defaults_existing_rows_native() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path();
-        // 先建无 plane 列的旧库并写一行
+        // build an old-style DB without the plane column and insert one row
         {
             let conn = Connection::open(path).unwrap();
             conn.execute_batch(
@@ -587,34 +604,43 @@ mod tests {
             )
             .unwrap();
         }
-        // 重新 open 触发迁移
+        // reopen to trigger the migration
         let s = HistoryStore::open(path).unwrap();
         let rows = s.recent_health("fusion-mlx", 10).unwrap();
-        assert_eq!(rows.len(), 1, "旧行应保留");
-        assert_eq!(rows[0].plane, "native", "旧行 plane 默认 native");
+        assert_eq!(rows.len(), 1, "existing row retained");
+        assert_eq!(
+            rows[0].plane, "native",
+            "existing row plane defaults to native"
+        );
         assert_eq!(rows[0].latency_ms, 7);
         let ev = s.recent_events("fusion-rag", 10).unwrap();
         assert_eq!(ev.len(), 1);
-        assert_eq!(ev[0].plane, "native", "旧 event 行 plane 默认 native");
-        assert_eq!(ev[0].severity, "warn", "旧 event 行 severity 默认 warn");
-        // 迁移后再写新行, plane 显式 compose
+        assert_eq!(
+            ev[0].plane, "native",
+            "existing event row plane defaults to native"
+        );
+        assert_eq!(
+            ev[0].severity, "warn",
+            "existing event row severity defaults to warn"
+        );
+        // after migration, write a new row with an explicit compose plane
         s.record_health("redis", "healthy", 1, 2000, "compose")
             .unwrap();
         let new_rows = s.recent_health("redis", 10).unwrap();
         assert_eq!(new_rows[0].plane, "compose");
     }
 
-    // PRD app-tiering: boot_pin 存取 — set/get/覆盖/清除/全量
+    // PRD app-tiering: boot_pin access — set/get/overwrite/clear/all
     #[test]
     fn test_boot_pin_set_get_clear() {
         let s = open_mem();
-        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), None, "无 pin 记录");
+        assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), None, "no pin record");
         s.set_boot_pin("fusion-rag", Some(PinMode::Auto)).unwrap();
         assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), Some(PinMode::Auto));
-        // 覆盖写
+        // overwrite
         s.set_boot_pin("fusion-rag", Some(PinMode::Manual)).unwrap();
         assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), Some(PinMode::Manual));
-        // 清除 = 回到注册表语义
+        // clear = fall back to registry semantics
         s.set_boot_pin("fusion-rag", None).unwrap();
         assert_eq!(s.get_boot_pin("fusion-rag").unwrap(), None);
     }
@@ -628,7 +654,7 @@ mod tests {
             s.set_boot_pin("fusion-health", Some(PinMode::Manual))
                 .unwrap();
         }
-        // 重开 (模拟 daemon 重启) — pin 不丢 (验收 §5.4)
+        // reopen (simulates a daemon restart) — pins survive (acceptance §5.4)
         let s = HistoryStore::open(tmp.path()).unwrap();
         let mut pins = s.all_boot_pins().unwrap();
         pins.sort();

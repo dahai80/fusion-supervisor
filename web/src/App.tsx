@@ -48,12 +48,12 @@ export function App() {
     );
 }
 
-// issue #95: 双语导航 (zh 优先 — shell 默认语言)。
+// issue #95: bilingual nav (zh first — shell default language).
 const NAV_ITEMS: Array<{ id: Route; zh: string; en: string }> = [
-    { id: "services", zh: "服务", en: "Services" },
-    { id: "health", zh: "健康", en: "Health" },
-    { id: "alerts", zh: "告警", en: "Alerts" },
-    { id: "ops", zh: "运维", en: "Ops" },
+    { id: "services", zh: "服务", en: "Services" }, // i18n: user-facing
+    { id: "health", zh: "健康", en: "Health" }, // i18n: user-facing
+    { id: "alerts", zh: "告警", en: "Alerts" }, // i18n: user-facing
+    { id: "ops", zh: "运维", en: "Ops" }, // i18n: user-facing
 ];
 
 function EmbeddedTabs({

@@ -1,22 +1,25 @@
-// compose 平面: 包装 docker compose 命令, 解析 ps 状态, 提供给 SupervisorCore 统一编排。
-// 设计: trait 抽象 ComposeBackend 便于测试注入 (同 ArcStartFn/ArcProbeFn 约定)。
-// 生产=真 docker compose; 测试=fake (不调 docker)。
+// Compose plane: wraps docker compose commands, parses ps status, and feeds SupervisorCore
+// for unified orchestration.
+// Design: the ComposeBackend trait abstracts the backend for test injection (same
+// convention as ArcStartFn/ArcProbeFn).
+// Production = real docker compose; tests = fake (no docker calls).
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-// 容器状态: 来自 docker compose ps 的 Service+Health 映射到 supervisor State。
+// Container status: Service+Health from docker compose ps mapped to supervisor State.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerStatus {
     pub name: String,
     pub service: String,
     pub state: String,           // running / exited / restarting ...
-    pub health: String,          // healthy / starting / unhealthy / "" (无 healthcheck)
-    pub publishers: Vec<String>, // 端口映射 ["0.0.0.0:5432->5432/tcp"]
+    pub health: String,          // healthy / starting / unhealthy / "" (no healthcheck)
+    pub publishers: Vec<String>, // port mappings ["0.0.0.0:5432->5432/tcp"]
 }
 
 impl ContainerStatus {
-    // 映射到 supervisor::runner::State 语义 (不依赖 runner 模块, 返回字符串避免环)
+    // Maps to supervisor::runner::State semantics (does not depend on the runner module;
+    // returns strings to avoid a dependency cycle)
     pub fn supervisor_state(&self) -> &'static str {
         if self.state == "exited" || self.state == "dead" {
             return "Failed";
@@ -27,21 +30,21 @@ impl ContainerStatus {
         if self.state != "running" {
             return "Starting";
         }
-        // running: 看 healthcheck
+        // running: consult the healthcheck
         match self.health.as_str() {
             "healthy" => "Healthy",
             "unhealthy" => "Failed",
             "starting" => "Starting",
-            "" => "Healthy", // 无 healthcheck 但 running 视为健康
+            "" => "Healthy", // no healthcheck but running is treated as healthy
             _ => "Starting",
         }
     }
 
-    // 端口: 取第一个 publisher 的容器端口数字, 无则 0。
-    // 兼容 "0.0.0.0:5432->5432/tcp" (规整) 和 "0.0.0.0:5432:5432/tcp" (原始)。
+    // Port: container-side port number of the first publisher, 0 if none.
+    // Handles both "0.0.0.0:5432->5432/tcp" (normalized) and "0.0.0.0:5432:5432/tcp" (raw).
     pub fn port(&self) -> u16 {
         for p in &self.publishers {
-            // 取 / 前部分, 再取最后一个 : 后的容器端口
+            // take the part before /, then the container port after the last :
             let host_part = p.split('/').next().unwrap_or(p);
             let port_str = if let Some(after) = host_part.split("->").nth(1) {
                 after.split(':').next_back().unwrap_or(after)
@@ -56,23 +59,23 @@ impl ContainerStatus {
     }
 }
 
-// compose 后端 trait: 生产真 docker, 测试 fake。
+// Compose backend trait: production = real docker, tests = fake.
 pub trait ComposeBackend: Send + Sync {
-    // up sidecar 平面 (traefik/redis/postgres/qdrant), 等健康
+    // up the sidecar plane (traefik/redis/postgres/qdrant), wait for health
     fn up_sidecar(&self) -> Result<()>;
-    // up business 容器 (model-hub/cowork)
+    // up business containers (model-hub/cowork)
     fn up_business(&self) -> Result<()>;
-    // down 全部 (business + sidecar)
+    // down everything (business + sidecar)
     fn down(&self) -> Result<()>;
-    // ps: 列出所有容器状态
+    // ps: list all container statuses
     fn ps(&self) -> Result<Vec<ContainerStatus>>;
-    // logs --tail 50 单服务
+    // logs --tail 50 for one service
     fn logs(&self, service: &str) -> Result<String>;
-    // fail-closed env 检查: 缺密码拒绝
+    // fail-closed env check: reject on missing secrets
     fn check_env(&self) -> Result<()>;
 }
 
-// 生产后端: 真 docker compose。
+// Production backend: real docker compose.
 pub struct DockerCompose {
     pub sidecar_file: PathBuf,
     pub business_file: PathBuf,
@@ -112,7 +115,11 @@ impl DockerCompose {
             .map_err(|e| anyhow::anyhow!("spawn docker compose: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("docker compose {} 失败: {}", args.join(" "), stderr.trim());
+            anyhow::bail!(
+                "docker compose {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            );
         }
         Ok(out)
     }
@@ -121,22 +128,22 @@ impl DockerCompose {
 impl ComposeBackend for DockerCompose {
     fn up_sidecar(&self) -> Result<()> {
         self.check_env()?;
-        // sidecar 服务先起, --wait 等健康检查通过
+        // sidecar services first; --wait for healthchecks to pass
         self.run(&[
             "up", "-d", "--wait", "traefik", "redis", "postgres", "qdrant",
         ])?;
-        tracing::info!("sidecar 平面已起 (traefik/redis/postgres/qdrant 健康)");
+        tracing::info!("sidecar plane up (traefik/redis/postgres/qdrant healthy)");
         Ok(())
     }
 
     fn up_business(&self) -> Result<()> {
         self.run(&["up", "-d", "--wait", "fusion-model-hub", "fusion-cowork"])?;
-        tracing::info!("business 容器已起 (model-hub/cowork 健康)");
+        tracing::info!("business containers up (model-hub/cowork healthy)");
         Ok(())
     }
 
     fn down(&self) -> Result<()> {
-        // down 容忍部分缺失 (orphan 清理)
+        // down tolerates partial absence (orphan cleanup)
         let mut full = self.base_cmd();
         full.push("down".into());
         full.push("--remove-orphans".into());
@@ -146,8 +153,8 @@ impl ComposeBackend for DockerCompose {
             .map_err(|e| anyhow::anyhow!("spawn docker compose down: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            // down 失败多为容器已停, 仅告警不致命
-            tracing::warn!(stderr = %stderr.trim(), "compose down 非零退出 (容许)");
+            // down failures usually mean containers already stopped; warn only, not fatal
+            tracing::warn!(stderr = %stderr.trim(), "compose down exited non-zero (tolerated)");
         }
         Ok(())
     }
@@ -164,15 +171,16 @@ impl ComposeBackend for DockerCompose {
     }
 
     fn check_env(&self) -> Result<()> {
-        // fail-closed: 必需密码, 缺则拒绝并指 .env.example
-        // docker --env-file 会注入文件内变量, 故查 env + env_file 两处
-        // config Phase 3 (issue #74): 客户端 key 用 canonical 名 FUSION_CLIENT_KEY,
-        // 旧名 FUSION_MLX_API_KEY 的兼容由 fusion-core alias 链负责, 本仓不再引用
+        // fail-closed: secrets required; reject and point at .env.example when missing
+        // docker --env-file injects variables from the file, so check both env and env_file
+        // config Phase 3 (issue #74): client key uses the canonical name FUSION_CLIENT_KEY;
+        // legacy FUSION_MLX_API_KEY compatibility lives in the fusion-core alias chain,
+        // this repo no longer references it
         let need = ["FUSION_PG_PASSWORD", "FUSION_CLIENT_KEY"];
         for k in need {
             if std::env::var(k).is_err() && !key_in_env_file(&self.env_file, k) {
                 anyhow::bail!(
-                    "缺少 {k} — compose fail-closed 守卫。填 .env (参考 .env.example) 或 export {k}"
+                    "missing {k} — compose fail-closed guard. Fill .env (see .env.example) or export {k}"
                 );
             }
         }
@@ -180,7 +188,7 @@ impl ComposeBackend for DockerCompose {
     }
 }
 
-// 检查 env_file 中是否定义了某 key (docker --env-file 会注入)
+// Check whether a key is defined in the env_file (docker --env-file injects it)
 fn key_in_env_file(path: &std::path::Path, key: &str) -> bool {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -198,34 +206,35 @@ fn key_in_env_file(path: &std::path::Path, key: &str) -> bool {
     })
 }
 
-// 解析 docker compose ps --format json 输出。
-// compose v2 输出: 多行 JSON 数组 (每行一个对象) 或单个 JSON 数组, 兼容两种。
+// Parse docker compose ps --format json output.
+// compose v2 output: a multi-line JSON array (one object per line) or a single JSON
+// array; both are handled.
 pub fn parse_compose_ps(text: &str) -> Result<Vec<ContainerStatus>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(vec![]);
     }
-    // 尝试整体 JSON 数组 (compose v2 新版)
+    // try a whole-document JSON array (newer compose v2)
     if trimmed.starts_with('[') {
         let arr: Vec<RawContainer> = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow::anyhow!("ps JSON 数组解析失败: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("ps JSON array parse failed: {e}"))?;
         return Ok(arr.into_iter().map(RawContainer::into_status).collect());
     }
-    // 逐行 JSON 对象 (compose v2 旧版/ndjson)
+    // line-by-line JSON objects (older compose v2 / ndjson)
     let mut out = Vec::new();
     for line in trimmed.lines() {
         let line = line.trim();
         if line.is_empty() || !line.starts_with('{') {
             continue;
         }
-        let raw: RawContainer =
-            serde_json::from_str(line).map_err(|e| anyhow::anyhow!("ps JSON 行解析失败: {e}"))?;
+        let raw: RawContainer = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("ps JSON line parse failed: {e}"))?;
         out.push(raw.into_status());
     }
     Ok(out)
 }
 
-// docker compose ps --format json 原始字段 (compose v2 = PascalCase: Name/Service/State/Health/Publishers)
+// Raw docker compose ps --format json fields (compose v2 = PascalCase: Name/Service/State/Health/Publishers)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct RawContainer {
@@ -245,12 +254,12 @@ struct RawContainer {
 #[serde(rename_all = "PascalCase")]
 struct RawPublisher {
     #[serde(default, alias = "URL")]
-    url: String, // "0.0.0.0:5432:5432/tcp" 或 published_url
+    url: String, // "0.0.0.0:5432:5432/tcp" or published_url
 }
 
 impl RawContainer {
     fn into_status(self) -> ContainerStatus {
-        // publishers.url 格式 "0.0.0.0:5432:5432/tcp" → 规整为 "0.0.0.0:5432->5432/tcp"
+        // publishers.url format "0.0.0.0:5432:5432/tcp" → normalize to "0.0.0.0:5432->5432/tcp"
         let pubs: Vec<String> = self
             .publishers
             .into_iter()
@@ -269,7 +278,7 @@ impl RawContainer {
 
 // "0.0.0.0:5432:5432/tcp" → "0.0.0.0:5432->5432/tcp"
 fn normalize_publisher(url: &str) -> String {
-    // 已是 -> 格式直接返回
+    // already in -> form: return as-is
     if url.contains("->") {
         return url.to_string();
     }
@@ -288,7 +297,7 @@ fn normalize_publisher(url: &str) -> String {
     }
 }
 
-// 测试支持: FakeCompose 暴露给 supervisor 集成测试 (仅 cfg test)
+// Test support: FakeCompose exposed to supervisor integration tests (cfg test only)
 #[cfg(test)]
 pub mod test_support {
     use super::*;
@@ -347,7 +356,7 @@ pub mod test_support {
 mod tests {
     use super::*;
 
-    // compose v2 单 JSON 数组格式
+    // compose v2 single JSON array format
     #[test]
     fn test_parse_ps_json_array() {
         let json = r#"[
@@ -363,7 +372,7 @@ mod tests {
         assert!(st[1].publishers[0].contains("->"));
     }
 
-    // ndjson 逐行格式
+    // ndjson line-by-line format
     #[test]
     fn test_parse_ps_ndjson() {
         let json = "{\"Name\":\"sv-traefik-1\",\"Service\":\"traefik\",\"State\":\"running\",\"Health\":\"healthy\",\"Publishers\":[]}\n{\"Name\":\"sv-qdrant-1\",\"Service\":\"qdrant\",\"State\":\"exited\",\"Health\":\"\",\"Publishers\":[]}\n";

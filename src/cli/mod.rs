@@ -7,7 +7,7 @@ struct Row {
     state: String,
     port: u16,
     plane: String,
-    // issue #112: 最近一次 restart 类事件 (AutoRestart/ManualStart/ManualStop)
+    // issue #112: most recent restart-class event (AutoRestart/ManualStart/ManualStop)
     last_restart: String,
 }
 
@@ -42,9 +42,10 @@ pub fn print_error(msg: &str) {
     eprintln!("error: {msg}");
 }
 
-// issue #41: up/down 的 [SERVICE] 参数路由 — Some(非空) → 单服务 RPC (params.service),
-// None/空串 → 全量 RPC。此前 main.rs `{ .. }` 丢弃参数, `down <svc>` 实际全停 (fleet-kill)。
-// 纯函数可测, 回归即事故; main.rs 必须经此路由, 不允许再直接丢参。
+// issue #41: [SERVICE] parameter routing for up/down — Some(non-empty) → single-service RPC (params.service),
+// None/empty → fleet-wide RPC. Previously main.rs `{ .. }` discarded the argument, so `down <svc>` actually
+// stopped everything (fleet-kill). Pure function, testable — a regression here is an incident; main.rs must
+// route through this, no direct argument discarding.
 pub fn up_down_target(service: Option<String>) -> Option<String> {
     service.filter(|s| !s.is_empty())
 }
@@ -53,7 +54,7 @@ pub fn up_down_target(service: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
 
-    // issue #41: service 参数必须路由到单服务 RPC; 空串/None 归全量
+    // issue #41: the service argument must route to the single-service RPC; empty/None means fleet-wide
     #[test]
     fn test_up_down_target_routes_service() {
         assert_eq!(

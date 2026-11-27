@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
-// 移植 fusion-mlx _run_with_watchdog: 300s 滑窗, 5 次封顶, 退避 1→2→4→8→16→30 上限。
-// 纯逻辑: 时间以 u64(unix sec) 注入, 不碰 SystemTime, 便于确定性单测。
+// Ported from fusion-mlx _run_with_watchdog: 300s sliding window, 5-crash cap, backoff 1→2→4→8→16→30 max.
+// Pure logic: time injected as u64 (unix sec), never touches SystemTime, for deterministic unit tests.
 pub struct RestartPolicy {
     window_sec: u64,
     max: u32,
@@ -27,8 +27,8 @@ impl RestartPolicy {
         self.crashes.len() > self.max as usize
     }
 
-    // 记一次 crash (ts=unix sec). 返回 true = 已达封顶, 调用方应停重启+告警。
-    // 先滑窗 (剔除 ts-window_sec 之前的), 再 push, 再判封顶。
+    // Record one crash (ts=unix sec). Returns true = cap reached, caller should stop restarting + alert.
+    // Slide window first (drop entries older than ts-window_sec), then push, then check cap.
     pub fn record_crash(&mut self, ts: u64) -> bool {
         let cutoff = ts.saturating_sub(self.window_sec);
         while let Some(&front) = self.crashes.front() {
@@ -47,7 +47,7 @@ impl RestartPolicy {
         self.is_capped()
     }
 
-    // 下次退避秒数: 2^(n-1), 上限 backoff_max; 封顶后恒 backoff_max (用于告警显示)。
+    // Next backoff seconds: 2^(n-1), capped at backoff_max; always backoff_max after cap (for alert display).
     pub fn next_delay(&self) -> u64 {
         let n = self.crashes.len() as u32;
         if n == 0 {
@@ -82,7 +82,7 @@ mod tests {
         let (w, m, bmax) = cfg();
         let mut p = RestartPolicy::new(w, m, bmax);
         let ts = 1000u64;
-        // 每次重启前先记 crash, 再取 delay
+        // Record crash before each restart, then take delay
         // crash 1: delay 1
         assert!(!p.record_crash(ts));
         assert_eq!(p.next_delay(), 1);
@@ -95,9 +95,9 @@ mod tests {
         assert_eq!(p.next_delay(), 8);
         assert!(!p.record_crash(ts + 4));
         assert_eq!(p.next_delay(), 16);
-        // crash 6: cap hit (max=5), delay 不再增长, 返回 true
+        // crash 6: cap hit (max=5), delay stops growing, returns true
         assert!(p.record_crash(ts + 5));
-        // cap hit 后 next_delay 应返回 backoff_max
+        // after cap hit, next_delay should return backoff_max
         assert_eq!(p.next_delay(), 30);
     }
 
@@ -105,15 +105,15 @@ mod tests {
     fn test_window_rolls_old_crashes_out() {
         let (w, m, bmax) = cfg();
         let mut p = RestartPolicy::new(w, m, bmax);
-        // 5 crash 在 t=1000..1004
+        // 5 crashes at t=1000..1004
         for i in 0..5 {
             assert!(!p.record_crash(1000 + i));
         }
         assert_eq!(p.crash_count(), 5);
-        // 过 301s, 老的全滑出窗
+        // After 301s, all old crashes slide out of the window
         assert!(!p.record_crash(1000 + 5 + 301));
         assert_eq!(p.crash_count(), 1);
-        // delay 回到 1 (计数重置)
+        // delay back to 1 (count reset)
         assert_eq!(p.next_delay(), 1);
     }
 
@@ -136,10 +136,10 @@ mod tests {
         let (w, m, bmax) = cfg();
         let mut p = RestartPolicy::new(w, m, bmax);
         p.record_crash(1000);
-        // 恰好 300s 边界: 仍算在窗内 (<= window)
+        // Exactly 300s boundary: still counts as in-window (<= window)
         assert!(!p.record_crash(1300));
         assert_eq!(p.crash_count(), 2);
-        // 301s: 第一条滑出
+        // 301s: first entry slides out
         assert!(!p.record_crash(1301));
         assert_eq!(p.crash_count(), 2);
     }

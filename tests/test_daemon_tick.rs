@@ -39,36 +39,36 @@ async fn test_tick_all_recovers_unhealthy_to_healthy() {
         move |_: &ProbeSpec| pc.lock().unwrap().clone(),
         |_, _, _| Ok(()),
     );
-    // 起始 Unhealthy。issue #31: 退避改为排期 — 首 tick_all 排期不重启,
-    // 到点 tick_all (delay=1s) 才进重启流 → Restarting
-    // issue #79: 预置连续失败计数 (直接从 Unhealthy 起测)
+    // Start Unhealthy. issue #31: backoff became scheduling — the first tick_all schedules without restarting,
+    // the due tick_all (delay=1s) enters the restart flow → Restarting
+    // issue #79: preset the consecutive-failure count (testing straight from Unhealthy)
     core.runners[0].state = State::Unhealthy;
     core.runners[0].fail_streak = 2;
     core.drive(1000).await;
     assert!(
         matches!(core.runners[0].state, State::Unhealthy),
-        "排期 tick 不应重启, 实测 {:?}",
+        "scheduled tick must not restart, got {:?}",
         core.runners[0].state
     );
     core.drive(1001).await;
     assert!(
         matches!(core.runners[0].state, State::Restarting),
-        "tick_all 后应 Restarting, 实测 {:?}",
+        "should be Restarting after tick_all, got {:?}",
         core.runners[0].state
     );
-    // 翻探活为健康: tick_all 应恢复 Healthy
+    // Flip the probe to healthy: tick_all should recover to Healthy
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
     core.drive(1001).await;
     assert!(
         matches!(core.runners[0].state, State::Healthy),
-        "恢复后 tick_all 应 Healthy, 实测 {:?}",
+        "tick_all should be Healthy after recovery, got {:?}",
         core.runners[0].state
     );
 }
 
 #[tokio::test]
 async fn test_tick_all_skips_stopped_runner() {
-    // Stopped 态 runner 在 tick 内 no-op (runner.rs:163), tick_all 不应改其状态
+    // A Stopped runner is a no-op inside tick (runner.rs:163); tick_all must not change its state
     let mut core = SupervisorCore::new_with_fns(
         vec![def("fusion-rag", 11436)],
         cfg(),
@@ -81,7 +81,7 @@ async fn test_tick_all_skips_stopped_runner() {
     core.drive(2000).await;
     assert!(
         matches!(core.runners[0].state, State::Stopped),
-        "Stopped 态 tick_all 应 no-op, 实测 {:?}",
+        "tick_all should be a no-op on a Stopped runner, got {:?}",
         core.runners[0].state
     );
 }

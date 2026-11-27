@@ -7,8 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
-// issue #20: shutdown 信号 (RPC Shutdown arm 触发 → run_daemon select 接收 → 优雅退出)。
-// UDS 面仅 unix — windows 无 UnixStream (daemon 走 HTTP API 面, main.rs 已 gate)。
+// issue #20: shutdown signal (RPC Shutdown arm fires → run_daemon select receives → graceful exit).
+// UDS face is unix-only — windows has no UnixStream (the daemon uses the HTTP API face, gated in main.rs).
 #[cfg(unix)]
 pub async fn serve(
     core: std::sync::Arc<tokio::sync::Mutex<SupervisorCore>>,
@@ -24,10 +24,10 @@ pub async fn serve(
     .await
 }
 
-// 带 shutdown tx 的 serve: Shutdown arm 发送信号, run_daemon 监听 rx。
-// issue #25: tx 改为共享 Arc — HTTP 面 (http_server) 与 UDS 面共用同一信号。
-// issue #114: bind 提前到 run_daemon 入口 — bind 失败 = fatal (exit 1,
-// launchd KeepAlive 重试), 不再 faceless 空转 tick (孤儿 daemon 并跑实证)。
+// serve with a shutdown tx: the Shutdown arm sends the signal, run_daemon watches rx.
+// issue #25: tx is now a shared Arc — the HTTP face (http_server) and the UDS face share the same signal.
+// issue #114: bind moved up to the run_daemon entry — bind failure = fatal (exit 1,
+// launchd KeepAlive retries), no more faceless idling tick (proven by orphan-daemon co-running).
 #[cfg(unix)]
 pub fn bind_uds(socket_path: &str) -> Result<UnixListener> {
     let _ = std::fs::remove_file(socket_path);
@@ -117,7 +117,7 @@ async fn dispatch(
                 .map(|e| {
                     json!({
                         "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
-                        // issue #112: 最近一次 restart 类事件 (CLI status 表列)
+                        // issue #112: most recent restart-class event (CLI status table column)
                         "last_restart": e.last_restart,
                     })
                 })
@@ -125,10 +125,11 @@ async fn dispatch(
             make_result(json!(entries), req.id)
         }
         Some(Method::Up) => {
-            // issue #31: service 参数此前被忽略 (up <svc> 实际跑全量 up_all)。
-            // 有 service → 单服务 up_one; 无 → 全量 up_all。
-            // 2026-10-31: up 与 down 对称记录来源 — 此前 01:05 全 fleet 启动波
-            // 在日志/事件表零痕迹, 无法定位触发方 (down 侧 #82 已有同款)。
+            // issue #31: the service argument was previously ignored (up <svc> actually ran the fleet-wide up_all).
+            // With service → single-service up_one; without → fleet-wide up_all.
+            // 2026-10-31: up records its origin symmetrically with down — the previous 01:05 fleet-wide
+            // start wave left zero trace in logs/event table, trigger unattributable (down already had
+            // the same via #82).
             let origin = origin_of(&req.params, "uds client (origin not provided)");
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -141,9 +142,9 @@ async fn dispatch(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             if let Some(svc) = svc_param {
-                // issue #122: 单服务 exec 锁外 — prepare (锁内) → run (锁外) →
-                // finish (锁内)。旧实现持锁等 start.sh (go build 可达数分钟),
-                // 全部 RPC/HTTP 排队 (2026-11-11 实证)。
+                // issue #122: single-service exec outside the lock — prepare (locked) → run (unlocked) →
+                // finish (locked). The old implementation held the lock waiting for start.sh (go build can
+                // take minutes), queueing all RPC/HTTP (observed 2026-11-11).
                 let job = {
                     let mut c = core.lock().await;
                     tracing::info!(svc = %svc, origin = %origin, "manual start (operator intent)");
@@ -169,11 +170,11 @@ async fn dispatch(
                     Err(e) => make_error(-32000, &e.to_string(), req.id),
                 };
             }
-            // 全量 START-ALL (持锁语义不变 — 显式全 fleet 操作, 带 banner)
+            // fleet-wide START-ALL (lock semantics unchanged — explicit whole-fleet operation, with banner)
             let mut c = core.lock().await;
             let res = {
                 {
-                    // 醒目 banner: 全量启动波与 stop-all 对称, 逐行日志易漏看
+                    // prominent banner: fleet-wide start waves mirror stop-all; per-line logs are easy to miss
                     tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                     tracing::warn!("!! START-ALL requested — entire fleet will be started");
                     tracing::warn!("!! origin: {origin}");
@@ -193,9 +194,10 @@ async fn dispatch(
             }
         }
         Some(Method::Down) => {
-            // issue #31: 同 Up — service 参数此前被忽略, down <svc> 会全停, 危险。
-            // issue #82: 停止是操作员意图, 必须记录来源 (CLI argv / HTTP 路由+对端 /
-            // UDS 直连) 并与探活失败区分 — stop-all 全停波打醒目 banner + 事件表。
+            // issue #31: same as Up — the service argument was previously ignored, so down <svc> stopped
+            // everything, dangerous.
+            // issue #82: stopping is operator intent, the origin must be recorded (CLI argv / HTTP route+peer /
+            // UDS direct) and distinguished from probe failures — the stop-all wave gets a prominent banner + event rows.
             let origin = origin_of(&req.params, "uds client (origin not provided)");
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -208,7 +210,7 @@ async fn dispatch(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             if let Some(svc) = svc_param {
-                // issue #122: 单服务 stop exec 锁外 (同 Up 臂)
+                // issue #122: single-service stop exec outside the lock (same as the Up arm)
                 let job = {
                     let mut c = core.lock().await;
                     tracing::warn!(svc = %svc, origin = %origin, "manual stop (operator intent)");
@@ -233,11 +235,11 @@ async fn dispatch(
                     Err(e) => make_error(-32000, &e.to_string(), req.id),
                 };
             }
-            // 全量 STOP-ALL (持锁语义不变 — 显式全 fleet 操作, 带 banner)
+            // fleet-wide STOP-ALL (lock semantics unchanged — explicit whole-fleet operation, with banner)
             let mut c = core.lock().await;
             let res = {
                 {
-                    // 醒目 banner: 全停波普通逐行日志易漏看 (2026-10-30 22:53 事故)
+                    // prominent banner: fleet-wide stop waves are easy to miss in per-line logs (2026-10-30 22:53 incident)
                     tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                     tracing::warn!("!! STOP-ALL requested — entire fleet will be stopped");
                     tracing::warn!("!! fleet stays DOWN until manually restarted");
@@ -249,9 +251,9 @@ async fn dispatch(
                     {
                         tracing::warn!(err = %e, "StopAll event write fail");
                     }
-                    // issue #128: 全停逐服务记 ManualStop — 此前只有一条 StopAll("*")
-                    // 聚合事件, 单服务 last_restart 留着陈旧 note (如 AutoRestart
-                    // "restart ok"), fleet drift 排障无法归因停止方
+                    // issue #128: per-service ManualStop on stop-all — previously only one StopAll("*")
+                    // aggregate event was written, leaving stale last_restart notes per service (e.g. AutoRestart
+                    // "restart ok"), making fleet-drift stop attribution impossible
                     let was_running: Vec<String> = c
                         .runners
                         .iter()
@@ -284,10 +286,11 @@ async fn dispatch(
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => return make_error(-32602, "invalid params: service required", req.id),
             };
-            // issue #96: restart 必须 stop 旧进程并验证端口释放后再 start —
-            // 此前只 invoke_start, 旧监听器存活、新进程撞口死掉, 探活命中旧进程
-            // 返回 "ok" 但代码从未被替换。结果携带 pidfile 新旧 PID 替换证据。
-            // issue #122: stop/start exec 全部锁外, 仅 verify (有界探活) 持锁。
+            // issue #96: restart must stop the old process and verify port release before starting —
+            // previously only invoke_start ran, leaving the old listener alive while the new process died
+            // on the port collision; the probe hit the old process and returned "ok" without replacing code.
+            // The result carries old/new pidfile PIDs as replacement evidence.
+            // issue #122: stop/start exec all outside the lock; only verify (bounded probing) holds it.
             let (old_pid, stop_job) = {
                 let mut c = core.lock().await;
                 match c.prepare_restart(&svc).await {
@@ -344,7 +347,7 @@ async fn dispatch(
                 _ => return make_error(-32602, "invalid params: service required", req.id),
             };
             let c = core.lock().await;
-            // compose 容器优先: 走 compose logs
+            // compose containers first: use compose logs
             if let Some(res) = c.compose_logs(&svc) {
                 match res {
                     Ok(text) => {
@@ -355,7 +358,7 @@ async fn dispatch(
                     }
                 }
             }
-            // native: 读每服务日志文件 tail 50
+            // native: tail 50 lines of the per-service log file
             let log_dir = std::env::var("HOME")
                 .map(|h| format!("{h}/.fusion-sv/logs"))
                 .unwrap_or_else(|_| "/tmp/fusion-sv-logs".into());
@@ -375,7 +378,7 @@ async fn dispatch(
             make_result(json!({"lines": out, "plane": "native"}), req.id)
         }
         Some(Method::Drain) => {
-            // issue #9: drain 单服务 (params.service) 或全部 (无 service)。
+            // issue #9: drain a single service (params.service) or all (no service).
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -393,7 +396,7 @@ async fn dispatch(
             }
         }
         Some(Method::Rollout) => {
-            // issue #9: 零停机换版单服务 (drain→stop→start→prewarm→清 drain)。
+            // issue #9: zero-downtime rollout of a single service (drain→stop→start→prewarm→clear drain).
             let svc = match req.params.get("service").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => return make_error(-32602, "invalid params: service required", req.id),
@@ -416,18 +419,18 @@ async fn dispatch(
                 }
             }
         }
-        // issue #20: Top 是客户端命令 (cli_top 循环 cli_status), 无需 server RPC。
+        // issue #20: Top is a client-side command (cli_top loops cli_status), no server RPC needed.
         Some(Method::Top) => make_error(
             -32601,
             "top is a client-side command, run `fusion-sv top` directly",
             req.id,
         ),
-        // issue #20: 优雅远程关停 daemon。发送 shutdown 信号 → run_daemon select 接收 → 退出。
+        // issue #20: graceful remote daemon shutdown. Send the shutdown signal → run_daemon select receives → exit.
         Some(Method::Shutdown) => {
             let mut guard = shutdown_tx.lock().await;
             let usable = guard.as_ref().map(|tx| !tx.is_closed()).unwrap_or(false);
             if usable {
-                // 取出 tx 发送; 置 None 防重复触发 (幂等: 再次 shutdown 返回 unavailable)。
+                // take the tx and send; set None to prevent re-triggering (idempotent: a second shutdown returns unavailable).
                 if let Some(tx) = guard.take()
                     && tx.send(()).is_err()
                 {
@@ -440,10 +443,11 @@ async fn dispatch(
             }
         }
         Some(Method::Backup) => {
-            // issue #10: 一次性备份 (Postgres + Qdrant → FUSION_BACKUP_TARGET)。
-            // issue #113: 改 fire-and-forget — 旧同步实现持锁 ~15min, RPC 客户端
-            // 超时且全 API 无响应。启动 detached 任务立即返回; 结果走 event 表
-            // + 告警 (BackupFailed), 完成走 INFO 日志。
+            // issue #10: one-shot backup (Postgres + Qdrant → FUSION_BACKUP_TARGET).
+            // issue #113: switched to fire-and-forget — the old synchronous implementation held the lock
+            // ~15min, timing out the RPC client and leaving the whole API unresponsive. Spawns a detached
+            // task and returns immediately; outcomes land in the event table + alerts (BackupFailed),
+            // completion in the INFO log.
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -453,7 +457,7 @@ async fn dispatch(
             tracing::info!("backup started (rpc, detached)");
             make_result(json!({"ok": true, "started": true}), req.id)
         }
-        // PRD app-tiering (issue #62): boot 分级启动面
+        // PRD app-tiering (issue #62): boot-tier startup face
         Some(Method::Boot) => {
             let c = core.lock().await;
             make_result(json!(c.boot_status()), req.id)
@@ -494,7 +498,7 @@ async fn dispatch(
                 _ => return make_error(-32602, "invalid params: action required", req.id),
             };
             let mut c = core.lock().await;
-            // issue #82: 分组停止波也是操作员意图, 日志带来源
+            // issue #82: group stop waves are also operator intent, log with origin
             let origin = origin_of(&req.params, "uds client (origin not provided)");
             match c.boot_group(&group, &action).await {
                 Ok(summary) => {
@@ -507,8 +511,8 @@ async fn dispatch(
     }
 }
 
-// issue #25: HTTP 面复用 UDS dispatch — 同一 token 语义、同一编排逻辑,
-// 不在 HTTP 层重写 up/down/restart/drain。
+// issue #25: the HTTP face reuses the UDS dispatch — same token semantics, same orchestration logic,
+// no rewriting of up/down/restart/drain at the HTTP layer.
 pub async fn dispatch_http(
     method: &str,
     params: serde_json::Value,
@@ -530,8 +534,8 @@ pub async fn dispatch_http(
     .await
 }
 
-// issue #82: 停止命令来源解析 — 客户端显式带 origin (CLI argv / HTTP 路由) 优先,
-// 缺失回退调用方面默认值 (UDS 直连无法取对端进程, 标记为未知来源)。
+// issue #82: stop-command origin resolution — an explicit client origin (CLI argv / HTTP route) wins,
+// missing falls back to the caller-face default (UDS direct connections cannot read the peer process, marked as unknown origin).
 fn origin_of(params: &serde_json::Value, fallback: &str) -> String {
     params
         .get("origin")
@@ -564,7 +568,7 @@ mod tests {
             origin_of(&serde_json::Value::Null, "uds client"),
             "uds client"
         );
-        // 空串视为缺失
+        // empty string counts as missing
         assert_eq!(
             origin_of(&serde_json::json!({"origin": ""}), "uds client"),
             "uds client"

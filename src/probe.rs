@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-// 探活四型: HTTP GET / UDS ping / TCP 端口通 / PidFile 进程存活。2s 超时 (对齐 fusion-cli)。
-// 防风暴: BadPath(404/405) = 路径错, 不重启; 仅 ConnectionRefused/Timeout 进重启流。
+// Four probe kinds: HTTP GET / UDS ping / TCP port reachable / PidFile process alive. 2s timeout (aligned with fusion-cli).
+// Anti-storm: BadPath(404/405) = wrong path, no restart; only ConnectionRefused/Timeout enter the restart flow.
 #[derive(Debug, Clone, Copy)]
 pub enum ProbeKind {
     Http,
@@ -16,12 +16,13 @@ pub struct ProbeSpec {
     pub port: u16,
     pub path: Option<String>,
     pub socket: Option<String>,
-    // issue #120: PidFile 探活 — GUI 桌面应用无 HTTP/TCP 面, 存活即进程在。
-    // 相对路径按 FUSION_ROOT 解析 (start.sh 自管 pidfile, supervisor 不持有)。
+    // issue #120: PidFile probe — GUI desktop apps have no HTTP/TCP face, alive = process exists.
+    // Relative paths resolve against FUSION_ROOT (start.sh owns the pidfile, not the supervisor).
     pub pidfile: Option<String>,
-    // issue #79: 按服务覆盖探活超时。None=全局默认 2s。
-    // GIL 密集型推理服务 (fusion-mlx) 高负载下 /healthz 可能 >2s 才答,
-    // 2s 超时会把健康但繁忙的服务误判宕机触发重启 (杀掉 in-flight 流量)。
+    // issue #79: per-service probe timeout override. None = global default 2s.
+    // GIL-bound inference services (fusion-mlx) under load may answer /healthz in >2s;
+    // a 2s timeout misjudges a healthy-but-busy service as down and triggers a restart
+    // (killing in-flight traffic).
     pub timeout: Option<Duration>,
 }
 
@@ -36,7 +37,7 @@ impl ProbeSpec {
             timeout: None,
         }
     }
-    // issue #79: 带超时覆盖的 HTTP 探活 spec
+    // issue #79: HTTP probe spec with a timeout override
     pub fn http_with_timeout(port: u16, path: &str, secs: u64) -> Self {
         Self {
             timeout: Some(Duration::from_secs(secs)),
@@ -64,8 +65,8 @@ impl ProbeSpec {
         }
     }
 
-    // issue #120: GUI 桌面应用 (fusion-desigma) — 无 HTTP/TCP 面,
-    // 存活判定 = start.sh 自管 pidfile 里的进程还活着。
+    // issue #120: GUI desktop app (fusion-desigma) — no HTTP/TCP face,
+    // alive = the process in the start.sh-owned pidfile still exists.
     pub fn pidfile(path: &str) -> Self {
         Self {
             kind: ProbeKind::PidFile,
@@ -77,7 +78,7 @@ impl ProbeSpec {
         }
     }
 
-    // 生效超时: spec 覆盖 > 全局默认
+    // Effective timeout: spec override > global default
     fn effective_timeout(&self) -> Duration {
         self.timeout.unwrap_or(PROBE_TIMEOUT)
     }
@@ -91,14 +92,14 @@ pub enum UnhealthyReason {
     BadStatus(u16),
     UdsConnectFailed,
     UdsBadReply,
-    // issue #111: pidfile 里的进程已死但探活仍通过 — 端口被陈旧监听器
-    // (孤儿父进程/别的进程撞口) 占着, probe-pass ≠ process-alive。
-    // 按真宕机处理, 走自动重启 (#96 port 兜底 + #110 归属校验会清掉陈旧监听)。
+    // issue #111: the pidfile process is dead but the probe still passes — the port is held by a
+    // stale listener (orphaned parent / another process colliding), probe-pass ≠ process-alive.
+    // Treated as a real crash, entering auto-restart (#96 port fallback + #110 ownership check clear the stale listener).
     ProcessExit,
 }
 
 impl UnhealthyReason {
-    // 仅这两个 = 真宕机信号, 触发重启。其余不重启 (防风暴)。
+    // Only these = real crash signals, trigger restart. The rest never restart (anti-storm).
     pub fn restart_eligible(&self) -> bool {
         matches!(
             self,
@@ -117,7 +118,7 @@ pub enum ProbeResult {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-// 纯函数: 把 HTTP status 归类。2xx=Healthy, 404/405=BadPath, 其余=BadStatus。
+// Pure function: classify an HTTP status. 2xx=Healthy, 404/405=BadPath, else=BadStatus.
 pub fn classify_status(status: u16) -> ProbeResult {
     if (200..300).contains(&status) {
         ProbeResult::Healthy { latency_ms: 0 }
@@ -132,10 +133,10 @@ pub fn classify_status(status: u16) -> ProbeResult {
     }
 }
 
-// issue #120: PidFile 探活 — 读 pidfile, kill -0 判进程存活。相对路径按
-// FUSION_ROOT 解析 (无则 CWD); `~/` 前缀按 HOME 展开 (issue #160: fusion-link
-// pidfile 在 $HOME/.fusion-link/ 下)。pidfile 缺失/不可读/进程死 → ProcessExit
-// (restart-eligible: GUI 应用崩了自动重拉, 熔断窗口兜底风暴)。
+// issue #120: PidFile probe — read the pidfile, kill -0 for process liveness. Relative paths
+// resolve against FUSION_ROOT (fallback CWD); `~/` prefixes expand against HOME (issue #160: the
+// fusion-link pidfile lives under $HOME/.fusion-link/). Missing/unreadable pidfile/dead process →
+// ProcessExit (restart-eligible: GUI crashes get auto-restarted, the circuit-breaker window caps storms).
 async fn probe_pidfile(spec: &ProbeSpec) -> ProbeResult {
     let raw = spec.pidfile.as_deref().unwrap_or_default();
     let path = if let Some(rest) = raw.strip_prefix("~/") {
@@ -197,10 +198,10 @@ pub async fn probe(spec: &ProbeSpec) -> ProbeResult {
 async fn probe_http(spec: &ProbeSpec) -> ProbeResult {
     let path = spec.path.as_deref().unwrap_or("/health");
     let url = format!("http://127.0.0.1:{}{}", spec.port, path);
-    // issue #150: loopback 探活绝不能走系统代理 — macOS 开启系统代理
-    // (clash :7897) 时 reqwest 默认读取 SystemConfiguration, 127.0.0.1 的
-    // /healthz 被 clash 截胡返回 502, 健康服务被误判宕机触发重启风暴。
-    // 强制 no_proxy, 与 curl 直连行为对齐。
+    // issue #150: loopback probes must never use the system proxy — when macOS has a system proxy
+    // enabled (clash :7897), reqwest reads SystemConfiguration by default and 127.0.0.1 /healthz
+    // gets intercepted by clash returning 502, misjudging healthy services as down and triggering
+    // restart storms. Force no_proxy, aligning with curl's direct-connect behavior.
     let client = reqwest::Client::builder()
         .timeout(spec.effective_timeout())
         .no_proxy()
@@ -247,7 +248,7 @@ async fn probe_uds(spec: &ProbeSpec) -> ProbeResult {
     {
         probe_uds_unix(spec).await
     }
-    // windows 无 UnixStream — UDS 探活恒不可达 (不重启型)
+    // windows has no UnixStream — UDS probe permanently unreachable (non-restart kind)
     #[cfg(not(unix))]
     {
         let _ = spec;
@@ -280,9 +281,9 @@ async fn probe_uds_unix(spec: &ProbeSpec) -> ProbeResult {
             };
         }
     };
-    // 发 repo 既有 envelope ping。协议是 newline-delimited (server 端
-    // lines()/readline() 读), 不带 \n 对端 parse 不了; 且必须读到应答才算活 —
-    // 只验 write 会放过 dispatch 卡死的 daemon (假 Healthy)。
+    // Send the repo's existing envelope ping. The protocol is newline-delimited (the server reads
+    // via lines()/readline()); without \n the peer cannot parse. And a reply must be read to count
+    // as alive — write-only would let a dispatch-stuck daemon pass (fake Healthy).
     let req = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n";
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if stream.write_all(req.as_bytes()).await.is_err() {
@@ -292,7 +293,7 @@ async fn probe_uds_unix(spec: &ProbeSpec) -> ProbeResult {
     }
     let mut buf = [0u8; 512];
     match tokio::time::timeout(spec.effective_timeout(), stream.read(&mut buf)).await {
-        // 任何非空应答 (result/error 都算) = daemon dispatch 活着
+        // any non-empty reply (result/error both count) = daemon dispatch alive
         Ok(Ok(n)) if n > 0 => ProbeResult::Healthy { latency_ms: 0 },
         _ => ProbeResult::Unhealthy {
             reason: UnhealthyReason::UdsBadReply,
@@ -337,7 +338,7 @@ mod tests {
         assert_eq!(s.socket.as_deref(), Some("/tmp/fusion-sv.sock"));
     }
 
-    // issue #79: 超时覆盖构造器 + 默认 None (全局 2s)
+    // issue #79: timeout override constructor + default None (global 2s)
     #[test]
     fn test_probe_spec_timeout_override() {
         let s = ProbeSpec::http(11434, "/healthz");
@@ -346,17 +347,17 @@ mod tests {
         let s = ProbeSpec::http_with_timeout(11434, "/healthz", 10);
         assert_eq!(s.timeout, Some(Duration::from_secs(10)));
         assert_eq!(s.effective_timeout(), Duration::from_secs(10));
-        // 未覆盖的构造器不受影响
+        // non-overriding constructors unaffected
         assert_eq!(ProbeSpec::tcp(1).timeout, None);
         assert_eq!(ProbeSpec::uds("/tmp/x.sock").timeout, None);
     }
 
     #[test]
     fn test_unhealthy_reason_restart_eligible() {
-        // 这两个才进重启流
+        // only these enter the restart flow
         assert!(UnhealthyReason::ConnectionRefused.restart_eligible());
         assert!(UnhealthyReason::Timeout.restart_eligible());
-        // BadPath 不重启 (防风暴)
+        // BadPath never restarts (anti-storm)
         assert!(!UnhealthyReason::BadPath(404).restart_eligible());
         assert!(!UnhealthyReason::BadStatus(500).restart_eligible());
         assert!(!UnhealthyReason::UdsConnectFailed.restart_eligible());
@@ -364,8 +365,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_http_healthy() {
-        // 用 reqwest 连一个不存在的端口 → ConnectionRefused (不依赖外部 server)
-        // 此处验证 classify_status 纯函数
+        // connect reqwest to a nonexistent port → ConnectionRefused (no external server needed)
+        // here we verify the classify_status pure function
         assert!(matches!(classify_status(200), ProbeResult::Healthy { .. }));
         assert!(matches!(classify_status(204), ProbeResult::Healthy { .. }));
         assert!(matches!(
@@ -388,7 +389,7 @@ mod tests {
         ));
     }
 
-    // issue #120: PidFile 探活三态 — 活进程 Healthy / 死 pid ProcessExit / 无文件 ProcessExit
+    // issue #120: PidFile probe three states — live process Healthy / dead pid ProcessExit / missing file ProcessExit
     #[tokio::test]
     async fn test_pidfile_probe_alive_process() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -402,7 +403,7 @@ mod tests {
     async fn test_pidfile_probe_dead_process() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pf = tmp.path().join("x.pid");
-        // 拉起即退出的子进程拿一个确定已死的 pid
+        // spawn a child that exits immediately to get a definitely-dead pid
         let mut child = std::process::Command::new("true")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -432,8 +433,8 @@ mod tests {
         }
     }
 
-    // issue #160: `~/` 前缀 pidfile 按 HOME 展开 (fusion-link pidfile 在
-    // $HOME/.fusion-link/ 下, 字面 ~ 不展开则探活恒 ProcessExit)
+    // issue #160: `~/`-prefixed pidfile expands against HOME (the fusion-link pidfile lives
+    // under $HOME/.fusion-link/; a literal ~ left unexpanded makes the probe always ProcessExit)
     #[tokio::test]
     async fn test_issue160_pidfile_tilde_expansion() {
         let tmp = tempfile::TempDir::new().unwrap();

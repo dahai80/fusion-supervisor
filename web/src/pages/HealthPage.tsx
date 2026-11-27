@@ -32,7 +32,7 @@ export function HealthPage() {
             });
     }, []);
 
-    // stale-response guard: 服务切换后旧请求晚到不得覆盖新数据
+    // stale-response guard: late responses from a previous service must not overwrite new data
     const reqSeq = useRef(0);
 
     const load = useCallback(async (svc: string) => {
@@ -70,7 +70,7 @@ export function HealthPage() {
         return (
             <ErrorState
                 message={error}
-                retryLabel={t("重试", "Retry")}
+                retryLabel={t("重试", "Retry")} // i18n: user-facing
                 onRetry={() => void load(selected)}
             />
         );
@@ -80,7 +80,7 @@ export function HealthPage() {
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
                 <h1 className="text-base text-text-primary">
-                    {t("健康", "Health")}
+                    {t("健康", "Health") /* i18n: user-facing */}
                 </h1>
                 <SelectInput
                     value={selected}
@@ -96,6 +96,7 @@ export function HealthPage() {
                         series={[
                             {
                                 label: t(
+                                    // i18n: user-facing
                                     `${selected} 延迟 (ms)`,
                                     `${selected} latency (ms)`,
                                 ),
@@ -106,15 +107,15 @@ export function HealthPage() {
                     />
                     <div className="grid grid-cols-3 gap-2">
                         <MetricTile
-                            label={t("样本数", "Samples")}
+                            label={t("样本数", "Samples")} // i18n: user-facing
                             value={rows.length}
                         />
                         <MetricTile
-                            label={t("最新状态", "Last status")}
+                            label={t("最新状态", "Last status")} // i18n: user-facing
                             value={latest?.status ?? "-"}
                         />
                         <MetricTile
-                            label={t("非健康样本", "Non-healthy")}
+                            label={t("非健康样本", "Non-healthy")} // i18n: user-facing
                             value={downCount}
                         />
                     </div>

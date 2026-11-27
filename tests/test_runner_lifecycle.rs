@@ -38,29 +38,29 @@ async fn test_lifecycle_crash_then_recover() {
     let _ = std::fs::remove_file(&path);
     let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
-    // 健康保持
+    // stays healthy
     r.tick(1000, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Healthy));
-    // 宕机: 首次标 Unhealthy, 不重启
+    // outage: first down marks Unhealthy, no restart
     *probe_cell.lock().unwrap() = ProbeResult::Unhealthy {
         reason: UnhealthyReason::ConnectionRefused,
     };
     r.tick(1001, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
-    // issue #31: 退避改为排期 — 再次宕机 tick 排期, 到点 tick (delay=1s) 重启
-    // issue #79: 连续失败计数 — tick1001 streak=1, tick1002 streak=2 (未达阈值 3 不排),
-    // tick1003 streak=3 排期, tick1004 到点才进 Restarting
+    // issue #31: backoff becomes scheduling — the next down tick schedules; the due tick (delay=1s) restarts
+    // issue #79: consecutive-failure count — tick1001 streak=1, tick1002 streak=2 (below threshold 3, no schedule),
+    // tick1003 streak=3 schedules, tick1004 due finally enters Restarting
     r.tick(1002, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     assert_eq!(calls.lock().unwrap().len(), 0);
     r.tick(1003, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Unhealthy));
     r.tick(1004, &store, &mut al).await.unwrap();
-    // issue #122 phase-2: 到点 tick 只挂起 exec (锁外执行), 同步收尾后 Restarting
+    // issue #122 phase-2: the due tick only parks the exec (lock-free execution); Restarting after the synchronous finish
     r.complete_pending_exec(1004, &mut al).await;
     assert!(matches!(r.state, State::Restarting));
     assert_eq!(calls.lock().unwrap().len(), 1);
-    // 恢复
+    // recovery
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 5 };
     r.tick(1004, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Healthy));
@@ -69,21 +69,21 @@ async fn test_lifecycle_crash_then_recover() {
 
 #[tokio::test]
 async fn test_issue124_failed_recovers_on_healthy_probe() {
-    // issue #124: Failed 态 + 探活恢复健康 (操作员手工 restart 拉起了新实例)
-    // → 状态翻回 Healthy, 不再永久卡 Failed 等人工复位。
+    // issue #124: Failed state + probe recovers healthy (the operator's manual restart spawned a new instance)
+    // → state flips back to Healthy, no longer stuck in Failed awaiting a manual reset.
     let (mut r, probe_cell, _calls, path) = failed_runner("a").await;
     let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 3 };
     r.tick(1100, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
+    assert!(matches!(r.state, State::Healthy), "actual {:?}", r.state);
     cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_issue124_adopt_skips_respawn_when_port_served() {
-    // issue #124: 到点重启 exec 前置探活已 Healthy (外部实例已接管端口)
-    // → 跳过拉起 (start 闭包零调用), 采纳外部实例翻回 Healthy。
+    // issue #124: pre-exec probe of a due restart already Healthy (an external instance took over the port)
+    // → skip the pull (start closure called zero times), adopt the external instance and flip back to Healthy.
     let def = ServiceDef {
         name: "fusion-agent-studio".into(),
         port: 11442,
@@ -115,28 +115,28 @@ async fn test_issue124_adopt_skips_respawn_when_port_served() {
     let _ = std::fs::remove_file(&path);
     let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
-    // 3 连败排期 + 到点 tick 挂起 exec (cap=5 未封顶)
+    // 3 consecutive failures schedule + the due tick parks the exec (cap=5 not reached)
     r.tick(1000, &store, &mut al).await.unwrap();
     r.tick(1001, &store, &mut al).await.unwrap();
     r.tick(1002, &store, &mut al).await.unwrap();
     r.tick(1003, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Restarting), "实际 {:?}", r.state);
-    // 操作员的 start.sh 在退避窗口内把服务拉起来了 — 探活恢复健康
+    assert!(matches!(r.state, State::Restarting), "actual {:?}", r.state);
+    // the operator's start.sh brought the service up within the backoff window — probe recovers healthy
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
     r.complete_pending_exec(1003, &mut al).await;
     assert!(
         calls.lock().unwrap().is_empty(),
-        "采纳路径不得拉起 (双进程撞口), 实际 {:?}",
+        "the adopt path must not pull (double-process port collision), actual {:?}",
         calls.lock().unwrap()
     );
-    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
+    assert!(matches!(r.state, State::Healthy), "actual {:?}", r.state);
     cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_issue126_grace_defers_restart_during_window() {
-    // issue #126: 启动宽限期内探活失败不计 fail_streak / 不排重启,
-    // 慢启动 daemon (30-60s 才绑口) 不再被 auto-restart 击杀。
+    // issue #126: within the startup grace window, probe failures count no fail_streak / schedule no restart,
+    // a slow-starting daemon (30-60s to bind its port) is no longer killed by auto-restart.
     let def = ServiceDef {
         name: "fusion-agent-studio".into(),
         port: 11442,
@@ -170,26 +170,26 @@ async fn test_issue126_grace_defers_restart_during_window() {
     let _ = std::fs::remove_file(&path);
     let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
-    // 宽限期内连续失败: 状态不变, 无 crash 记账, 无 exec 排期
+    // consecutive failures within the grace window: state unchanged, no crash accounting, no exec scheduling
     r.tick(1001, &store, &mut al).await.unwrap();
     r.tick(1010, &store, &mut al).await.unwrap();
     r.tick(1050, &store, &mut al).await.unwrap();
     assert!(
         matches!(r.state, State::Starting),
-        "宽限期内状态不得转移, 实际 {:?}",
+        "state must not transition within the grace window, actual {:?}",
         r.state
     );
     assert!(calls.lock().unwrap().is_empty());
-    // 宽限到期后正常流转: 首次失败标 Unhealthy
+    // after grace expiry, normal flow: the first failure marks Unhealthy
     r.tick(1061, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Unhealthy), "实际 {:?}", r.state);
+    assert!(matches!(r.state, State::Unhealthy), "actual {:?}", r.state);
     cleanup_db(&path);
 }
 
 #[tokio::test]
 async fn test_issue126_grace_expires_normal_flow_resumes() {
-    // issue #126: 宽限到期 + 探活恢复健康 → 翻回 Healthy 且宽限窗口清除,
-    // 之后再次宕机走正常恢复流 (不受宽限残留影响)。
+    // issue #126: grace expiry + probe recovers healthy → flips back to Healthy and the grace window clears,
+    // a later outage walks the normal recovery flow (unaffected by grace leftovers).
     let def = ServiceDef {
         name: "fusion-agent-studio".into(),
         port: 11442,
@@ -223,19 +223,19 @@ async fn test_issue126_grace_expires_normal_flow_resumes() {
     let _ = std::fs::remove_file(&path);
     let store = HistoryStore::open(&path).unwrap();
     let mut al = Alerter::new(300, String::new());
-    // 宽限期内失败被吞
+    // failures within the grace window are swallowed
     r.tick(1010, &store, &mut al).await.unwrap();
     assert!(matches!(r.state, State::Starting));
-    // daemon 完成启动, 探活恢复健康
+    // the daemon finishes startup, probe recovers healthy
     *probe_cell.lock().unwrap() = ProbeResult::Healthy { latency_ms: 2 };
     r.tick(1020, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Healthy), "实际 {:?}", r.state);
-    // 再次宕机: 正常流转 (先 Unhealthy, 3 连败后排期重启)
+    assert!(matches!(r.state, State::Healthy), "actual {:?}", r.state);
+    // another outage: normal flow (first Unhealthy, scheduled restart after 3 consecutive failures)
     *probe_cell.lock().unwrap() = ProbeResult::Unhealthy {
         reason: UnhealthyReason::ConnectionRefused,
     };
     r.tick(1030, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Unhealthy), "实际 {:?}", r.state);
+    assert!(matches!(r.state, State::Unhealthy), "actual {:?}", r.state);
     r.tick(1031, &store, &mut al).await.unwrap();
     r.tick(1032, &store, &mut al).await.unwrap();
     r.tick(1033, &store, &mut al).await.unwrap();
@@ -243,14 +243,14 @@ async fn test_issue126_grace_expires_normal_flow_resumes() {
     assert_eq!(
         calls.lock().unwrap().len(),
         1,
-        "宽限清除后重启应正常执行, 实际 {:?}",
+        "after the grace clears, restart should execute normally, actual {:?}",
         calls.lock().unwrap()
     );
     cleanup_db(&path);
 }
 
-// issue #124 测试脚手架: 已达 Failed 态的 runner (crash-window cap=1 封顶路径)。
-// 后缀区分两测试的 db 文件 (同进程并发跑, 共名会 database is locked)。
+// issue #124 test scaffold: a runner already in the Failed state (crash-window cap=1 capping path).
+// The suffix distinguishes the two tests' db files (running concurrently in the same process, a shared name hits database is locked).
 async fn failed_runner(
     suffix: &str,
 ) -> (
@@ -262,8 +262,8 @@ async fn failed_runner(
     let def = ServiceDef {
         name: "fusion-agent-studio".into(),
         port: 11442,
-        // 假 repo 目录 — 操作员竞态闸门 (issue #86) 会 pgrep 真机 start.sh,
-        // 用真实 repo 名可能撞上在跑的脚本导致测试不确定
+        // fake repo dir — the operator race gate (issue #86) pgreps real start.sh on the machine;
+        // a real repo name could collide with a running script and make the test flaky
         repo_dir: "fusion-test-no-such-repo".into(),
         purpose: "x".into(),
         fixed: false,
@@ -288,7 +288,7 @@ async fn failed_runner(
         RestartPolicy::new(300, 1, 30),
     );
     r.state = State::Healthy;
-    // 走真实路径进 Failed: 第一轮 crash (cap=1 未封顶) + 第二轮 crash 封顶
+    // take the real path into Failed: first crash round (cap=1 not reached) + second crash round caps
     let path =
         std::env::temp_dir().join(format!("fusion-sv-i124-{suffix}-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -303,7 +303,7 @@ async fn failed_runner(
     r.tick(1005, &store, &mut al).await.unwrap();
     r.tick(1006, &store, &mut al).await.unwrap();
     r.tick(1007, &store, &mut al).await.unwrap();
-    assert!(matches!(r.state, State::Failed), "实际 {:?}", r.state);
+    assert!(matches!(r.state, State::Failed), "actual {:?}", r.state);
     (r, probe_cell, calls, path)
 }
 

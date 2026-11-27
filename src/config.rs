@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    // 全字段 serde default: 配置文件可只写覆盖项 (文档承诺 "all fields have defaults",
-    // 之前无 default 的字段会让部分配置文件直接 parse 失败 — 与文档矛盾)。
+    // All fields have serde defaults: config files may carry only overrides (docs promise
+    // "all fields have defaults"; fields without defaults used to make some config files
+    // fail to parse outright — contradicting the docs).
     #[serde(default = "default_socket_path")]
     pub socket_path: String,
     #[serde(default = "default_db_path")]
@@ -29,88 +30,91 @@ pub struct Config {
     pub alert_url: String,
     #[serde(default = "default_alert_dedup_sec")]
     pub alert_dedup_sec: u64,
-    // compose 容器连续失败达此次数 → 升级告警 (ContainerCrashLoop, issue #6)
+    // issue #6: compose container failing this many times in a row → escalated alert (ContainerCrashLoop)
     #[serde(default = "default_container_crash_escalation")]
     pub container_crash_escalation: u32,
-    // issue #9: drain 宽限期 (秒)。到期强制 Stopped (in-flight 未完也停)。
+    // issue #9: drain grace period (seconds). On expiry force Stopped (even if in-flight work remains).
     #[serde(default = "default_drain_grace_sec")]
     pub drain_grace_sec: u64,
-    // issue #9: rollout prewarm 超时 (秒)。启动后探活在此时间内未达 Healthy → 告警 + 留 Stopped。
+    // issue #9: rollout prewarm timeout (seconds). If probes do not reach Healthy within this window after start → alert + leave Stopped.
     #[serde(default = "default_rollout_prewarm_timeout_sec")]
     pub rollout_prewarm_timeout_sec: u64,
-    // issue #10: 备份调度间隔 (秒)。daemon tick 循环检查, 到期触发 backup。默认 86400 (每日)。
+    // issue #10: backup schedule interval (seconds). Checked by the daemon tick loop, triggers backup when due. Default 86400 (daily).
     #[serde(default = "default_backup_schedule_sec")]
     pub backup_schedule_sec: u64,
-    // issue #10: 备份保留份数。新备份后裁剪超出 N 份的旧备份, 默认 7。
+    // issue #10: backup retention count. After a new backup, prune old backups beyond N. Default 7.
     #[serde(default = "default_backup_retention")]
     pub backup_retention: u32,
-    // issue #132: 周备份保留份数 — 日保留 (backup_retention) 之外, 裁剪候选中按
-    // 自然周再留最新 N 份。0 = 关闭 (旧平铺行为)。默认 0。
+    // issue #132: weekly backup retention — on top of daily retention (backup_retention), keep the
+    // newest N backups per natural week among prune candidates. 0 = disabled (old flat behavior). Default 0.
     #[serde(default)]
     pub backup_weekly_retention: u32,
-    // issue #37: history.db 健康史/事件保留天数。daemon 周期 sweep 清除过期行。
+    // issue #37: history.db health-history/event retention days. The daemon periodically sweeps expired rows.
     #[serde(default = "default_history_retention_days")]
     pub history_retention_days: u32,
-    // issue #37: sweep 调度间隔 (秒)。到期执行一次 cleanup_old; 失败也更新时间戳
-    // (避免每 tick 重试风暴, 同 backup 调度语义)。
+    // issue #37: sweep schedule interval (seconds). Runs cleanup_old once when due; the timestamp is
+    // updated even on failure (avoids a per-tick retry storm, same semantics as the backup schedule).
     #[serde(default = "default_prune_schedule_sec")]
     pub prune_schedule_sec: u64,
     #[serde(default = "default_registry_path")]
     pub registry_path: PathBuf,
-    // issue #145: systemd 托管服务表 (service name → systemd unit)。
-    // VPS 部署 systemd 是生命周期权威 — supervisor 的 start/stop/restart 经
-    // systemctl 驱动该 unit 而非 start.sh (start.sh 的 pidfile 对 systemd 拉起
-    // 的进程失效, stop 杀不到真进程 → 假停止 + 端口占用 bail)。Mac 不配置
-    // (缺省空表, 全走 start.sh / start_map)。unit 名 fail-closed 字符校验。
+    // issue #145: systemd-managed service table (service name → systemd unit).
+    // On VPS deployments systemd is the lifecycle authority — supervisor start/stop/restart
+    // drives the unit via systemctl instead of start.sh (start.sh pidfiles do not work for
+    // systemd-spawned processes; stop cannot kill the real process → fake stop + port-in-use
+    // bail). Mac does not configure this (default empty table, everything goes through
+    // start.sh / start_map). Unit names get fail-closed character validation.
     #[serde(default)]
     pub systemd_units: HashMap<String, String>,
     #[serde(default)]
     pub compose: ComposeConfig,
-    // issue #22: Prometheus /metrics HTTP 端点监听地址。
-    // Some → 启用端点; None → 不启 HTTP server (默认 Some("127.0.0.1:9100"))。
-    // 仅 localhost 绑定是安全边界 (不对外暴露, 不加 auth)。
+    // issue #22: listen address for the Prometheus /metrics HTTP endpoint.
+    // Some → endpoint enabled; None → no HTTP server (default Some("127.0.0.1:9100")).
+    // Loopback-only binding is a security boundary (not exposed externally, no auth).
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
-    // issue #25: web 控制台静态产物目录 (web/dist)。
-    // Some → HTTP listener 同时服务 SPA 静态文件; None → 不服务 (默认)。
+    // issue #25: web console static asset directory (web/dist).
+    // Some → the HTTP listener also serves SPA static files; None → not served (default).
     #[serde(default)]
     pub web_dir: Option<String>,
-    // issue #29: daemon 启动时自动执行一次 up_all (探活跳过已健康, 不双启)。
-    // 主机重启后 launchd/操作员拉起 daemon → 全量服务按 layer 序自愈。
-    // 默认 false (开发机手动 fusion-sv up 的行为不变)。
+    // issue #29: run one up_all automatically at daemon start (probe-first skips already-healthy, no double start).
+    // After a host reboot, launchd/operator starts the daemon → full fleet self-heals in layer order.
+    // Default false (dev-machine manual `fusion-sv up` behavior unchanged).
     #[serde(default)]
     pub auto_up_on_start: bool,
-    // issue #77: native 备份平面 (compose.enabled=false 时生效) 的 pg_dumpall 二进制覆盖。
-    // None → 从 PATH 解析 "pg_dumpall"。版本须与目标 server 匹配 (brew 多版本共存时注意)。
+    // issue #77: pg_dumpall binary override for the native backup plane (effective when compose.enabled=false).
+    // None → resolve "pg_dumpall" from PATH. Version must match the target server (mind brew multi-version coexistence).
     #[serde(default)]
     pub pg_dump_bin: Option<String>,
-    // issue #77: native brew PostgreSQL 连接参数 (authoritative 实例,
-    // 见 architecture/fusion-db-conventions-1030.md §1)。用户名走 FUSION_PG_USER env,
-    // 未设则省略 -U (pg_dumpall 默认 OS 用户, brew trust auth 下即安装用户)。
+    // issue #77: native brew PostgreSQL connection parameters (authoritative instance,
+    // see architecture/fusion-db-conventions-1030.md §1). The username goes through the FUSION_PG_USER env;
+    // when unset, -U is omitted (pg_dumpall defaults to the OS user, which under brew trust auth is the installing user).
     #[serde(default = "default_native_pg_host")]
     pub native_pg_host: String,
     #[serde(default = "default_native_pg_port")]
     pub native_pg_port: u16,
-    // issue #80: daemon 自身 PATH 的追加项 (冒号分隔)。launchd 默认 PATH 不含
-    // /opt/homebrew/bin — node/brew 系 start.sh 在 daemon 拉起时 `command -v node`
-    // 全挂。daemon 启动时把缺失项追加到自身 PATH 尾部, 子进程 (start.sh /
-    // daemonize) 全部继承; 空串禁用 (保持 launchd 原始 PATH)。
+    // issue #80: extra PATH entries appended to the daemon's own PATH (colon-separated). The launchd
+    // default PATH lacks /opt/homebrew/bin — node/brew-based start.sh scripts all fail `command -v node`
+    // when started by the daemon. At daemon start, missing entries are appended to the tail of its own
+    // PATH and inherited by all child processes (start.sh / daemonize); an empty string disables this
+    // (keeps the raw launchd PATH).
     #[serde(default = "default_native_extra_path")]
     pub native_extra_path: String,
-    // issue #126: 启动宽限窗口 (秒)。exec 拉起成功后, 宽限期内探活失败不计
-    // fail_streak / 不排重启 (慢启动 daemon 绑定口需 30-60s, 旧逻辑在启动窗口
-    // 内就烧完连续失败计数 → 到点重启杀掉正在启动的健康进程)。0 = 禁用。
+    // issue #126: startup grace window (seconds). After a successful exec start, probe failures within
+    // the grace window do not count toward fail_streak / do not schedule restarts (slow-start daemons
+    // need 30-60s to bind their port; the old logic burned consecutive-failure counts during the startup
+    // window → due restarts killed healthy processes still starting). 0 = disabled.
     #[serde(default = "default_startup_grace_secs")]
     pub startup_grace_secs: u64,
-    // issue #137: 定时任务表 (fusion-ops retention/cluster 等一次性作业)。
-    // daemon tick 循环判定到期, detached 执行; 游标持久化 meta job_last:<name>。
+    // issue #137: scheduled job table (one-shot jobs such as fusion-ops retention/cluster).
+    // The daemon tick loop checks due jobs and runs them detached; the cursor persists in meta job_last:<name>.
     #[serde(default)]
     pub jobs: Vec<JobConfig>,
-    // issue #168: daemon 日志尺寸轮转 (copy-truncate)。
-    // log_rotate_max_mb: 单文件超过此 MB 数触发轮转, 0 = 禁用 (默认 100)。
-    // log_rotate_keep: 保留备份份数 <file>.1 .. <file>.N (默认 3)。
-    // log_rotate_paths: 轮转目标 — 默认 launchd StandardOut/ErrPath 两份 daemon
-    // 日志 (相对 FUSION_ROOT 解析, 见 log_rotate::resolve_rotate_path)。
+    // issue #168: daemon log size rotation (copy-truncate).
+    // log_rotate_max_mb: rotate a file once it exceeds this many MB; 0 = disabled (default 100).
+    // log_rotate_keep: number of backup copies kept <file>.1 .. <file>.N (default 3).
+    // log_rotate_paths: rotation targets — defaults to the two launchd StandardOut/ErrPath daemon
+    // logs (resolved relative to FUSION_ROOT, see log_rotate::resolve_rotate_path).
     #[serde(default = "default_log_rotate_max_mb")]
     pub log_rotate_max_mb: u64,
     #[serde(default = "default_log_rotate_keep")]
@@ -134,20 +138,20 @@ fn default_log_rotate_paths() -> Vec<String> {
     ]
 }
 
-// issue #137: 单条定时任务。daily_at 与 every_sec 必须恰好设一个 (load 校验)。
+// issue #137: a single scheduled job. Exactly one of daily_at / every_sec must be set (validated in load).
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobConfig {
     pub name: String,
     pub bin: String,
     #[serde(default)]
     pub args: Vec<String>,
-    // 每日本地 HH:MM 跑一次 (retention 类夜间任务)
+    // Run once daily at local HH:MM (retention-style nightly jobs)
     #[serde(default)]
     pub daily_at: Option<String>,
-    // 固定间隔秒 (cluster 类周期任务)
+    // Fixed interval in seconds (cluster-style periodic jobs)
     #[serde(default)]
     pub every_sec: Option<u64>,
-    // 执行超时, 到点 kill。默认 900 (上游 job 二进制自带 10min ctx)。
+    // Execution timeout; killed when reached. Default 900 (upstream job binaries carry their own 10min ctx).
     #[serde(default = "default_job_timeout_sec")]
     pub timeout_sec: u64,
 }
@@ -156,8 +160,8 @@ fn default_job_timeout_sec() -> u64 {
     900
 }
 
-// issue #137: jobs 配置校验 — name 非空且唯一; daily_at / every_sec 恰好设一个;
-// daily_at 格式 HH:MM (0-23:0-59)。失败 = 配置致命 (daemon 拒启动, fail-closed)。
+// issue #137: jobs config validation — name non-empty and unique; exactly one of daily_at / every_sec;
+// daily_at format HH:MM (0-23:0-59). Failure = config fatal (daemon refuses to start, fail-closed).
 fn validate_jobs(jobs: &[JobConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for j in jobs {
@@ -189,10 +193,10 @@ fn default_startup_grace_secs() -> u64 {
     90
 }
 
-// compose 平面配置。enabled=false (默认) → 仅 native, 保留单节点开发行为。
-// 注意不能 derive(Default): derive 给 PathBuf 的默认是空串, 而 serde default = "..."
-// 函数只在 toml 显式缺 key 时生效 — derive(Default) 会让无 [compose] 段的配置文件
-// 拿到空 env_file/sidecar_file, 破坏 .env 解析。手动 impl 走真正的默认值。
+// Compose-plane config. enabled=false (default) → native only, preserving single-node dev behavior.
+// Note: cannot derive(Default) — derive gives PathBuf an empty-string default, and serde default = "..."
+// functions only apply when the toml key is explicitly absent, so derive(Default) would hand config files
+// without a [compose] section empty env_file/sidecar_file, breaking .env parsing. The manual impl uses real defaults.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComposeConfig {
     #[serde(default)]
@@ -279,24 +283,24 @@ fn default_backup_schedule_sec() -> u64 {
 fn default_backup_retention() -> u32 {
     7
 }
-// issue #22: metrics 默认绑 localhost:9100 (不对外, 无 auth)。
+// issue #22: metrics binds localhost:9100 by default (not exposed, no auth).
 fn default_metrics_addr() -> Option<String> {
     Some("127.0.0.1:9100".to_string())
 }
-// issue #77: native brew PG 默认连接参数 (authoritative 实例)。
+// issue #77: native brew PG default connection parameters (authoritative instance).
 fn default_native_pg_host() -> String {
     "127.0.0.1".to_string()
 }
 fn default_native_pg_port() -> u16 {
     5432
 }
-// issue #80: Apple Silicon (/opt/homebrew) + Intel (/usr/local) 两处 Homebrew bin。
+// issue #80: Homebrew bin on both Apple Silicon (/opt/homebrew) and Intel (/usr/local).
 fn default_native_extra_path() -> String {
     "/opt/homebrew/bin:/usr/local/bin".to_string()
 }
 
-// issue #80: 把 extra 中的 PATH 项追加到 cur 尾部 — 已存在的项跳过 (保序去重,
-// 追加-only 不改变既有解析优先级), 空项/空白项忽略。纯函数便于单测。
+// issue #80: append PATH entries from extra to the tail of cur — existing entries are skipped (order-preserving
+// dedup, append-only keeps existing resolution priority), empty/whitespace entries ignored. Pure function for unit tests.
 pub fn append_path_entries(cur: &str, extra: &str) -> String {
     let mut entries: Vec<&str> = cur.split(':').filter(|s| !s.is_empty()).collect();
     for e in extra.split(':') {
@@ -350,14 +354,14 @@ impl Default for Config {
     }
 }
 
-// issue #136: 部署约定配置路径 (docs/backup-restore.md VPS systemd 部署,
-// daemon unit 的 FUSION_SV_CONFIG 指向此处)。CLI 在 FUSION_SV_CONFIG 未设
-// 且默认路径缺失时采纳它, 避免 root 手跑 CLI 静默用默认值 (retention 等)。
+// issue #136: deployment-convention config path (docs/backup-restore.md VPS systemd deploy;
+// the daemon unit's FUSION_SV_CONFIG points here). The CLI adopts it when FUSION_SV_CONFIG is unset
+// and the default path is missing, avoiding a root-run CLI silently using defaults (retention etc.).
 const DEPLOY_CONFIG_PATH: &str = "/opt/fusion-sv/config.toml";
 
-// 纯函数: 解析配置路径。explicit (FUSION_SV_CONFIG) 恒优先; 未设时默认
-// ~/.fusion-sv/config.toml, 但默认缺失而部署约定路径存在则采纳部署配置
-// (adopted=true)。两个 exists 由调用方现场探测, 便于测试注入。
+// Pure function: resolve the config path. explicit (FUSION_SV_CONFIG) always wins; when unset the
+// default is ~/.fusion-sv/config.toml, but if the default is missing and the deploy-convention path
+// exists, the deploy config is adopted (adopted=true). The caller probes both exists flags inline, easing test injection.
 fn resolve_config_path(
     explicit: Option<String>,
     default_exists: bool,
@@ -381,9 +385,9 @@ impl Config {
         let (path, adopted) =
             resolve_config_path(explicit, default_expanded.exists(), deploy_path.exists());
         let expanded = expand_tilde(&path);
-        // issue #136: FUSION_SV_CONFIG 未设且默认配置与部署配置并存 → WARN。
-        // 两份配置可能各持不同 retention/schedule, CLI 与 daemon 静默分歧
-        // (VPS 实证: /root/.fusion-sv/config.toml ≠ /opt/fusion-sv/config.toml)。
+        // issue #136: FUSION_SV_CONFIG unset and default + deploy configs coexisting → WARN.
+        // The two configs may carry different retention/schedule settings; CLI and daemon diverge silently
+        // (observed on VPS: /root/.fusion-sv/config.toml ≠ /opt/fusion-sv/config.toml).
         if !adopted
             && std::env::var("FUSION_SV_CONFIG").is_err()
             && deploy_path.exists()
@@ -396,9 +400,9 @@ impl Config {
             );
         }
         if !expanded.exists() {
-            // issue #134: CLI 与 daemon 可能各持一份配置 (daemon 走 systemd
-            // FUSION_SV_CONFIG, CLI 默认 ~/.fusion-sv/config.toml) — 回退默认
-            // 值时升级 WARN 并给出对齐提示, 避免 "CLI 静默跑错配置" 无从归因。
+            // issue #134: CLI and daemon may each hold their own config (daemon uses the systemd
+            // FUSION_SV_CONFIG, CLI defaults to ~/.fusion-sv/config.toml) — when falling back to
+            // defaults, upgrade to WARN with an alignment hint so "CLI silently runs the wrong config" is attributable.
             tracing::warn!(
                 path = %expanded.display(),
                 "config not found, using defaults (if a daemon runs with FUSION_SV_CONFIG set, set the same variable for one-shot CLI runs)"
@@ -418,24 +422,24 @@ impl Config {
         cfg.compose.business_file = expand_tilde(&cfg.compose.business_file);
         cfg.compose.env_file = expand_tilde(&cfg.compose.env_file);
         cfg.compose.env_file = resolve_env_file(&cfg.compose.env_file);
-        // issue #25: web_dir 同样展开 ~ (与 db_path 一致)。
+        // issue #25: expand ~ in web_dir too (consistent with db_path).
         if let Some(dir) = &cfg.web_dir {
             cfg.web_dir = Some(expand_tilde(Path::new(dir)).to_string_lossy().into_owned());
         }
-        // issue #22: 空字符串 → None (禁用 metrics 端点)。
+        // issue #22: empty string → None (disable the metrics endpoint).
         if let Some(addr) = &cfg.metrics_addr
             && addr.trim().is_empty()
         {
             cfg.metrics_addr = None;
         }
-        // issue #25: 空字符串 → None (不服务 web 静态面)。
+        // issue #25: empty string → None (do not serve the web static face).
         if let Some(dir) = &cfg.web_dir
             && dir.trim().is_empty()
         {
             cfg.web_dir = None;
         }
         validate_jobs(&cfg.jobs)?;
-        // issue #145: systemd unit 名 fail-closed 校验 (防 shell 元字符注入 systemctl 参数)
+        // issue #145: systemd unit name fail-closed validation (prevents shell metacharacter injection into systemctl args)
         for (svc, unit) in &cfg.systemd_units {
             anyhow::ensure!(
                 !svc.trim().is_empty() && !unit.trim().is_empty(),
@@ -452,7 +456,7 @@ impl Config {
 }
 
 pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
-    // 只展开 "~" 与 "~/.."; "~user"/"~suffix" 形如 ~backup 的路径不改写
+    // Only expand "~" and "~/.."; "~user"/"~suffix"-style paths like ~backup are left untouched
     if let Some(s) = p.to_str()
         && (s == "~" || s.starts_with("~/"))
         && let Some(home) = dirs_or_home()
@@ -462,10 +466,11 @@ pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-// issue #31: 相对 env_file 在 FUSION_ROOT 设置且该处存在时优先相对 monorepo 根解析。
-// README 引导从 monorepo 根启动 daemon (start.sh 路径解析依赖 FUSION_ROOT), 若 .env
-// 仍按 CWD 找, 密钥文件留在 fusion-supervisor/ 会读不到 → shell env fail-closed 拒启动。
-// 显式绝对路径 / ~ 展开后不受影响; FUSION_ROOT 下不存在则回退 CWD (旧行为)。
+// issue #31: a relative env_file resolves preferentially against the monorepo root when FUSION_ROOT is set
+// and the file exists there. The README guides starting the daemon from the monorepo root (start.sh path
+// resolution depends on FUSION_ROOT); if .env is still looked up relative to CWD, a secret file left in
+// fusion-supervisor/ would not be found → shell env fail-closed refuses to start.
+// Explicit absolute paths / ~-expanded paths are unaffected; fall back to CWD when absent under FUSION_ROOT (old behavior).
 fn resolve_env_file(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
@@ -487,19 +492,19 @@ fn dirs_or_home() -> Option<String> {
 mod tests {
     use super::*;
 
-    // RAII 守卫: 设 env, Drop 时恢复原值 (panic 也会跑 Drop, 不污染其他测试)。
-    // edition 2024 起 set_var/remove_var 为 unsafe, 故包 unsafe 块。
+    // RAII guard: sets an env var, restores the original on Drop (Drop also runs on panic, so other tests are not polluted).
+    // Since edition 2024, set_var/remove_var are unsafe, hence the unsafe blocks.
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
-        // 持有 env 测试锁 (#134 CI flake): set/恢复全程与其他 env 测试互斥。
+        // Holds the env test lock (#134 CI flake): set/restore is mutually exclusive with other env tests throughout.
         _lock: crate::env_map::tests::EnvLockGuard,
     }
     impl EnvGuard {
         fn set(key: &'static str, val: &str) -> Self {
             let lock = crate::env_map::tests::env_lock();
             let prev = std::env::var(key).ok();
-            // SAFETY: 测试单线程内设 env, 此处无并发读此 key 的代码。
+            // SAFETY: env is set within a single test thread; no code concurrently reads this key here.
             unsafe { std::env::set_var(key, val) };
             Self {
                 key,
@@ -510,7 +515,7 @@ mod tests {
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: 同上, 测试内恢复 env。
+            // SAFETY: same as above, restoring env within the test.
             match &self.prev {
                 Some(v) => unsafe { std::env::set_var(self.key, v) },
                 None => unsafe { std::env::remove_var(self.key) },
@@ -518,35 +523,35 @@ mod tests {
         }
     }
 
-    // I1: load() 在无配置文件分支应展开 db_path 的 ~ 为 $HOME,
-    // 不留字面 "~" 目录。回归: 之前 load 返回 Default 带 "~/.fusion-sv/history.db"。
+    // I1: in the no-config-file branch, load() should expand ~ in db_path to $HOME,
+    // never leaving a literal "~" directory. Regression: load used to return Default with "~/.fusion-sv/history.db".
     #[test]
     fn test_load_expands_tilde_in_db_path() {
         let nonexistent = std::env::temp_dir().join("fusion-sv-config-noexist-test.toml");
         let _ = std::fs::remove_file(&nonexistent);
         let _guard = EnvGuard::set("FUSION_SV_CONFIG", nonexistent.to_str().unwrap());
-        let cfg = Config::load().expect("load 应成功 (无文件用默认)");
-        let home = std::env::var("HOME").expect("HOME 应存在");
+        let cfg = Config::load().expect("load should succeed (no file, defaults used)");
+        let home = std::env::var("HOME").expect("HOME should exist");
         assert!(
             !cfg.db_path.starts_with("~"),
-            "db_path 不应保留字面 ~: {:?}",
+            "db_path must not keep a literal ~: {:?}",
             cfg.db_path
         );
         assert!(
             cfg.db_path.starts_with(&home),
-            "db_path 应以 $HOME 开头: {:?} vs {}",
+            "db_path should start with $HOME: {:?} vs {}",
             cfg.db_path,
             home
         );
         assert!(
             !cfg.registry_path.starts_with("~") || cfg.registry_path.starts_with(&home),
-            "registry_path 不应保留字面 ~: {:?}",
+            "registry_path must not keep a literal ~: {:?}",
             cfg.registry_path
         );
         let _ = std::fs::remove_file(&nonexistent);
     }
 
-    // issue #145: systemd_units 校验 — 合法 unit 通过, shell 元字符 fail-closed
+    // issue #145: systemd_units validation — a valid unit passes, shell metacharacters fail closed
     #[test]
     fn test_issue145_systemd_units_validation() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -562,12 +567,12 @@ mod tests {
             cfg.systemd_units.get("fusion-identity").map(String::as_str),
             Some("fusion-identity.service")
         );
-        // shell 元字符注入拒绝
+        // shell metacharacter injection rejected
         std::fs::write(tmp.path(), "[systemd_units]\n\"svc\" = \"evil; reboot\"\n").unwrap();
         assert!(Config::load().is_err());
     }
 
-    // issue #136: 配置路径解析纯函数 — explicit 恒优先。
+    // issue #136: config path resolution pure function — explicit always wins.
     #[test]
     fn test_issue136_resolve_path_explicit_wins() {
         let (path, adopted) = resolve_config_path(Some("/custom/sv.toml".into()), true, true);
@@ -575,7 +580,7 @@ mod tests {
         assert!(!adopted);
     }
 
-    // issue #136: 默认配置存在 → 用默认, 不采纳部署配置。
+    // issue #136: default config exists → use the default, do not adopt the deploy config.
     #[test]
     fn test_issue136_resolve_path_default_present() {
         let (path, adopted) = resolve_config_path(None, true, true);
@@ -583,7 +588,7 @@ mod tests {
         assert!(!adopted);
     }
 
-    // issue #136: 默认缺失 + 部署配置存在 (VPS root 跑 CLI) → 采纳部署配置。
+    // issue #136: default missing + deploy config exists (VPS root running CLI) → adopt the deploy config.
     #[test]
     fn test_issue136_resolve_path_adopts_deploy() {
         let (path, adopted) = resolve_config_path(None, false, true);
@@ -591,7 +596,7 @@ mod tests {
         assert!(adopted);
     }
 
-    // issue #136: 两者都缺 → 回默认路径 (缺失分支由调用方 WARN, #134)。
+    // issue #136: both missing → fall back to the default path (the missing branch is WARNed by the caller, #134).
     #[test]
     fn test_issue136_resolve_path_neither_exists() {
         let (path, adopted) = resolve_config_path(None, false, false);
@@ -599,26 +604,26 @@ mod tests {
         assert!(!adopted);
     }
 
-    // 部分配置文件 (只写覆盖项) 应可加载, 其余字段取默认 —
-    // 文档承诺 "all fields have defaults", 之前无 serde default 的字段直接 parse 失败。
+    // A partial config file (only overrides) should load, remaining fields take defaults —
+    // the docs promise "all fields have defaults"; fields without serde defaults used to fail parsing outright.
     #[test]
     fn test_partial_config_file_uses_defaults() {
         let path = std::env::temp_dir().join("fusion-sv-config-partial-test.toml");
         std::fs::write(&path, "auto_up_on_start = true\n").unwrap();
         let _guard = EnvGuard::set("FUSION_SV_CONFIG", path.to_str().unwrap());
-        // issue #31: env 全局共享, config 测试也须与其它 env 测试共用锁串行
+        // issue #31: env is globally shared, config tests must also share the lock with other env tests to serialize
         let _g0 = crate::env_map::tests::env_lock();
-        // 钉住 FUSION_ROOT 到无 .env 的临时目录, 断言不受宿主环境影响
+        // Pin FUSION_ROOT to a temp dir without .env, asserting independence from the host environment
         let empty_root = std::env::temp_dir().join("fusion-sv-config-test-root");
         std::fs::create_dir_all(&empty_root).unwrap();
         let _guard2 = EnvGuard::set("FUSION_ROOT", empty_root.to_str().unwrap());
-        let cfg = Config::load().expect("部分配置应加载成功");
-        assert!(cfg.auto_up_on_start, "覆盖项应生效");
+        let cfg = Config::load().expect("partial config should load");
+        assert!(cfg.auto_up_on_start, "override should take effect");
         assert_eq!(cfg.socket_path, "/tmp/fusion-sv.sock");
         assert_eq!(cfg.poll_healthy_sec, 15);
         assert_eq!(cfg.max_concurrent_start, 4);
         assert!(!cfg.compose.enabled);
-        // 回归: 无 [compose] 段时 env_file 应为 ".env" 而非 derive(Default) 的空串
+        // Regression: without a [compose] section, env_file should be ".env", not derive(Default)'s empty string
         assert_eq!(cfg.compose.env_file, PathBuf::from(".env"));
         assert_eq!(
             cfg.compose.sidecar_file,
@@ -627,10 +632,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // issue #31: 相对 env_file 优先解析到 FUSION_ROOT 下 (存在时), 否则回退 CWD
+    // issue #31: relative env_file resolves preferentially under FUSION_ROOT (when present), else falls back to CWD
     #[test]
     fn test_resolve_env_file_fusion_root_priority() {
-        // issue #31: 同上, env 锁串行
+        // issue #31: as above, env lock serializes
         let _g = crate::env_map::tests::env_lock();
         let root = std::env::temp_dir().join("fusion-sv-envroot-test");
         std::fs::create_dir_all(&root).unwrap();
@@ -639,19 +644,23 @@ mod tests {
         assert_eq!(
             resolve_env_file(Path::new(".env")),
             root.join(".env"),
-            "FUSION_ROOT 下存在 .env 时应优先解析到根"
+            "resolves to the root when .env exists under FUSION_ROOT"
         );
         assert_eq!(
             resolve_env_file(Path::new("other.env")),
             PathBuf::from("other.env"),
-            "FUSION_ROOT 下不存在时回退 CWD 相对路径"
+            "falls back to the CWD-relative path when absent under FUSION_ROOT"
         );
         let abs = root.join("abs.env");
-        assert_eq!(resolve_env_file(&abs), abs, "绝对路径原样返回");
+        assert_eq!(
+            resolve_env_file(&abs),
+            abs,
+            "absolute paths are returned as-is"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // issue #80: 缺失项追加到尾部 (追加-only, 不改变既有解析顺序)
+    // issue #80: missing entries appended to the tail (append-only, does not change existing resolution order)
     #[test]
     fn test_append_path_entries_appends_missing() {
         assert_eq!(
@@ -660,7 +669,7 @@ mod tests {
         );
     }
 
-    // issue #80: 已存在的项跳过 — launchd 环境已含 Homebrew bin 时幂等
+    // issue #80: existing entries skipped — idempotent when the launchd environment already has Homebrew bin
     #[test]
     fn test_append_path_entries_dedups_existing() {
         assert_eq!(
@@ -670,11 +679,11 @@ mod tests {
             ),
             "/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin"
         );
-        // 全部已存在 → 不变
+        // all already present → unchanged
         assert_eq!(append_path_entries("/a:/b", "/a:/b"), "/a:/b");
     }
 
-    // issue #80: extra 为空串 (禁用) / 空项 / 空白项 → cur 原样 (仅去空项)
+    // issue #80: extra empty string (disabled) / empty / whitespace entries → cur as-is (only empty entries removed)
     #[test]
     fn test_append_path_entries_empty_and_trim() {
         assert_eq!(append_path_entries("/usr/bin:/bin", ""), "/usr/bin:/bin");
@@ -682,14 +691,14 @@ mod tests {
             append_path_entries("/usr/bin:::/bin", "  "),
             "/usr/bin:/bin"
         );
-        // 空白项 trim 后追加
+        // whitespace entries are trimmed then appended
         assert_eq!(
             append_path_entries("/usr/bin", "  /opt/homebrew/bin  "),
             "/usr/bin:/opt/homebrew/bin"
         );
     }
 
-    // issue #80: cur 为空 (PATH 未设) → 仅剩 extra 的有效项
+    // issue #80: cur empty (PATH unset) → only extra's valid entries remain
     #[test]
     fn test_append_path_entries_empty_cur() {
         assert_eq!(

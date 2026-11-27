@@ -48,14 +48,14 @@ interface PendingOp {
     service?: string;
 }
 
-// issue #95: 操作名双语映射 (确认弹窗文案用)。
+// issue #95: bilingual op-name map (used by confirm dialog copy).
 const OP_NAMES: Record<MutationMethod, { zh: string; en: string }> = {
-    up: { zh: "启动", en: "up" },
-    down: { zh: "停止", en: "down" },
-    restart: { zh: "重启", en: "restart" },
-    drain: { zh: "排水", en: "drain" },
-    rollout: { zh: "滚动发布", en: "rollout" },
-    backup: { zh: "备份", en: "backup" },
+    up: { zh: "启动", en: "up" }, // i18n: user-facing
+    down: { zh: "停止", en: "down" }, // i18n: user-facing
+    restart: { zh: "重启", en: "restart" }, // i18n: user-facing
+    drain: { zh: "排水", en: "drain" }, // i18n: user-facing
+    rollout: { zh: "滚动发布", en: "rollout" }, // i18n: user-facing
+    backup: { zh: "备份", en: "backup" }, // i18n: user-facing
 };
 
 export function ServicesPage() {
@@ -99,7 +99,7 @@ export function ServicesPage() {
         return (
             <ErrorState
                 message={error}
-                retryLabel={t("重试", "Retry")}
+                retryLabel={t("重试", "Retry")} // i18n: user-facing
                 onRetry={() => void load()}
             />
         );
@@ -111,7 +111,7 @@ export function ServicesPage() {
     const columns: DataTableColumn<ServiceStatus>[] = [
         {
             key: "name",
-            header: t("服务", "Service"),
+            header: t("服务", "Service"), // i18n: user-facing
             render: (r) => (
                 <span className="font-mono text-sm text-text-primary">
                     {r.name}
@@ -120,46 +120,46 @@ export function ServicesPage() {
         },
         {
             key: "state",
-            header: t("状态", "State"),
+            header: t("状态", "State"), // i18n: user-facing
             render: (r) => (
                 <StatusBadge status={stateToKind(r.state)} label={r.state} />
             ),
         },
         {
             key: "port",
-            header: t("端口", "Port"),
+            header: t("端口", "Port"), // i18n: user-facing
             sortable: true,
             align: "right",
         },
-        { key: "plane", header: t("平面", "Plane") },
+        { key: "plane", header: t("平面", "Plane") }, // i18n: user-facing
         {
             key: "actions",
-            header: t("操作", "Actions"),
+            header: t("操作", "Actions"), // i18n: user-facing
             render: (r) => (
                 <div className="flex gap-1">
                     <ActionBtn
-                        label={t("启动", "Up")}
+                        label={t("启动", "Up")} // i18n: user-facing
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "up", service: r.name })
                         }
                     />
                     <ActionBtn
-                        label={t("重启", "Restart")}
+                        label={t("重启", "Restart")} // i18n: user-facing
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "restart", service: r.name })
                         }
                     />
                     <ActionBtn
-                        label={t("排水", "Drain")}
+                        label={t("排水", "Drain")} // i18n: user-facing
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "drain", service: r.name })
                         }
                     />
                     <ActionBtn
-                        label={t("发布", "Rollout")}
+                        label={t("发布", "Rollout")} // i18n: user-facing
                         disabled={busy}
                         onClick={() =>
                             setPending({ method: "rollout", service: r.name })
@@ -174,22 +174,23 @@ export function ServicesPage() {
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
                 <h1 className="text-base text-text-primary">
-                    {t("服务", "Services")}
+                    {t("服务", "Services") /* i18n: user-facing */}
                 </h1>
                 <div className="flex items-center gap-2">
                     <span className="text-xs text-text-muted">
                         {t(
+                            // i18n: user-facing
                             `${services.length} 个服务 · 5s 轮询`,
                             `${services.length} services · 5s poll`,
                         )}
                     </span>
                     <ActionBtn
-                        label={t("全部启动", "Up all")}
+                        label={t("全部启动", "Up all")} // i18n: user-facing
                         disabled={busy}
                         onClick={() => setPending({ method: "up" })}
                     />
                     <ActionBtn
-                        label={t("全部停止", "Down all")}
+                        label={t("全部停止", "Down all")} // i18n: user-facing
                         danger
                         disabled={busy}
                         onClick={() => setPending({ method: "down" })}
@@ -213,17 +214,19 @@ export function ServicesPage() {
                 title={
                     pending
                         ? t(
+                              // i18n: user-facing
                               `确认${OP_NAMES[pending.method].zh}${pending.service ? ` ${pending.service}` : "全部服务"}？`,
                               `Confirm ${pending.method} ${pending.service ?? "all services"}?`,
                           )
                         : ""
                 }
                 description={t(
+                    // i18n: user-facing
                     "supervisor 经与 fusion-sv CLI 相同的 RPC 路径执行此操作。",
                     "The supervisor executes this through the same RPC path as the fusion-sv CLI.",
                 )}
-                confirmLabel={t("确认", "Confirm")}
-                cancelLabel={t("取消", "Cancel")}
+                confirmLabel={t("确认", "Confirm")} // i18n: user-facing
+                cancelLabel={t("取消", "Cancel")} // i18n: user-facing
                 onConfirm={() => pending && runOp(pending)}
                 onCancel={() => setPending(null)}
             />

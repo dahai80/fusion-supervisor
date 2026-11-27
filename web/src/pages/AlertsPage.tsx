@@ -57,7 +57,7 @@ export function AlertsPage() {
         return (
             <ErrorState
                 message={error}
-                retryLabel={t("重试", "Retry")}
+                retryLabel={t("重试", "Retry")} // i18n: user-facing
                 onRetry={() => void load()}
             />
         );
@@ -69,7 +69,7 @@ export function AlertsPage() {
     const columns: DataTableColumn<EventRow>[] = [
         {
             key: "ts",
-            header: t("时间", "Time"),
+            header: t("时间", "Time"), // i18n: user-facing
             render: (r) => (
                 <span className="text-xs text-text-muted">
                     {formatRelativeTime(
@@ -82,7 +82,7 @@ export function AlertsPage() {
         },
         {
             key: "service",
-            header: t("服务", "Service"),
+            header: t("服务", "Service"), // i18n: user-facing
             render: (r) => (
                 <span className="font-mono text-sm text-text-primary">
                     {r.service}
@@ -91,14 +91,14 @@ export function AlertsPage() {
         },
         {
             key: "kind",
-            header: t("事件", "Event"),
+            header: t("事件", "Event"), // i18n: user-facing
             render: (r) => (
                 <StatusBadge status={kindToBadgeKind(r.kind)} label={r.kind} />
             ),
         },
         {
             key: "detail",
-            header: t("详情", "Detail"),
+            header: t("详情", "Detail"), // i18n: user-facing
             render: (r) => (
                 <span className="text-xs text-text-secondary">{r.detail}</span>
             ),
@@ -109,10 +109,11 @@ export function AlertsPage() {
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
                 <h1 className="text-base text-text-primary">
-                    {t("告警", "Alerts")}
+                    {t("告警", "Alerts") /* i18n: user-facing */}
                 </h1>
                 <span className="text-xs text-text-muted">
                     {t(
+                        // i18n: user-facing
                         `最近 ${events.length} 条事件 · 10s 轮询`,
                         `last ${events.length} events · 10s poll`,
                     )}
@@ -125,8 +126,10 @@ export function AlertsPage() {
                 pageSize={20}
                 emptyState={
                     <EmptyState
+                        // i18n: user-facing
                         title={t("暂无事件记录", "No events recorded")}
                         description={t(
+                            // i18n: user-facing
                             "服务崩溃/恢复/drain/发布/备份事件会出现在这里。",
                             "Crash / recovery / drain / rollout / backup events appear here.",
                         )}

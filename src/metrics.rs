@@ -1,12 +1,13 @@
-// issue #22: Prometheus /metrics 端点纯逻辑渲染。
-// 从 SupervisorCore 内存态生成 Prometheus 文本格式 (text exposition format v0.0.4)。
-// 纯函数, 不持锁不查 DB, 调用方 (HTTP handler) 负责 lock core 后传引用。
-// 锁纪律: handler lock().await → render(&c) → 立即释放, 短持锁同 RPC。
+// issue #22: pure-logic rendering for the Prometheus /metrics endpoint.
+// Generates the Prometheus text format (text exposition format v0.0.4) from SupervisorCore
+// in-memory state. Pure function, no locking, no DB; the caller (HTTP handler) locks
+// the core and passes the reference.
+// Lock discipline: handler lock().await → render(&c) → release immediately, short hold like RPC.
 
 use crate::supervisor::SupervisorCore;
 use crate::supervisor::runner::State;
 
-// State → 1 if Healthy else 0 (供 healthy gauge)。
+// State → 1 if Healthy else 0 (for the healthy gauge).
 fn is_healthy(s: State) -> u32 {
     match s {
         State::Healthy => 1,
@@ -14,7 +15,7 @@ fn is_healthy(s: State) -> u32 {
     }
 }
 
-// State → Prometheus label-safe 字符串 (全小写, 无空格)。
+// State → Prometheus label-safe string (all lowercase, no spaces).
 fn state_label(s: State) -> &'static str {
     match s {
         State::Stopped => "stopped",
@@ -27,24 +28,24 @@ fn state_label(s: State) -> &'static str {
     }
 }
 
-// 渲染 Prometheus 文本格式。core 内存态 → 字符串。
-// 指标:
-//   fusion_sv_up 1                              — daemon 活着 (恒 1, 端点能响应即活)
-//   fusion_sv_services_total{plane="native"}    — native 服务总数
-//   fusion_sv_services_total{plane="compose"}   — compose 容器总数
-//   fusion_sv_service_healthy{service,port,plane} — 1=Healthy, 0=其他态
-//   fusion_sv_service_state{service,port,plane,state} — 1=当前态 (每服务仅其当前态为 1)
-//   fusion_sv_crash_count{service}              — 滑动窗内崩溃次数 (native only)
-//   fusion_sv_alerts_total                      — 去抖后真实发出的告警累计 (issue #37)
-//   fusion_sv_events_pruned_total               — retention sweep 累计清除行数 (issue #37)
+// Render the Prometheus text format. Core in-memory state → string.
+// Metrics:
+//   fusion_sv_up 1                              — daemon alive (always 1, endpoint responding = alive)
+//   fusion_sv_services_total{plane="native"}    — total native services
+//   fusion_sv_services_total{plane="compose"}   — total compose containers
+//   fusion_sv_service_healthy{service,port,plane} — 1=Healthy, 0=other states
+//   fusion_sv_service_state{service,port,plane,state} — 1=current state (only the current state is 1 per service)
+//   fusion_sv_crash_count{service}              — crash count within the sliding window (native only)
+//   fusion_sv_alerts_total                      — actually emitted post-dedup alerts, cumulative (issue #37)
+//   fusion_sv_events_pruned_total               — rows pruned by retention sweeps, cumulative (issue #37)
 pub fn render(core: &SupervisorCore) -> String {
     let mut out = String::with_capacity(4096);
-    // daemon up (端点能响应即活)
+    // daemon up (endpoint responding = alive)
     out.push_str("# HELP fusion_sv_up 1 if the supervisor daemon is responding.\n");
     out.push_str("# TYPE fusion_sv_up gauge\n");
     out.push_str("fusion_sv_up 1\n");
 
-    // native 服务总数
+    // total native services
     let native_n = core.runners.len();
     out.push_str("# HELP fusion_sv_services_total Number of supervised services by plane.\n");
     out.push_str("# TYPE fusion_sv_services_total gauge\n");
@@ -52,8 +53,8 @@ pub fn render(core: &SupervisorCore) -> String {
         "fusion_sv_services_total{{plane=\"native\"}} {native_n}\n"
     ));
 
-    // compose 行一次取齐 — status_all 每次调用都是一次阻塞 docker ps 子进程,
-    // 不得重复调用 (调用方持核心锁, 双倍子进程会加倍锁占用时长)。
+    // fetch compose rows once — each status_all call is a blocking docker ps subprocess,
+    // must not be called repeatedly (caller holds the core lock; double subprocesses double the lock hold time).
     let compose_rows: Vec<_> = if core.compose_enabled() {
         core.status_all()
             .into_iter()
@@ -67,7 +68,7 @@ pub fn render(core: &SupervisorCore) -> String {
         "fusion_sv_services_total{{plane=\"compose\"}} {compose_n}\n"
     ));
 
-    // issue #37: 告警 + retention sweep 累计计数 (daemon 生命周期内单调递增)
+    // issue #37: alert + retention sweep cumulative counters (monotonic within the daemon lifetime)
     out.push_str(
         "# HELP fusion_sv_alerts_total Alerts actually emitted (post-dedup), cumulative.\n",
     );
@@ -76,7 +77,7 @@ pub fn render(core: &SupervisorCore) -> String {
         "fusion_sv_alerts_total {}\n",
         core.alerter.alerts_emitted()
     ));
-    // issue #142: 限流抑制计数 — 此前 getter 无消费方, 排障不可见
+    // issue #142: rate-limit suppression counter — the getter previously had no consumer, invisible when debugging
     out.push_str(
         "# HELP fusion_sv_alerts_rate_limited_total Alerts suppressed by the per (service, kind) rate window, cumulative.\n",
     );
@@ -92,7 +93,7 @@ pub fn render(core: &SupervisorCore) -> String {
         core.events_pruned_total
     ));
 
-    // 每服务 healthy gauge + state gauge + crash_count
+    // per-service healthy gauge + state gauge + crash_count
     out.push_str("# HELP fusion_sv_service_healthy 1 if the service is Healthy, 0 otherwise.\n");
     out.push_str("# TYPE fusion_sv_service_healthy gauge\n");
     out.push_str(
@@ -120,7 +121,7 @@ pub fn render(core: &SupervisorCore) -> String {
         ));
     }
 
-    // compose 容器: 仅 healthy + state gauge (compose 容器无 crash_count)
+    // compose containers: only healthy + state gauge (no crash_count for containers)
     for e in &compose_rows {
         let name = &e.name;
         let port = e.port;
@@ -137,10 +138,10 @@ pub fn render(core: &SupervisorCore) -> String {
     out
 }
 
-// issue #26: 只读 HTTP 状态面 (GET /api/v1/status) 纯逻辑渲染。
-// 镜像 UDS RPC `status` 方法: 每服务 {name, state, port, plane} JSON 数组。
-// 浏览器可达的 ops 面板数据源; start/stop 等变更操作仍只在 UDS RPC。
-// 纯函数, 不持锁, 调用方 (HTTP handler) lock core 后传引用, 同 render 锁纪律。
+// issue #26: pure-logic rendering for the read-only HTTP status face (GET /api/v1/status).
+// Mirrors the UDS RPC `status` method: per-service {name, state, port, plane} JSON array.
+// Data source for the browser-reachable ops panel; start/stop mutations remain UDS RPC only.
+// Pure function, no locking; the caller (HTTP handler) locks the core and passes the reference, same lock discipline as render.
 pub fn render_status_json(core: &SupervisorCore) -> String {
     let entries: Vec<serde_json::Value> = core
         .status_all()
@@ -148,7 +149,7 @@ pub fn render_status_json(core: &SupervisorCore) -> String {
         .map(|e| {
             serde_json::json!({
                 "name": e.name, "state": e.state, "port": e.port, "plane": e.plane,
-                // issue #112: 最近一次 restart 类事件 (与 UDS status 镜像一致)
+                // issue #112: most recent restart-class event (mirrors the UDS status output)
                 "last_restart": e.last_restart,
             })
         })
@@ -200,14 +201,17 @@ mod tests {
             |_, _, _| Ok(()),
         );
         let out = render(&core);
-        assert!(out.contains("fusion_sv_up 1"), "应有 daemon up 指标");
+        assert!(
+            out.contains("fusion_sv_up 1"),
+            "should have the daemon up metric"
+        );
         assert!(
             out.contains("fusion_sv_services_total{plane=\"native\"} 2"),
-            "native 总数应为 2"
+            "native total should be 2"
         );
         assert!(
             out.contains("fusion_sv_services_total{plane=\"compose\"} 0"),
-            "compose 未启用应为 0"
+            "compose disabled should be 0"
         );
     }
 
@@ -225,15 +229,15 @@ mod tests {
             out.contains(
                 "fusion_sv_service_healthy{service=\"fusion-mlx\",port=\"11434\",plane=\"native\"} 1"
             ),
-            "Healthy 服务应 healthy=1"
+            "Healthy service should have healthy=1"
         );
         assert!(
             out.contains("state=\"healthy\"} 1"),
-            "应有 state=healthy gauge"
+            "should have a state=healthy gauge"
         );
         assert!(
             out.contains("fusion_sv_crash_count{service=\"fusion-mlx\"} 0"),
-            "应有 crash_count=0"
+            "should have crash_count=0"
         );
     }
 
@@ -246,7 +250,7 @@ mod tests {
             |_, _, _| Ok(()),
         );
         core.runners[0].state = State::Failed;
-        // 记 2 次崩溃
+        // record 2 crashes
         core.runners[0].policy.record_crash(100);
         core.runners[0].policy.record_crash(101);
         let out = render(&core);
@@ -254,19 +258,19 @@ mod tests {
             out.contains(
                 "fusion_sv_service_healthy{service=\"fusion-mlx\",port=\"11434\",plane=\"native\"} 0"
             ),
-            "Failed 服务应 healthy=0"
+            "Failed service should have healthy=0"
         );
         assert!(
             out.contains("state=\"failed\"} 1"),
-            "应有 state=failed gauge"
+            "should have a state=failed gauge"
         );
         assert!(
             out.contains("fusion_sv_crash_count{service=\"fusion-mlx\"} 2"),
-            "crash_count 应为 2"
+            "crash_count should be 2"
         );
     }
 
-    // issue #37: 告警 + retention sweep 计数器
+    // issue #37: alert + retention sweep counters
     #[test]
     fn test_render_alerts_and_pruned_counters() {
         let mut core = SupervisorCore::new_with_fns(
@@ -279,17 +283,17 @@ mod tests {
         let out = render(&core);
         assert!(
             out.contains("fusion_sv_alerts_total 0"),
-            "初始告警计数应为 0: {out}"
+            "initial alert count should be 0: {out}"
         );
         assert!(
             out.contains("fusion_sv_events_pruned_total 5"),
-            "sweep 计数应为 5: {out}"
+            "sweep count should be 5: {out}"
         );
     }
 
     #[test]
     fn test_render_status_json_mirrors_status_rpc() {
-        // issue #26: 只读状态面 = UDS status RPC 的字段镜像 (name/state/port/plane)
+        // issue #26: read-only status face = field mirror of the UDS status RPC (name/state/port/plane)
         let mut core = SupervisorCore::new_with_fns(
             vec![
                 def("fusion-mlx", Layer::Core, 11434),
@@ -337,7 +341,7 @@ mod tests {
             let label = state_label(st);
             assert!(
                 out.contains(&format!("state=\"{label}\"}} 1")),
-                "状态 {st:?} 应有 state={label} gauge"
+                "state {st:?} should have a state={label} gauge"
             );
         }
     }

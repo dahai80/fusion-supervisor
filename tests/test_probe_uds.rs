@@ -10,7 +10,7 @@ async fn test_probe_uds_healthy() {
         loop {
             if let Ok((mut s, _)) = listener.accept().await {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // 真 daemon 是 newline-delimited 协议: 先读一行 ping 再应答
+                // the real daemon is a newline-delimited protocol: read one ping line then reply
                 let mut line = [0u8; 512];
                 if s.read(&mut line).await.unwrap_or(0) == 0 {
                     continue;
@@ -38,7 +38,7 @@ async fn test_probe_uds_conn_fail() {
     ));
 }
 
-// dispatch 卡死的 daemon (accept 但不应答) 不能得假 Healthy
+// a dispatch-stuck daemon (accepts but never replies) must not get a fake Healthy
 #[tokio::test]
 async fn test_probe_uds_silent_server_is_bad_reply() {
     let sock = format!("/tmp/fusion-sv-silent-{}.sock", std::process::id());
@@ -49,7 +49,7 @@ async fn test_probe_uds_silent_server_is_bad_reply() {
         loop {
             if let Ok((mut s, _)) = listener.accept().await {
                 use tokio::io::AsyncReadExt;
-                // 读但不回 — 模拟 dispatch 卡死
+                // read but never reply — simulating a stuck dispatch
                 let mut line = Vec::new();
                 let _ = s.read(&mut line).await;
                 std::mem::forget(s);

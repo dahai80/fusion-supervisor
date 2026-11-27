@@ -1,22 +1,22 @@
-// issue #22 / #26 / #25: supervisor HTTP 面 (与 metrics 同一 listener)。
-// 路由:
-//   GET  /metrics                Prometheus 文本 (issue #22)
-//   GET  /health                 {"ok":true} (shell 模块健康探针)
-//   GET  /api/v1/status          只读 JSON 状态面, 镜像 UDS status (issue #26)
-//   GET  /api/v1/history?service=&limit=   单服务健康历史 (issue #25)
-//   GET  /api/v1/events?limit=            全局事件流, 告警列表数据源 (issue #25)
-//   GET  /api/v1/logs?service=            日志 tail (复用 RPC dispatch)
-//   GET  /api/v1/boot                     boot 分级面 (issue #62, 只读无 token)
-//   POST /api/v1/boot/pin|boot/group      pin 覆盖 / 分组批量 (issue #62, token)
+// issue #22 / #26 / #25: supervisor HTTP face (same listener as metrics).
+// Routes:
+//   GET  /metrics                Prometheus text (issue #22)
+//   GET  /health                 {"ok":true} (shell module health probe)
+//   GET  /api/v1/status          read-only JSON status, mirrors UDS status (issue #26)
+//   GET  /api/v1/history?service=&limit=   per-service health history (issue #25)
+//   GET  /api/v1/events?limit=            global event stream, alerts-list data source (issue #25)
+//   GET  /api/v1/logs?service=            log tail (reuses RPC dispatch)
+//   GET  /api/v1/boot                     boot tier view (issue #62, read-only, no token)
+//   POST /api/v1/boot/pin|boot/group      pin override / group batch (issue #62, token)
 //   POST /api/v1/{up,down,restart,drain,rollout,backup,shutdown}
-//                                编排操作 — 复用 UDS dispatch, 同一 token 语义
+//                                orchestration ops — reuse UDS dispatch, same token semantics
 //                                (issue #25; Authorization: Bearer / x-token)
-//   POST /api/v1/alerts/ingest   外部告警摄入 (issue #139, token; 事件落库 +
-//                                可选 webhook 转发, dedup_key 可选)
-//   GET  其余路径                web 控制台静态文件 (web_dir 配置, issue #25)
-// 安全边界: listener 绑 loopback (metrics_addr, 默认 127.0.0.1:9100);
-// 变更操作 token 校验与 UDS 完全一致 (FUSION_SV_TOKEN)。
-// 锁纪律: 短持锁 (lock → render → release), 绝不持锁跨 await。
+//   POST /api/v1/alerts/ingest   external alert ingestion (issue #139, token; event persisted +
+//                                optional webhook forward, dedup_key optional)
+//   GET  other paths             web console static files (web_dir config, issue #25)
+// Security boundary: listener binds loopback (metrics_addr, default 127.0.0.1:9100);
+// mutation token validation is identical to UDS (FUSION_SV_TOKEN).
+// Lock discipline: short lock hold (lock → render → release), never hold across await.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,12 +25,12 @@ use serde_json::json;
 
 use crate::supervisor::SupervisorCore;
 
-// 读请求上限: 请求行 + 头 + JSON body (编排操作参数很小)。
+// Read request cap: request line + headers + JSON body (orchestration params are small).
 const MAX_REQUEST_BYTES: usize = 8192;
 
 pub type SharedShutdownTx = Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
 
-// issue #114: bind 提前到 run_daemon 入口 — bind 失败 = fatal, 不再 faceless 空转。
+// issue #114: bind moved up to the run_daemon entry — bind failure = fatal, no more faceless idle loop.
 pub async fn bind_tcp(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(addr, "http server listening (metrics + status + web)");
@@ -89,7 +89,7 @@ struct Request {
     method: String,
     path: String,
     query: String,
-    // Authorization: Bearer <t> 或 x-token: <t>
+    // Authorization: Bearer <t> or x-token: <t>
     token: String,
     body: String,
 }
@@ -109,7 +109,7 @@ fn parse_request(raw: &str) -> Request {
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("authorization: bearer ") {
-            // rest 是 prefix 之后的部分 — 原始 line 同位置切片。
+            // rest is the part after the prefix — slice the original line at the same position.
             let start = line.len() - rest.len();
             token = line[start..].trim().to_string();
         } else if lower.starts_with("x-token:") {
@@ -180,8 +180,8 @@ async fn route(
             };
             http_text("200 OK", "application/json", &body)
         }
-        // PRD app-tiering (issue #62): boot 分级面 — GET 只读无 token (与 status 对齐),
-        // POST pin/group 走 dispatch_http 复用 token 校验。
+        // PRD app-tiering (issue #62): boot tier view — GET is read-only without token
+        // (aligned with status); POST pin/group goes through dispatch_http token validation.
         ("GET", "/api/v1/boot") => {
             let body = {
                 let c = core.lock().await;
@@ -190,7 +190,7 @@ async fn route(
             http_text("200 OK", "application/json", &body)
         }
         ("POST", "/api/v1/boot/pin") => {
-            // issue #82: boot 面请求同带来源
+            // issue #82: boot-plane requests carry origin too
             let Some(mut params) = boot_post_params(&req.body, &req.token) else {
                 return http_text(
                     "400 Bad Request",
@@ -214,7 +214,7 @@ async fn route(
             )
         }
         ("POST", "/api/v1/boot/group") => {
-            // issue #82: 分组停止波也是操作员意图, 来源可追溯
+            // issue #82: group stop waves are operator intent too; origin kept traceable
             let Some(mut params) = boot_post_params(&req.body, &req.token) else {
                 return http_text(
                     "400 Bad Request",
@@ -303,9 +303,11 @@ async fn route(
             };
             http_text("200 OK", "application/json", &body)
         }
-        // issue #139: 外部告警摄入 — token 语义与编排操作一致 (配置了则必须匹配,
-        // 401 不落事件); 事件直接落 history.db (plane="external"), 可选经 Alerter
-        // webhook 转发 (独立实例无 sink, 事件不重复记)。锁内只做 dedup + 落库。
+        // issue #139: external alert ingestion — token semantics match orchestration ops
+        // (must match when configured; 401 does not record an event). Events go straight
+        // into history.db (plane="external"), optionally forwarded via an Alerter webhook
+        // (separate instance without a sink, so events are not double-recorded).
+        // Under the lock: dedup + persist only.
         ("POST", "/api/v1/alerts/ingest") => {
             if let Some(expected) = token
                 && expected != &req.token
@@ -346,7 +348,7 @@ async fn route(
                         &payload.severity,
                     )
                 {
-                    // 回退 dedup 游标 — 白耗窗口会吞掉合法重发
+                    // roll back the dedup cursor — a wasted window would swallow legitimate retries
                     c.ingest_gate.rollback(payload.dedup_key.as_deref());
                     tracing::warn!(err = %e, "ingest event record fail");
                     return http_text(
@@ -371,7 +373,7 @@ async fn route(
                     "{\"ok\":true,\"deduped\":true}",
                 );
             }
-            // webhook 转发锁外 fire-and-forget (网络 I/O 不持锁)
+            // webhook forward is fire-and-forget outside the lock (no network I/O under the lock)
             if !alert_url.is_empty() {
                 let alert = crate::alert::Alert {
                     service: payload.source.clone(),
@@ -388,14 +390,14 @@ async fn route(
             }
             http_text("200 OK", "application/json", "{\"ok\":true}")
         }
-        // 编排操作 (POST) 与日志 (GET): 复用 UDS dispatch, token 语义一致。
+        // Orchestration ops (POST) and logs (GET): reuse UDS dispatch, same token semantics.
         (m, p) if p.starts_with("/api/v1/") => {
             let method = p.trim_start_matches("/api/v1/");
             let is_get_rpc = m == "GET" && (method == "logs" || method == "status");
             if !(m == "POST" || is_get_rpc) {
                 return http_text("404 Not Found", "text/plain", "");
             }
-            // HTTP 凭证 (Bearer/x-token) → RPC params.token (dispatch 校验)。
+            // HTTP credentials (Bearer/x-token) → RPC params.token (validated by dispatch).
             let mut params: serde_json::Value = if req.body.trim().is_empty() {
                 json!({})
             } else {
@@ -410,7 +412,7 @@ async fn route(
                     }
                 }
             };
-            // GET 查询参数并入 params (logs?service=x)。
+            // Merge GET query params into params (logs?service=x).
             if m == "GET" {
                 for kv in req.query.split('&').filter(|s| !s.is_empty()) {
                     if let Some((k, v)) = kv.split_once('=') {
@@ -421,10 +423,11 @@ async fn route(
             if !req.token.is_empty() {
                 params["token"] = json!(req.token);
             }
-            // issue #82: HTTP 编排操作来源可追溯 (方法+路径+对端地址);
-            // issue #173: 对端加调用者身份 (lsof 反查临时端口的属主 pid+进程名,
-            // best-effort — 事后只有端口号不可归因, 两次误杀 fusion-mlx bench 实证)。
-            // 请求体自带 origin 时不覆盖
+            // issue #82: HTTP orchestration ops keep a traceable origin (method+path+peer);
+            // issue #173: enrich the peer with the caller identity (lsof resolves the
+            // ephemeral port owner's pid+process name, best-effort — a bare port number is
+            // not attributable after the fact; two mistaken fusion-mlx bench kills proved it).
+            // Do not overwrite an origin supplied in the request body.
             if params
                 .get("origin")
                 .and_then(|v| v.as_str())
@@ -447,7 +450,7 @@ async fn route(
                 &serde_json::to_string(&resp).unwrap_or_default(),
             )
         }
-        // 其余 GET: web 控制台静态文件 (web_dir 配置时)。
+        // Remaining GETs: web console static files (when web_dir is configured).
         ("GET", _) | ("HEAD", _) => match web_dir {
             Some(dir) => serve_static(dir, &req.path).await,
             None => http_text("404 Not Found", "text/plain", ""),
@@ -463,9 +466,10 @@ fn http_text(status: &str, content_type: &str, body: &str) -> String {
     )
 }
 
-// issue #173: 对端端口 → 调用者身份 (pid + 进程名)。lsof 反查该 TCP 端口
-// (本机连接的临时端口足够唯一), 失败/超时/查不到 = 只回对端地址 (best-effort,
-// 绝不因归因失败拒绝请求)。仅 unix; windows 无 lsof 直接回对端地址。
+// issue #173: peer port → caller identity (pid + process name). lsof resolves the TCP port
+// (a local ephemeral port is unique enough); failure/timeout/no match = return the peer
+// address only (best-effort, never reject a request because attribution failed).
+// unix only; windows has no lsof and returns the peer address directly.
 fn caller_identity(peer: &str) -> String {
     #[cfg(unix)]
     {
@@ -503,8 +507,9 @@ fn caller_identity(peer: &str) -> String {
     }
 }
 
-// boot POST 端点参数: JSON body + Bearer/x-token → params.token (与 catch-all 同语义)。
-// 非 JSON body 返回 None → 调用方 400 (与 catch-all POST 校验一致, 不静默当空参)。
+// boot POST endpoint params: JSON body + Bearer/x-token → params.token (same semantics as
+// the catch-all). A non-JSON body returns None → caller replies 400 (consistent with the
+// catch-all POST validation, not silently treated as empty params).
 fn boot_post_params(body: &str, token: &str) -> Option<serde_json::Value> {
     let mut params: serde_json::Value = if body.trim().is_empty() {
         json!({})
@@ -517,11 +522,11 @@ fn boot_post_params(body: &str, token: &str) -> Option<serde_json::Value> {
     Some(params)
 }
 
-// 静态文件: "/" → index.html; 其余按路径取 (拒绝 ..); 未配置目录 → 404。
+// Static files: "/" → index.html; other paths resolved as-is (reject ..); no configured dir → 404.
 async fn serve_static(web_dir: &Path, path: &str) -> String {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    // 路径穿越防护: 任一组件为 .. 或绝对路径 → 404。
+    // Path traversal guard: any component equal to .. or an absolute path → 404.
     if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
         return http_text("404 Not Found", "text/plain", "");
     }
@@ -530,8 +535,8 @@ async fn serve_static(web_dir: &Path, path: &str) -> String {
         Ok(bytes) => {
             let ct = content_type_for(rel);
             let body = String::from_utf8_lossy(&bytes).into_owned();
-            // 二进制 (字体/图片) 经 lossy 转换会损坏 — 仅文本走此路径;
-            // dist 内字体为 woff2, base64 内联于 CSS, 无独立二进制资源。
+            // Binary files (fonts/images) would be corrupted by lossy conversion — text only;
+            // dist fonts are woff2, base64-inlined in CSS, no standalone binary assets.
             if bytes.contains(&0) {
                 return http_text("404 Not Found", "text/plain", "");
             }
@@ -559,8 +564,9 @@ fn content_type_for(path: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    // issue #173: 归因 best-effort — 本进程自己的监听 socket 一定能被 lsof 反查
-    // 到自身 pid; 查不到时回退纯 peer 地址 (不拒绝请求)。
+    // issue #173: attribution is best-effort — this process's own listening socket can
+    // always be lsof-resolved to its own pid; on failure fall back to the bare peer
+    // address (never reject the request).
     #[cfg(unix)]
     #[test]
     fn test_caller_identity_resolves_own_pid() {
@@ -576,7 +582,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_caller_identity_falls_back_without_socket() {
-        // 没有任何进程持有该端口时 (大概率), lsof 空 → 原样返回 peer
+        // When no process holds the port (the likely case), lsof is empty → return peer as-is
         let id = caller_identity("127.0.0.1:63999");
         assert!(id == "127.0.0.1:63999" || id.contains("(pid"));
     }
@@ -609,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_static_path_traversal_rejected() {
-        // 拒绝 ".." 与空段 (绝对路径拼接)。
+        // Reject ".." and empty segments (absolute path splicing).
         assert!(rel_has_traversal("/../etc/passwd"));
         assert!(rel_has_traversal("/a/../../etc"));
         assert!(!rel_has_traversal("/assets/index.js"));

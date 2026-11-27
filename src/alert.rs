@@ -1,39 +1,42 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// issue #37: 事件落库 sink — 每次真实发出的告警同步写 history.db event 表。
-// (service, kind, detail, ts, plane, severity) 六元组, 由构造方闭包决定落库细节。
+// issue #37: event persistence sink — every actually-emitted alert is synchronously
+// written to the history.db event table.
+// The (service, kind, detail, ts, plane, severity) tuple decides persistence details.
 pub type EventSink = Arc<dyn Fn(&str, &str, &str, u64, &str, &str) + Send + Sync>;
 
-// 告警: ServiceDown 去抖 (5min/服务), 其余每次发。sink = tracing WARN + 可选 webhook。
-// webhook 投递失败重试 3 次退回仅日志, 不影响监督 (spec §6.1)。
+// Alerts: ServiceDown is deduped (5min per service), the rest emit every time.
+// sink = tracing WARN + optional webhook.
+// Webhook delivery retries 3 times on failure then falls back to log-only,
+// never affecting supervision (spec §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertKind {
     ServiceDown,
     ServiceBack,
     RestartFailed,
     RestartCapHit,
-    // compose 容器失败期间 docker state 变化 (新事件, 不去抖)
+    // compose container docker state changed while failing (new event, not deduped)
     ContainerStateChange,
-    // compose 容器连续失败达阈值升级 (crash-loop, 不去抖)
+    // compose container consecutive failures reached escalation threshold (crash-loop, not deduped)
     ContainerCrashLoop,
-    // issue #9: 服务 drain 完成 (摘流量后停止, 正常事件)
+    // issue #9: service drain completed (stopped after traffic removal, normal event)
     ServiceDrained,
-    // issue #9: rollout prewarm 失败 (启动后超时未达 Healthy)
+    // issue #9: rollout prewarm failed (did not reach Healthy within timeout after start)
     RolloutPrewarmFailed,
-    // issue #10: 备份失败 (目标未设/不可写/docker exec 失败)
+    // issue #10: backup failed (target unset/unwritable/docker exec failure)
     BackupFailed,
-    // issue #47: 配置致命退出 (exit 78, EX_CONFIG) — 重启无救, 需人工修配置
+    // issue #47: config-fatal exit (exit 78, EX_CONFIG) — restart cannot help, needs manual config fix
     ServiceConfigFatal,
-    // issue #47: 快速失败熔断 (start 成功后秒级又宕, 连续达阈值)
+    // issue #47: fast-fail circuit breaker (dies seconds after a successful start, repeatedly)
     FastFailLoop,
-    // issue #112: 自动恢复 (crash/start-retry 退避流) 实际拉起成功 — 审计事件,
-    // 不去抖。detail 携带 old/new pid; 触发原因见紧邻的 ServiceDown 行。
+    // issue #112: crash/start-retry backoff flow actually restarted the service — audit event,
+    // not deduped. detail carries old/new pid; see the adjacent ServiceDown row for the trigger.
     AutoRestart,
-    // issue #137: 定时任务执行失败 (非零退出 / 超时被杀 / spawn 失败)。不去抖。
+    // issue #137: scheduled job execution failed (nonzero exit / timeout kill / spawn failure). Not deduped.
     JobFailed,
-    // issue #139: 外部摄入告警经 webhook 转发时的 kind 标签 (事件本身由
-    // ingest 路径直接落库, 此处仅 re-emit, sink 恒空 — 不重复记事件)。
+    // issue #139: kind label when externally-ingested alerts are re-emitted via webhook (the event itself is
+    // persisted directly by the ingest path; only re-emitted here, sink always empty — no duplicate events).
     External,
 }
 
@@ -66,23 +69,24 @@ pub struct Alert {
     pub ts: u64,
 }
 
-// issue #142: 每 (service, kind) 滑动窗口限流 — 同 key 60s 内最多 10 条, 超出
-// 抑制。防御纵深: 状态机 bug 时不让 webhook / event 表被风暴打满
-// (ServiceDown 去抖只护一种 kind, 其余 kind 依赖源头边沿触发正确)。
+// issue #142: per (service, kind) sliding-window rate limit — max 10 per key within 60s,
+// beyond that suppressed. Defense in depth: a state-machine bug must not flood the
+// webhook / event table (ServiceDown dedup only guards one kind; the rest rely on
+// correct edge triggering at the source).
 const RATE_WINDOW_SEC: u64 = 60;
 const RATE_MAX_PER_WINDOW: usize = 10;
 
 pub struct Alerter {
     dedup_sec: u64,
     last_down: HashMap<String, u64>,
-    // issue #142: (service, kind) → 窗口内已发时间戳 (升序)
+    // issue #142: (service, kind) → emitted timestamps within the window (ascending)
     rate_window: HashMap<(String, &'static str), Vec<u64>>,
     webhook_url: String,
-    // issue #37: 告警 → event 表的落库 sink (可选; 未设置则不落库, 测试用)
+    // issue #37: alert → event table persistence sink (optional; unset = no persistence, tests)
     event_sink: Option<EventSink>,
-    // issue #37: 真实发出 (去抖后) 的告警累计数 (/metrics fusion_sv_alerts_total)
+    // issue #37: actually emitted (post-dedup) alert count (/metrics fusion_sv_alerts_total)
     alerts_emitted: u64,
-    // issue #142: 被限流抑制的告警累计数 (排障可见性)
+    // issue #142: alerts suppressed by rate limiting (debugging visibility)
     alerts_rate_limited: u64,
 }
 
@@ -99,7 +103,7 @@ impl Alerter {
         }
     }
 
-    // issue #37: 注入事件落库 sink (builder 风格, 生产构造处调用)
+    // issue #37: inject the event persistence sink (builder style, called at the production construction site)
     pub fn with_event_sink(mut self, sink: EventSink) -> Self {
         self.event_sink = Some(sink);
         self
@@ -109,12 +113,12 @@ impl Alerter {
         self.alerts_emitted
     }
 
-    // issue #142: 被限流抑制的告警累计数
+    // issue #142: alerts suppressed by rate limiting, cumulative
     pub fn alerts_rate_limited(&self) -> u64 {
         self.alerts_rate_limited
     }
 
-    // issue #142: 纯判定 — 同 (service, kind) 窗口内已发条数未达上限
+    // issue #142: pure check — emitted count for the same (service, kind) window is below the cap
     fn rate_ok(&self, service: &str, kind: &AlertKind, ts: u64) -> bool {
         match self.rate_window.get(&(service.to_string(), kind.label())) {
             None => true,
@@ -128,11 +132,11 @@ impl Alerter {
         }
     }
 
-    // issue #37: kind → severity 映射 (crash-loop 升级=error, 恢复/正常事件=info, 其余 warn)
+    // issue #37: kind → severity mapping (crash-loop escalation=error, recovery/normal events=info, rest warn)
     fn severity_of(kind: &AlertKind) -> &'static str {
         match kind {
             AlertKind::ContainerCrashLoop => "error",
-            // issue #47: 配置致命/快速失败熔断均为升级事件; #137 任务失败同升级
+            // issue #47: config-fatal/fast-fail circuit breaker are escalation events; #137 job failure likewise
             AlertKind::ServiceConfigFatal | AlertKind::FastFailLoop | AlertKind::JobFailed => {
                 "error"
             }
@@ -141,7 +145,8 @@ impl Alerter {
         }
     }
 
-    // 纯判定: ServiceDown 在去抖窗内 = 抑制; 再叠加每 (service, kind) 限流窗。
+    // Pure check: ServiceDown within the dedup window = suppressed; additionally layered
+    // with the per (service, kind) rate window.
     pub fn should_emit(&self, service: &str, kind: &AlertKind, ts: u64) -> bool {
         if *kind == AlertKind::ServiceDown {
             let dedup_passed = match self.last_down.get(service) {
@@ -155,7 +160,7 @@ impl Alerter {
         self.rate_ok(service, kind, ts)
     }
 
-    // 记录已发 (供测试与 alert() 内部调用)。
+    // Record as emitted (used by tests and internally by alert()).
     pub fn record_emitted(&mut self, service: &str, kind: &AlertKind, ts: u64) {
         if *kind == AlertKind::ServiceDown {
             self.last_down.insert(service.to_string(), ts);
@@ -173,7 +178,8 @@ impl Alerter {
             if self.rate_ok(&alert.service, &alert.kind, alert.ts) {
                 tracing::debug!(svc = %alert.service, kind = alert.kind.label(), "alert dedup skip");
             } else {
-                // issue #142: 限流抑制 — WARN 一次可见 (排障线索), 不进 webhook/事件表
+                // issue #142: rate-limit suppression — single WARN for visibility (debugging clue),
+                // never reaches webhook/event table
                 self.alerts_rate_limited += 1;
                 tracing::warn!(
                     svc = %alert.service,
@@ -185,7 +191,7 @@ impl Alerter {
             }
             return Ok(());
         }
-        // CrashLoop / config-fatal / 快速失败熔断升级用 ERROR, 其余 WARN (便于运维筛升级事件)
+        // CrashLoop / config-fatal / fast-fail circuit breaker escalate to ERROR, the rest WARN (ops filters escalation events)
         let is_escalation = matches!(
             alert.kind,
             AlertKind::ContainerCrashLoop
@@ -209,7 +215,7 @@ impl Alerter {
             );
         }
         self.record_emitted(&alert.service, &alert.kind, alert.ts);
-        // issue #37: 真实发出的告警 → 计数 + 事件落库 (dedup 通过才到这, 不重复记录)
+        // issue #37: actually emitted alert → count + event persistence (only reached after dedup passes, no duplicates)
         self.alerts_emitted += 1;
         if let Some(sink) = &self.event_sink {
             sink(
@@ -224,7 +230,7 @@ impl Alerter {
         if !self.webhook_url.is_empty()
             && let Err(e) = self.send_webhook(&alert).await
         {
-            tracing::warn!(err = %e, "webhook send fail (退回仅日志, 不影响监督)");
+            tracing::warn!(err = %e, "webhook send fail (falling back to log-only, supervision unaffected)");
         }
         Ok(())
     }
@@ -243,7 +249,8 @@ impl Alerter {
         let mut last_err = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
-                // 重试间加退避 — 旧实现 3 连发零间隔, 对端死亡时瞬时 3 连击
+                // backoff between retries — old implementation fired 3 times with zero gap,
+                // hitting a dead endpoint with an instant triple burst
                 tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
             }
             match client.post(&self.webhook_url).json(&body).send().await {
@@ -269,13 +276,13 @@ mod tests {
     fn test_dedup_down_within_window() {
         let mut a = Alerter::new(300, String::new());
         assert!(a.should_emit("fusion-rag", &AlertKind::ServiceDown, 1000));
-        // 记录已发
+        // record as emitted
         a.record_emitted("fusion-rag", &AlertKind::ServiceDown, 1000);
-        // 5min 内不重发
+        // no re-emit within 5min
         assert!(!a.should_emit("fusion-rag", &AlertKind::ServiceDown, 1000 + 299));
-        // 300s 边界: 仍抑制 (<= window)
+        // 300s boundary: still suppressed (<= window)
         assert!(!a.should_emit("fusion-rag", &AlertKind::ServiceDown, 1000 + 300));
-        // 301s: 释放
+        // 301s: released
         assert!(a.should_emit("fusion-rag", &AlertKind::ServiceDown, 1000 + 301));
     }
 
@@ -283,14 +290,14 @@ mod tests {
     fn test_dedup_per_service_isolated() {
         let mut a = Alerter::new(300, String::new());
         a.record_emitted("fusion-rag", &AlertKind::ServiceDown, 1000);
-        // 另一服务不受影响
+        // another service is unaffected
         assert!(a.should_emit("fusion-mlx", &AlertKind::ServiceDown, 1000 + 100));
     }
 
     #[test]
     fn test_other_kinds_always_emit() {
         let mut a = Alerter::new(300, String::new());
-        // ServiceBack / RestartFailed / RestartCapHit 不去抖, 每次都发
+        // ServiceBack / RestartFailed / RestartCapHit are not deduped, emit every time
         assert!(a.should_emit("fusion-rag", &AlertKind::ServiceBack, 1000));
         a.record_emitted("fusion-rag", &AlertKind::ServiceBack, 1000);
         assert!(a.should_emit("fusion-rag", &AlertKind::ServiceBack, 1001));
@@ -299,7 +306,7 @@ mod tests {
         assert!(a.should_emit("fusion-rag", &AlertKind::RestartCapHit, 1000));
     }
 
-    // issue #142: 每 (service, kind) 限流窗 — 同 key 60s 内超 10 条抑制
+    // issue #142: per (service, kind) rate window — more than 10 per key within 60s suppressed
     #[test]
     fn test_issue142_rate_limit_per_service_kind() {
         let mut a = Alerter::new(300, String::new());
@@ -307,12 +314,12 @@ mod tests {
             assert!(a.should_emit("svc", &AlertKind::ServiceBack, 1000 + i));
             a.record_emitted("svc", &AlertKind::ServiceBack, 1000 + i);
         }
-        // 第 11 条 (60s 窗内) 抑制
+        // 11th emit (within 60s window) suppressed
         assert!(!a.should_emit("svc", &AlertKind::ServiceBack, 1009));
-        // 其他 kind / 其他服务不受影响
+        // other kinds / other services unaffected
         assert!(a.should_emit("svc", &AlertKind::ServiceDown, 1009));
         assert!(a.should_emit("svc2", &AlertKind::ServiceBack, 1009));
-        // 窗口滑出后释放
+        // released after the window slides past
         assert!(a.should_emit("svc", &AlertKind::ServiceBack, 1000 + RATE_WINDOW_SEC));
     }
 
@@ -327,7 +334,7 @@ mod tests {
             "ContainerStateChange"
         );
         assert_eq!(AlertKind::ContainerCrashLoop.label(), "ContainerCrashLoop");
-        // issue #47: 新增升级告警 kind
+        // issue #47: new escalation alert kinds
         assert_eq!(AlertKind::ServiceConfigFatal.label(), "ServiceConfigFatal");
         assert_eq!(AlertKind::FastFailLoop.label(), "FastFailLoop");
     }

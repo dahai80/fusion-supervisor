@@ -1,5 +1,5 @@
-// issue #20: Method::Shutdown RPC — 发送 shutdown 信号, 返回 "ok", rx 收到信号。
-// Top 是客户端命令, server arm 返回 -32601 带说明。
+// issue #20: Method::Shutdown RPC — sends the shutdown signal, returns "ok", rx receives the signal.
+// Top is a client-side command, the server arm returns -32601 with an explanation.
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::probe::ProbeResult;
 use fusion_supervisor::rpc::client::RpcClient;
@@ -75,10 +75,10 @@ async fn test_rpc_shutdown_sends_signal_and_returns_ok() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let mut client = RpcClient::connect(&sock).await.unwrap();
     let resp = shutdown_call(&mut client, 1).await;
-    assert_eq!(resp.result, Some(json!("ok")), "shutdown 应返回 ok");
-    assert!(resp.error.is_none(), "不应有 error");
-    // 信号应到达 rx
-    rx.await.expect("shutdown 信号未收到");
+    assert_eq!(resp.result, Some(json!("ok")), "shutdown should return ok");
+    assert!(resp.error.is_none(), "should have no error");
+    // the signal should reach rx
+    rx.await.expect("shutdown signal not received");
     server.abort();
     let _ = std::fs::remove_file(&sock);
 }
@@ -108,15 +108,15 @@ async fn test_rpc_shutdown_idempotent_second_call_unavailable() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let mut client = RpcClient::connect(&sock).await.unwrap();
-    // 第一次取走 tx 发送
+    // first call takes the tx and sends
     let resp1 = shutdown_call(&mut client, 1).await;
     assert_eq!(resp1.result, Some(json!("ok")));
-    // 第二次: tx 已 take → unavailable
+    // second call: tx already taken → unavailable
     let resp2 = shutdown_call(&mut client, 2).await;
     assert_eq!(
         resp2.error.map(|e| e.code),
         Some(-32000),
-        "重复 shutdown 应 -32000 unavailable"
+        "repeat shutdown should return -32000 unavailable"
     );
     server.abort();
     let _ = std::fs::remove_file(&sock);
@@ -150,14 +150,14 @@ async fn test_rpc_top_returns_32601_client_side_message() {
     assert_eq!(
         resp.error.as_ref().map(|e| e.code),
         Some(-32601),
-        "top 应 -32601 (客户端命令)"
+        "top should return -32601 (client-side command)"
     );
     assert!(
         resp.error
             .as_ref()
             .map(|e| e.message.contains("client-side"))
             .unwrap_or(false),
-        "error message 应说明 client-side"
+        "error message should mention client-side"
     );
     server.abort();
     let _ = std::fs::remove_file(&sock);

@@ -1,6 +1,6 @@
-// issue #22: Prometheus /metrics HTTP 端点集成测试。
-// 启动 core + metrics HTTP server 于临时端口, reqwest GET /metrics, 断言响应体含指标。
-// 镜像 test_rpc_shutdown.rs 的 spawn-core-then-connect-then-cleanup 结构。
+// issue #22: Prometheus /metrics HTTP endpoint integration tests.
+// Start core + metrics HTTP server on a temp port, reqwest GET /metrics, assert the body contains metrics.
+// Mirrors test_rpc_shutdown.rs's spawn-core-then-connect-then-cleanup structure.
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::probe::ProbeResult;
 use fusion_supervisor::supervisor::{SupervisorCore, runner::State};
@@ -27,8 +27,8 @@ fn cfg() -> fusion_supervisor::config::Config {
     }
 }
 
-// 复用 main.rs 的 serve_metrics 需要进程内函数; 此测试改为直接在测试内
-// 跑同样的 hand-rolled HTTP (复用 metrics::render 纯函数), 验证端到端 HTTP 路径。
+// Reusing main.rs's serve_metrics would need an in-process function; this test instead runs
+// the same hand-rolled HTTP inline (reusing the metrics::render pure function) to verify the end-to-end HTTP path.
 async fn start_metrics_server(
     core: Arc<tokio::sync::Mutex<SupervisorCore>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -69,7 +69,7 @@ async fn start_metrics_server(
 }
 
 async fn http_get(url: &str) -> String {
-    // 原生 TcpStream 手写 GET (避免测试依赖 reqwest, 保持零新依赖原则)。
+    // hand-rolled GET over a raw TcpStream (avoids a reqwest test dependency, keeping the zero-new-deps principle).
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(url).await.unwrap();
     stream
@@ -90,7 +90,7 @@ async fn test_metrics_endpoint_returns_daemon_up_and_service_gauges() {
         |_, _, _| Ok(()),
     );
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
-    // 预置状态: mlx=Healthy, rag=Failed + crash_count=2
+    // preset states: mlx=Healthy, rag=Failed + crash_count=2
     {
         let mut c = core_arc.lock().await;
         c.runners[0].state = State::Healthy;
@@ -100,46 +100,49 @@ async fn test_metrics_endpoint_returns_daemon_up_and_service_gauges() {
     }
     let (addr, handle) = start_metrics_server(core_arc.clone()).await;
     let resp = http_get(&addr).await;
-    // 断言 HTTP 200
+    // assert HTTP 200
     assert!(
         resp.starts_with("HTTP/1.1 200"),
-        "应返回 200: {}",
+        "should return 200: {}",
         &resp[..30]
     );
     assert!(
         resp.contains("text/plain; version=0.0.4"),
-        "应含 Prometheus content-type"
+        "should contain the Prometheus content-type"
     );
-    // 断言指标体
+    // assert metric body
     let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
-    assert!(body.contains("fusion_sv_up 1"), "应有 daemon up 指标");
+    assert!(
+        body.contains("fusion_sv_up 1"),
+        "should have the daemon up metric"
+    );
     assert!(
         body.contains("fusion_sv_services_total{plane=\"native\"} 2"),
-        "native 总数应为 2"
+        "native total should be 2"
     );
     assert!(
         body.contains("fusion_sv_services_total{plane=\"compose\"} 0"),
-        "compose 未启用应为 0"
+        "compose disabled should be 0"
     );
     assert!(
         body.contains(
             "fusion_sv_service_healthy{service=\"fusion-mlx\",port=\"11434\",plane=\"native\"} 1"
         ),
-        "Healthy 服务应 healthy=1"
+        "Healthy service should have healthy=1"
     );
     assert!(
         body.contains(
             "fusion_sv_service_healthy{service=\"fusion-rag\",port=\"11436\",plane=\"native\"} 0"
         ),
-        "Failed 服务应 healthy=0"
+        "Failed service should have healthy=0"
     );
     assert!(
         body.contains("state=\"failed\"} 1"),
-        "应有 state=failed gauge"
+        "should have a state=failed gauge"
     );
     assert!(
         body.contains("fusion_sv_crash_count{service=\"fusion-rag\"} 2"),
-        "crash_count 应为 2"
+        "crash_count should be 2"
     );
     handle.abort();
 }
@@ -165,7 +168,7 @@ async fn test_metrics_endpoint_404_for_non_metrics_path() {
     let resp = String::from_utf8_lossy(&resp).to_string();
     assert!(
         resp.starts_with("HTTP/1.1 404"),
-        "非 /metrics 路径应 404: {}",
+        "non-/metrics path should 404: {}",
         &resp[..30]
     );
     handle.abort();
@@ -173,18 +176,18 @@ async fn test_metrics_endpoint_404_for_non_metrics_path() {
 
 #[tokio::test]
 async fn test_metrics_addr_none_disables_server() {
-    // Config::default() metrics_addr = Some; 显式置 None 应不启 server。
-    // 此测试验证 config 层: None → run_daemon 不 spawn metrics task。
-    // (run_daemon 内部逻辑: if let Some(addr) = &cfg.metrics_addr → spawn; None → skip)
+    // Config::default() metrics_addr = Some; explicitly setting None must not start the server.
+    // This test verifies the config layer: None → run_daemon does not spawn the metrics task.
+    // (run_daemon internals: if let Some(addr) = &cfg.metrics_addr → spawn; None → skip)
     let mut c = cfg();
     c.metrics_addr = None;
-    assert!(c.metrics_addr.is_none(), "None 应保持 None");
-    // 默认应为 Some
+    assert!(c.metrics_addr.is_none(), "None should stay None");
+    // default should be Some
     let d = fusion_supervisor::config::Config::default();
-    assert!(d.metrics_addr.is_some(), "default 应 Some");
+    assert!(d.metrics_addr.is_some(), "default should be Some");
     assert_eq!(
         d.metrics_addr.unwrap(),
         "127.0.0.1:9100",
-        "默认地址应为 127.0.0.1:9100"
+        "default address should be 127.0.0.1:9100"
     );
 }

@@ -1,11 +1,11 @@
-// issue #10: NAS 备份原语。Postgres (pg_dumpall → gzip) + Qdrant (storage 目录快照) → FUSION_BACKUP_TARGET。
-// 设计: injectable ExecFn 便于测试 (生产=shell docker compose exec, 测试=fake 不调 docker)。
-// fail-closed: FUSION_BACKUP_TARGET 未设 → 拒绝 + 告警 BackupFailed (生产安全任务不静默跳过)。
-// 保留: backup_retention 份, 新备份后裁剪旧备份, 记日志。结果写 history.db event(kind=Backup)。
-// issue #77: native 备份平面 — compose.enabled=false (默认) 时走本机 brew PostgreSQL
-// (authoritative 实例, 见 architecture/fusion-db-conventions-1030.md §1): PATH 解析 pg_dumpall
-// 直连 127.0.0.1:5432; Qdrant 探测本机容器 (docker ps), 不存在 → INFO 事件跳过 (缺席非错误)。
-// compose 平面行为不变。事件 detail 记录 plane=native|compose。
+// issue #10: NAS backup primitives. Postgres (pg_dumpall → gzip) + Qdrant (storage dir snapshot) → FUSION_BACKUP_TARGET.
+// Design: injectable ExecFn for testability (prod=shell docker compose exec, test=fake that never calls docker).
+// fail-closed: FUSION_BACKUP_TARGET unset → refuse + BackupFailed alert (prod safety tasks never skip silently).
+// Retention: keep backup_retention copies, prune old backups after each new one, log it. Result written to history.db event(kind=Backup).
+// issue #77: native backup plane — when compose.enabled=false (default) use local brew PostgreSQL
+// (authoritative instance, see architecture/fusion-db-conventions-1030.md §1): resolve pg_dumpall from PATH
+// and connect directly to 127.0.0.1:5432; Qdrant probes the local container (docker ps), absent → INFO event skip (absence is not an error).
+// compose-plane behavior unchanged. Event detail records plane=native|compose.
 use crate::alert::{Alert, AlertKind, Alerter};
 use crate::store::HistoryStore;
 use anyhow::{Context, Result, bail};
@@ -14,22 +14,22 @@ use flate2::write::GzEncoder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// 注入的 docker compose exec 函数。签名: (service, args) -> stdout bytes。
-// 生产=真 docker compose exec; 测试=fake 返回固定 dump bytes。
+// Injected docker compose exec fn. Signature: (service, args) -> stdout bytes.
+// prod=real docker compose exec; test=fake returning fixed dump bytes.
 pub type ExecFn = Arc<dyn Fn(&str, &[&str]) -> Result<Vec<u8>> + Send + Sync>;
 
-// issue #77: 注入的 native exec 函数。签名: (bin, args) -> stdout bytes。
-// 生产=直接 spawn 本机二进制 (pg_dumpall / docker); 测试=fake。
-// 注意: 只用于小输出 (docker ps / tar 元数据)。大输出 (dump 流) 走 DumpFn 流式, 见 #115。
+// issue #77: injected native exec fn. Signature: (bin, args) -> stdout bytes.
+// prod=spawn local binary directly (pg_dumpall / docker); test=fake.
+// Note: only for small outputs (docker ps / tar metadata). Large output (dump stream) goes through DumpFn streaming, see #115.
 pub type NativeExecFn = Arc<dyn Fn(&str, &[&str]) -> Result<Vec<u8>> + Send + Sync>;
 
-// issue #115: dump 流式执行函数。签名: (bin, args, out_path) -> gzip 压缩字节数。
-// 子进程 stdout 直接流过 GzEncoder 写文件 — 不经内存缓冲 (旧实现整包 Vec<u8>
-// 缓冲, 2.2GB dump 驻留 daemon RSS, 生产实证 2026-11-09)。生产=真 spawn;
-// 测试=fake 直接写 gzip。
+// issue #115: streaming dump fn. Signature: (bin, args, out_path) -> gzipped byte count.
+// Child stdout streams straight through GzEncoder into the file — no in-memory buffering (old impl buffered
+// a full Vec<u8>, a 2.2GB dump sat in daemon RSS, prod incident 2026-11-09). prod=real spawn;
+// test=fake writing gzip directly.
 pub type DumpFn = Arc<dyn Fn(&str, &[&str], &Path) -> Result<u64> + Send + Sync>;
 
-// dump stderr 文件尾读取 (失败消息携带根因, 最多 lines 行)。
+// Read the tail of the dump stderr file (failure message carries the root cause, at most lines lines).
 fn read_file_tail(path: &Path, lines: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(s) => {
@@ -41,16 +41,16 @@ fn read_file_tail(path: &Path, lines: usize) -> String {
     }
 }
 
-// 生产 dump 流式执行: spawn bin, stdout 逐块 gzip → out_path, stderr 收满尾。
-// FUSION_PG_PASSWORD 设置时注入 PGPASSWORD (与 real_native_exec 同语义)。
-// 失败语义: spawn 失败 / 退出码非 0 → bail (fail-closed 由 run() 告警)。
+// Prod streaming dump: spawn bin, gzip stdout chunk by chunk → out_path, collect the stderr tail.
+// Injects PGPASSWORD when FUSION_PG_PASSWORD is set (same semantics as real_native_exec).
+// Failure semantics: spawn failure / non-zero exit → bail (fail-closed alerting done by run()).
 pub fn real_dump_fn() -> DumpFn {
     Arc::new(|bin: &str, args: &[&str], out_path: &Path| {
         tracing::info!(bin, args = ?args, out = %out_path.display(), "exec dump (stream)");
         let mut cmd = std::process::Command::new(bin);
-        // stderr 落文件而非 inherit — launchd 下 inherit 的输出不进任何日志,
-        // exit 1 无从定位 (2026-11-09 实证: PG 侧 cancel 后只见 exit Some(1))。
-        // 文件直写无 pipe 满阻塞风险。
+        // stderr goes to a file instead of inherit — under launchd inherited output lands in no log,
+        // exit 1 unattributable (2026-11-09 incident: after PG-side cancel only exit Some(1) was visible).
+        // Direct file write has no pipe-full blocking risk.
         let err_path = out_path.with_file_name(format!(
             "{}.stderr.log",
             out_path.file_name().unwrap_or_default().to_string_lossy()
@@ -72,10 +72,10 @@ pub fn real_dump_fn() -> DumpFn {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {bin}: {e}"))?;
         let Some(stdout) = child.stdout.take() else {
-            // 错误路径也要收尸 — 不 wait 会留僵尸进程
+            // Reap on the error path too — skipping wait leaves a zombie process
             let _ = child.kill();
             let _ = child.wait();
-            bail!("{bin} stdout 不可读");
+            bail!("{bin} stdout unreadable");
         };
         let f = std::fs::File::create(out_path)
             .with_context(|| format!("create backup file {}", out_path.display()))?;
@@ -90,7 +90,7 @@ pub fn real_dump_fn() -> DumpFn {
         let n = match streamed {
             Ok(n) => n,
             Err(e) => {
-                // 流式段失败: 杀掉并收尸 pg_dumpall 子进程再返回
+                // Streaming phase failed: kill and reap the pg_dumpall child before returning
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(e);
@@ -98,16 +98,16 @@ pub fn real_dump_fn() -> DumpFn {
         };
         let out = child.wait().with_context(|| format!("wait {bin}"))?;
         if !out.success() {
-            // 失败时把 stderr 尾部带进错误 (告警/event 可见根因)
+            // Attach the stderr tail to the error on failure (root cause visible in alerts/events)
             let tail = read_file_tail(&err_path, 20);
-            bail!("{bin} 失败: exit {:?}, stderr tail: {}", out.code(), tail);
+            bail!("{bin} failed: exit {:?}, stderr tail: {}", out.code(), tail);
         }
         Ok(n)
     })
 }
 
-// 生产 native exec: 直接 spawn 二进制。FUSION_PG_PASSWORD 设置时注入 PGPASSWORD
-// (brew trust auth 下通常不需要, 留作远程/密码认证场景)。
+// Prod native exec: spawn the binary directly. Injects PGPASSWORD when FUSION_PG_PASSWORD is set
+// (usually unneeded under brew trust auth, kept for remote/password auth scenarios).
 pub fn real_native_exec() -> NativeExecFn {
     Arc::new(|bin: &str, args: &[&str]| {
         tracing::info!(bin, args = ?args, "exec native (backup)");
@@ -123,35 +123,37 @@ pub fn real_native_exec() -> NativeExecFn {
             .map_err(|e| anyhow::anyhow!("spawn {bin}: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("{bin} 失败: {}", stderr.trim());
+            bail!("{bin} failed: {}", stderr.trim());
         }
         Ok(out.stdout)
     })
 }
 
-// issue #77: 从 PATH 解析 pg_dumpall 绝对路径 (日志可见解析结果)。
-// 解析不到回退裸名 "pg_dumpall" (spawn 失败在 run 时 fail-closed 告警)。
+// issue #77: resolve the pg_dumpall absolute path from PATH (resolution result visible in logs).
+// Falls back to the bare name "pg_dumpall" when unresolved (spawn failure fail-closed alerts at run time).
 fn resolve_pg_dump_bin(override_bin: &Option<String>) -> String {
     if let Some(b) = override_bin
         && !b.trim().is_empty()
     {
-        tracing::info!(bin = %b, "pg_dumpall 使用配置覆盖路径");
+        tracing::info!(bin = %b, "pg_dumpall using configured override path");
         return b.trim().to_string();
     }
     if let Ok(paths) = std::env::var("PATH") {
         for dir in std::env::split_paths(&paths) {
             let cand = dir.join("pg_dumpall");
             if cand.is_file() {
-                tracing::info!(bin = %cand.display(), "pg_dumpall 已从 PATH 解析");
+                tracing::info!(bin = %cand.display(), "pg_dumpall resolved from PATH");
                 return cand.to_string_lossy().into_owned();
             }
         }
     }
-    tracing::warn!("PATH 未找到 pg_dumpall, 回退裸名 (spawn 失败将 fail-closed 告警)");
+    tracing::warn!(
+        "pg_dumpall not found in PATH, falling back to bare name (spawn failure will fail-closed alert)"
+    );
     "pg_dumpall".to_string()
 }
 
-// 生产 exec: shell `docker compose --env-file ... -f sidecar -f business exec <svc> <args>`
+// Prod exec: shell `docker compose --env-file ... -f sidecar -f business exec <svc> <args>`
 pub fn real_exec(sidecar: &Path, business: &Path, env_file: &Path) -> ExecFn {
     let sidecar = sidecar.to_path_buf();
     let business = business.to_path_buf();
@@ -178,39 +180,39 @@ pub fn real_exec(sidecar: &Path, business: &Path, env_file: &Path) -> ExecFn {
             .map_err(|e| anyhow::anyhow!("spawn docker compose exec: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("docker compose exec {svc} 失败: {}", stderr.trim());
+            bail!("docker compose exec {svc} failed: {}", stderr.trim());
         }
         Ok(out.stdout)
     })
 }
 
 pub struct BackupRunner {
-    // compose 平面 exec (docker compose exec)
+    // compose-plane exec (docker compose exec)
     exec: ExecFn,
-    // issue #77: native 平面 exec (直接 spawn 本机二进制)
+    // issue #77: native-plane exec (spawn local binary directly)
     native_exec: NativeExecFn,
-    // issue #115: dump 流式执行 (pg_dumpall stdout → gzip 文件, 零内存缓冲)
+    // issue #115: streaming dump (pg_dumpall stdout → gzip file, zero in-memory buffering)
     dump_fn: DumpFn,
-    // issue #115: compose 平面 dump 的完整 docker 参数 (env-file/-f 前缀与
-    // real_exec 同构, new() 预构; 测试构造为 None → fail-closed)
+    // issue #115: full docker args for the compose-plane dump (env-file/-f prefix mirrors
+    // real_exec, prebuilt in new(); None in test constructors → fail-closed)
     compose_dump_args: Option<Vec<String>>,
-    // issue #77: true = native 平面 (compose.enabled=false), 走本机 brew PG
+    // issue #77: true = native plane (compose.enabled=false), uses local brew PG
     plane_native: bool,
-    // issue #77: native pg_dumpall 解析结果 (配置覆盖或 PATH)
+    // issue #77: resolved native pg_dumpall path (config override or PATH)
     pg_dump_bin: String,
-    // issue #77: native PG 连接参数; pg_user=None 时省略 -U (默认 OS 用户)
+    // issue #77: native PG connection params; -U omitted when pg_user=None (default OS user)
     pg_host: String,
     pg_port: u16,
     pg_user: Option<String>,
     target: Option<PathBuf>,
     retention: u32,
-    // issue #132: 周保留份数 (0 = 关闭)
+    // issue #132: weekly retention count (0 = disabled)
     weekly_retention: u32,
 }
 
 impl BackupRunner {
-    // 生产构造: 从 env/env_file 解析 target, 真 exec。store/alerter 由调用方传入 run()。
-    // issue #77: plane 由 compose.enabled 决定 — 关闭 (默认) 走 native brew PG。
+    // Prod constructor: resolve target from env/env_file, real exec. store/alerter are passed into run() by the caller.
+    // issue #77: plane decided by compose.enabled — off (default) uses native brew PG.
     pub fn new(cfg: &crate::config::Config) -> Self {
         let target = resolve_target();
         let exec = real_exec(
@@ -218,7 +220,7 @@ impl BackupRunner {
             &cfg.compose.business_file,
             &cfg.compose.env_file,
         );
-        // issue #115: compose dump 完整参数 (与 real_exec 命令列表同构)
+        // issue #115: full compose dump args (mirrors the real_exec command list)
         let compose_dump_args = Some(vec![
             "compose".to_string(),
             "--env-file".to_string(),
@@ -241,7 +243,7 @@ impl BackupRunner {
             .filter(|s| !s.trim().is_empty());
         tracing::info!(
             plane = if plane_native { "native" } else { "compose" },
-            "backup runner 平面已选定 (issue #77)"
+            "backup runner plane selected (issue #77)"
         );
         Self {
             exec,
@@ -259,15 +261,15 @@ impl BackupRunner {
         }
     }
 
-    // 测试构造: 注入 fake exec, 显式 target/retention (compose 平面, 原行为)。
+    // Test constructor: inject fake exec, explicit target/retention (compose plane, original behavior).
     pub fn new_with_exec(exec: ExecFn, target: Option<PathBuf>, retention: u32) -> Self {
         Self {
             exec,
             native_exec: Arc::new(|_bin: &str, _args: &[&str]| {
-                bail!("native exec 不应在 compose 平面测试中被调用")
+                bail!("native exec must not be called in compose-plane tests")
             }),
             dump_fn: Arc::new(|_bin: &str, _args: &[&str], _out: &Path| {
-                bail!("dump_fn 不应在未注入时被调用 (测试须 with_dump_fn)")
+                bail!("dump_fn must not be called without injection (tests must use with_dump_fn)")
             }),
             compose_dump_args: Some(vec![]),
             plane_native: false,
@@ -281,7 +283,7 @@ impl BackupRunner {
         }
     }
 
-    // issue #77 测试构造: 注入 fake native exec, native 平面。
+    // issue #77 test constructor: inject fake native exec, native plane.
     pub fn new_native_with_exec(
         native_exec: NativeExecFn,
         target: Option<PathBuf>,
@@ -289,11 +291,11 @@ impl BackupRunner {
     ) -> Self {
         Self {
             exec: Arc::new(|_svc: &str, _args: &[&str]| {
-                bail!("compose exec 不应在 native 平面测试中被调用")
+                bail!("compose exec must not be called in native-plane tests")
             }),
             native_exec,
             dump_fn: Arc::new(|_bin: &str, _args: &[&str], _out: &Path| {
-                bail!("dump_fn 不应在未注入时被调用 (测试须 with_dump_fn)")
+                bail!("dump_fn must not be called without injection (tests must use with_dump_fn)")
             }),
             compose_dump_args: None,
             plane_native: true,
@@ -307,15 +309,15 @@ impl BackupRunner {
         }
     }
 
-    // issue #115: 注入 fake dump_fn (builder, 测试用) — fake 直接 gzip 写固定 bytes。
+    // issue #115: inject fake dump_fn (builder, test-only) — fake gzips fixed bytes directly into the file.
     #[cfg(test)]
     fn with_dump_fn(mut self, dump: DumpFn) -> Self {
         self.dump_fn = dump;
         self
     }
 
-    // fail-closed: target 未设 → 拒绝 + 告警。
-    // store/alerter 借用传入 (避免 Clone Connection)。
+    // fail-closed: target unset → refuse + alert.
+    // store/alerter borrowed (avoids Clone on Connection).
     pub async fn run(
         &mut self,
         now_ts: u64,
@@ -325,37 +327,39 @@ impl BackupRunner {
         let target = match &self.target {
             Some(t) => t.clone(),
             None => {
-                tracing::error!("FUSION_BACKUP_TARGET 未设, fail-closed 拒绝备份");
+                tracing::error!("FUSION_BACKUP_TARGET unset, fail-closed refusing backup");
                 emit_alert(
                     alerter,
                     "FUSION_BACKUP_TARGET unset — backup refused (fail-closed)".to_string(),
                 )
                 .await;
-                bail!("FUSION_BACKUP_TARGET 未设 — 备份 fail-closed 拒绝 (参考 .env.example)");
+                bail!("FUSION_BACKUP_TARGET unset — backup refused fail-closed (see .env.example)");
             }
         };
-        // 确保目标目录存在 (NAS 挂载点假设可写, 不可写则写文件时 fail loud)
+        // Ensure the target dir exists (NAS mount assumed writable; unwritable fails loud at file write)
         if let Err(e) = std::fs::create_dir_all(&target) {
             emit_alert(alerter, format!("backup target mkdir fail: {e}")).await;
             bail!("backup target mkdir fail: {e}");
         }
-        // issue #113: 带时分秒的 run_stamp — 同日多次备份不覆写
+        // issue #113: run_stamp with hhmmss — same-day backups no longer overwrite each other
         let date = run_stamp();
         let plane = if self.plane_native {
             "native"
         } else {
             "compose"
         };
-        // 1. Postgres: pg_dumpall → gzip → (可选) 静态加密
-        // #117: 先写 .sql.gz.tmp, 成功后原子 rename — daemon 中途被杀 (SIGTERM/
-        // SIGKILL) 只留 tmp 残片, 最终名永远对应完整 gzip (旧实现直接写最终名,
-        // 2026-11-09 daemon 死在 dump 中段留 157MB 无 footer 假备份实证)。
-        // tmp 名不以 .sql.gz 结尾 → prune_old 过滤器天然跳过。
-        // issue #132: FUSION_BACKUP_ENC_KEY 设置时 dump 落盘后静态加密 (openssl
-        // aes-256-cbc) — 加密失败 fail-closed (绝不留明文落 target), 最终名 .enc 后缀。
+        // 1. Postgres: pg_dumpall → gzip → (optional) at-rest encryption
+        // #117: write .sql.gz.tmp first, atomic rename on success — daemon killed mid-dump (SIGTERM/
+        // SIGKILL) leaves only a tmp fragment, the final name always corresponds to a complete gzip (old impl
+        // wrote the final name directly; 2026-11-09 daemon died mid-dump leaving a 157MB footer-less fake backup).
+        // tmp name does not end with .sql.gz → prune_old filter naturally skips it.
+        // issue #132: with FUSION_BACKUP_ENC_KEY set, the dump is encrypted at rest after landing (openssl
+        // aes-256-cbc) — encryption failure fail-closed (never leave plaintext in target), final name gets .enc suffix.
         let enc_key = resolve_enc_key();
         if enc_key.is_some() {
-            tracing::info!("FUSION_BACKUP_ENC_KEY 已设置, 备份将静态加密 (aes-256-cbc)");
+            tracing::info!(
+                "FUSION_BACKUP_ENC_KEY set, backup will be encrypted at rest (aes-256-cbc)"
+            );
         }
         let pg_suffix = if enc_key.is_some() {
             "sql.gz.enc"
@@ -376,7 +380,7 @@ impl BackupRunner {
         };
         let pg_res = match pg_res {
             Ok(n) => {
-                // issue #132: 静态加密 — tmp 加密成 .enc.tmp, 成功后清明文 tmp 再 rename。
+                // issue #132: at-rest encryption — encrypt tmp into .enc.tmp, remove the plaintext tmp then rename on success.
                 let enc_step: Result<Option<PathBuf>> = match &enc_key {
                     None => Ok(None),
                     Some(key) => {
@@ -389,7 +393,7 @@ impl BackupRunner {
                             .map_err(|e| {
                                 let _ = std::fs::remove_file(&pg_tmp);
                                 anyhow::anyhow!(e)
-                                    .context("backup 静态加密失败 (fail-closed, 不留明文)")
+                                    .context("backup at-rest encryption failed (fail-closed, no plaintext left)")
                             })
                     }
                 };
@@ -397,11 +401,11 @@ impl BackupRunner {
                     Err(e) => Err(e),
                     Ok(Some(enc_tmp)) => match std::fs::rename(&enc_tmp, &pg_path) {
                         Ok(()) => Ok(n),
-                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename 失败")),
+                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename failed")),
                     },
                     Ok(None) => match std::fs::rename(&pg_tmp, &pg_path) {
                         Ok(()) => Ok(n),
-                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename 失败")),
+                        Err(e) => Err(anyhow::anyhow!(e).context("backup tmp rename failed")),
                     },
                 }
             }
@@ -410,7 +414,7 @@ impl BackupRunner {
                 Err(e)
             }
         };
-        // issue #115: dur 用真实时钟 (旧实现拿注入 now_ts 相减恒 0, 事件假象)
+        // issue #115: dur uses the real clock (old impl subtracted the injected now_ts, always 0, fake event data)
         let pg_dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -421,10 +425,10 @@ impl BackupRunner {
             store, alerter, "postgres", plane, &pg_res, pg_size, pg_dur, &pg_path, now_ts,
         )
         .await;
-        pg_res.context("postgres pg_dumpall 失败")?;
-        // 2. Qdrant: storage 目录快照 (copy storage dir → target/fusion-qdrant-{date}/)
+        pg_res.context("postgres pg_dumpall failed")?;
+        // 2. Qdrant: storage dir snapshot (copy storage dir → target/fusion-qdrant-{date}/)
         let qd_dir = target.join(format!("fusion-qdrant-{date}"));
-        // issue #77: native 平面 qdrant 缺席非错误 (INFO 事件跳过), compose 平面维持 fail-closed
+        // issue #77: native-plane qdrant absence is not an error (INFO event skip), compose plane stays fail-closed
         if self.plane_native {
             let qd_res = self.qdrant_snapshot_native(&qd_dir, store, now_ts);
             let qd_size = qd_dir
@@ -436,53 +440,53 @@ impl BackupRunner {
                 store, alerter, "qdrant", plane, &qd_res, qd_size, 0, &qd_dir, now_ts,
             )
             .await;
-            qd_res.context("qdrant snapshot 失败")?;
+            qd_res.context("qdrant snapshot failed")?;
         } else {
             let qd_res = self.qdrant_snapshot(&qd_dir);
             record_outcome(
                 store, alerter, "qdrant", plane, &qd_res, 0, 0, &qd_dir, now_ts,
             )
             .await;
-            qd_res.context("qdrant snapshot 失败")?;
+            qd_res.context("qdrant snapshot failed")?;
         }
-        // 2.5 issue #132: qdrant tar 同样静态加密 (key 设置时, 缺席平面无目录跳过)
+        // 2.5 issue #132: qdrant tar also encrypted at rest (when key set; absent plane skips, no dir)
         if let Some(key) = &enc_key {
             let tar = qd_dir.join("storage.tar");
             if tar.exists() {
                 let tar_enc = qd_dir.join("storage.tar.enc");
                 if let Err(e) = encrypt_file(&tar, &tar_enc, key) {
-                    // fail-closed: 加密失败绝不留明文 tar 落 target (与 pg 分支同语义)
+                    // fail-closed: encryption failure never leaves a plaintext tar in target (same semantics as the pg branch)
                     let _ = std::fs::remove_file(&tar);
-                    return Err(e.context("qdrant snapshot 静态加密失败"));
+                    return Err(e.context("qdrant snapshot at-rest encryption failed"));
                 }
-                tracing::info!(file = %tar_enc.display(), "qdrant 快照已加密");
+                tracing::info!(file = %tar_enc.display(), "qdrant snapshot encrypted");
             }
         }
-        // 3. 保留裁剪
+        // 3. Retention pruning
         if let Err(e) = self.prune_old(&target) {
-            tracing::warn!(err = %e, "backup 保留裁剪失败 (非致命)");
+            tracing::warn!(err = %e, "backup retention prune failed (non-fatal)");
         }
-        tracing::info!(target = %target.display(), "备份完成");
+        tracing::info!(target = %target.display(), "backup complete");
         Ok(())
     }
 
-    // pg_dumpall via docker compose exec postgres — issue #115: stdout 流式 → gzip
-    // 文件 (旧实现整包 Vec<u8> 缓冲, 大库 2.2GB 驻留 daemon RSS)。
+    // pg_dumpall via docker compose exec postgres — issue #115: stdout streams → gzip
+    // file (old impl buffered a full Vec<u8>, a 2.2GB large-DB dump sat in daemon RSS).
     fn pg_dump(&self, out_path: &Path) -> Result<()> {
-        // issue #115: compose 前缀 (env-file/-f) 与 real_exec 同构 — new() 预构,
-        // 缺失 (测试构造) fail-closed
+        // issue #115: compose prefix (env-file/-f) mirrors real_exec — prebuilt in new(),
+        // missing (test constructor) fail-closed
         let Some(prefix) = &self.compose_dump_args else {
-            bail!("compose dump args 未配置 (仅测试构造缺省)");
+            bail!("compose dump args not configured (only test constructors omit them)");
         };
         let argv: Vec<&str> = prefix.iter().map(String::as_str).collect();
         let n = (self.dump_fn)("docker", &argv, out_path)?;
-        tracing::info!(path = %out_path.display(), bytes = n, "pg_dumpall 已流式压缩写入");
+        tracing::info!(path = %out_path.display(), bytes = n, "pg_dumpall streamed to gzip file");
         Ok(())
     }
 
-    // issue #77: native 平面 pg_dump — 本机 pg_dumpall 直连 brew PG (127.0.0.1:5432)。
-    // pg_user=None 时省略 -U (pg_dumpall 默认 OS 用户, brew trust auth 下即安装用户)。
-    // issue #115: stdout 流式 → gzip 文件 (旧实现整包缓冲, 2.2GB 驻留 daemon RSS)。
+    // issue #77: native-plane pg_dump — local pg_dumpall connects directly to brew PG (127.0.0.1:5432).
+    // -U omitted when pg_user=None (pg_dumpall defaults to the OS user, the installing user under brew trust auth).
+    // issue #115: stdout streams → gzip file (old impl buffered it whole, 2.2GB sat in daemon RSS).
     fn pg_dump_native(&self, out_path: &Path) -> Result<()> {
         let port = self.pg_port.to_string();
         let mut args: Vec<&str> = vec!["-h", &self.pg_host, "-p", &port];
@@ -495,14 +499,15 @@ impl BackupRunner {
             path = %out_path.display(),
             bytes = n,
             bin = %self.pg_dump_bin,
-            "native pg_dumpall 已流式压缩写入"
+            "native pg_dumpall streamed to gzip file"
         );
         Ok(())
     }
 
-    // issue #77: native 平面 Qdrant 快照 — 探测本机容器 (docker ps, 含 OrbStack 等非
-    // sidecar 托管实例), 找到则 docker exec tar 打包 storage。缺席 (docker 不可用 /
-    // 无 qdrant 容器) 记 INFO 事件并返回 Ok (缺席非错误, native 平面无 qdrant 是常态)。
+    // issue #77: native-plane Qdrant snapshot — probe local containers (docker ps, including
+    // non-sidecar-managed instances like OrbStack); if found, docker exec tar packs the storage.
+    // Absence (docker unavailable / no qdrant container) records an INFO event and returns Ok
+    // (absence is not an error; no qdrant on the native plane is the norm).
     fn qdrant_snapshot_native(
         &self,
         out_dir: &Path,
@@ -512,7 +517,7 @@ impl BackupRunner {
         let names = match (self.native_exec)("docker", &["ps", "--format", "{{.Names}}"]) {
             Ok(n) => n,
             Err(e) => {
-                tracing::info!(err = %e, "docker 不可用, native 平面无 qdrant 可备份");
+                tracing::info!(err = %e, "docker unavailable, no qdrant to back up on the native plane");
                 record_absent(store, now_ts, "docker unavailable");
                 return Ok(());
             }
@@ -520,7 +525,7 @@ impl BackupRunner {
         let names = String::from_utf8_lossy(&names);
         let qdrant = names.lines().map(str::trim).find(|n| n.contains("qdrant"));
         let Some(container) = qdrant else {
-            tracing::info!("无 qdrant 容器, native 平面跳过 qdrant 备份");
+            tracing::info!("no qdrant container, skipping qdrant backup on the native plane");
             record_absent(store, now_ts, "no qdrant container");
             return Ok(());
         };
@@ -539,38 +544,39 @@ impl BackupRunner {
                 ".",
             ],
         )
-        .with_context(|| format!("docker exec {container} tar qdrant storage 失败"))?;
+        .with_context(|| format!("docker exec {container} tar qdrant storage failed"))?;
         let tar_path = out_dir.join("storage.tar");
         std::fs::write(&tar_path, &tar_bytes)
             .with_context(|| format!("write qdrant backup {}", tar_path.display()))?;
-        tracing::info!(dir = %out_dir.display(), container, bytes = tar_bytes.len(), "native qdrant 快照已写入");
+        tracing::info!(dir = %out_dir.display(), container, bytes = tar_bytes.len(), "native qdrant snapshot written");
         Ok(())
     }
 
-    // Qdrant 快照: docker compose exec qdrant 创建快照目录, 复制到 target。
-    // MVP: 拷贝容器内 storage 目录内容 (生产由 qdrant --snapshot 创建, 此处 exec 读 storage)。
-    // 测试 fake exec 返回占位 bytes, 写入占位文件即可。
+    // Qdrant snapshot: docker compose exec qdrant, copy to target.
+    // MVP: copy the in-container storage dir contents (prod creates via qdrant --snapshot; here exec reads storage).
+    // Test fake exec returns placeholder bytes; writing the placeholder file is enough.
     fn qdrant_snapshot(&self, out_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("mkdir qdrant backup dir {}", out_dir.display()))?;
-        // 用 exec tar 打包 qdrant storage (避免逐文件 exec)
+        // Pack qdrant storage via exec tar (avoids per-file exec)
         let tar_bytes = (self.exec)("qdrant", &["tar", "cf", "-", "-C", "/qdrant/storage", "."])?;
         let tar_path = out_dir.join("storage.tar");
         std::fs::write(&tar_path, &tar_bytes)
             .with_context(|| format!("write qdrant backup {}", tar_path.display()))?;
-        tracing::info!(dir = %out_dir.display(), bytes = tar_bytes.len(), "qdrant 快照已写入");
+        tracing::info!(dir = %out_dir.display(), bytes = tar_bytes.len(), "qdrant snapshot written");
         Ok(())
     }
 
-    // 保留裁剪 (issue #132 两层保留): 按文件名 date 降序 (词序=时序, date 为
-    // YYYYMMDD[-hhmmss] 或 d{日序号}), 前 retention 份为日保留; 其余候选中按
-    // 自然周 (day_index/7) 每周留最新一份, 最多 weekly_retention 周 — 供月级回溯。
-    // weekly_retention=0 → 旧平铺行为。裁剪只动 pg 文件 + 同 date qdrant 目录。
+    // Retention pruning (issue #132 two-tier retention): sort by filename date descending
+    // (lexicographic = chronological; date is YYYYMMDD[-hhmmss] or d{day-index}), the first
+    // retention copies are daily keeps; among the rest keep one newest per natural week
+    // (day_index/7), at most weekly_retention weeks — for month-level lookback.
+    // weekly_retention=0 → old flat behavior. Pruning only touches pg files + same-date qdrant dirs.
     fn prune_old(&self, target: &Path) -> Result<()> {
         if self.retention == 0 {
             return Ok(());
         }
-        // 收集 pg 备份 (path, date_str, day_index), 按日期降序
+        // Collect pg backups (path, date_str, day_index), sorted by date descending
         let mut pg_files: Vec<(PathBuf, String, i64)> = Vec::new();
         for entry in std::fs::read_dir(target)? {
             let e = entry?;
@@ -589,7 +595,7 @@ impl BackupRunner {
             }
         }
         pg_files.sort_by(|a, b| b.1.cmp(&a.1));
-        // 日保留 = 前 retention 份; 周保留 = 其余候选中每周最新一份 (最多 N 周)
+        // Daily keep = first retention copies; weekly keep = one newest per week among the rest (up to N weeks)
         let daily_keep = (self.retention as usize).min(pg_files.len());
         let mut prune: Vec<(PathBuf, String)> = Vec::new();
         let mut last_week: Option<i64> = None;
@@ -601,7 +607,7 @@ impl BackupRunner {
             if self.weekly_retention > 0 && weeks_kept < self.weekly_retention {
                 let week = day / 7;
                 if last_week != Some(week) {
-                    // 每周第一份 (即该周最新) 保留, 同周其余裁剪
+                    // Keep the first copy of each week (the week's newest), prune the rest of that week
                     last_week = Some(week);
                     weeks_kept += 1;
                     continue;
@@ -610,36 +616,36 @@ impl BackupRunner {
             prune.push((p.clone(), date.clone()));
         }
         for (p, date) in &prune {
-            tracing::info!(file = %p.display(), "prune 旧 pg 备份 (日保留 {}, 周保留 {})", self.retention, self.weekly_retention);
+            tracing::info!(file = %p.display(), "prune old pg backup (daily keep {}, weekly keep {})", self.retention, self.weekly_retention);
             if let Err(e) = std::fs::remove_file(p) {
-                tracing::warn!(file = %p.display(), err = %e, "prune pg 文件失败");
+                tracing::warn!(file = %p.display(), err = %e, "prune pg file failed");
             }
-            // 对应 qdrant 目录 (同 date)
+            // Matching qdrant dir (same date)
             let qd_dir = target.join(format!("fusion-qdrant-{date}"));
             if qd_dir.exists() {
-                tracing::info!(dir = %qd_dir.display(), "prune 旧 qdrant 备份");
+                tracing::info!(dir = %qd_dir.display(), "prune old qdrant backup");
                 if let Err(e) = std::fs::remove_dir_all(&qd_dir) {
-                    tracing::warn!(dir = %qd_dir.display(), err = %e, "prune qdrant 目录失败");
+                    tracing::warn!(dir = %qd_dir.display(), err = %e, "prune qdrant dir failed");
                 }
             }
         }
         Ok(())
     }
 
-    // 保留裁剪内部方法保留在 impl 内 (上面)。
+    // Retention prune helper stays inside the impl (above).
 }
 
-// issue #77: native 平面 qdrant 缺席 → INFO 事件 (缺席非错误, 不告警)。
+// issue #77: native-plane qdrant absence → INFO event (absence is not an error, no alert).
 fn record_absent(store: &HistoryStore, now_ts: u64, reason: &str) {
     let detail = format!("qdrant backup skipped ({reason}, native plane)");
     if let Err(e) = store.record_event("qdrant", "Backup", &detail, now_ts, "backup", "info") {
-        tracing::warn!(err = %e, "qdrant absent 事件写入失败 (非致命)");
+        tracing::warn!(err = %e, "qdrant absent event write failed (non-fatal)");
     }
-    tracing::info!(reason, "qdrant native 缺席已记录");
+    tracing::info!(reason, "qdrant native absence recorded");
 }
 
-// 记录备份结果到 history.db (kind=Backup) + 失败告警。
-// issue #77: detail 带 plane=native|compose, history 可见备份覆盖面。
+// Record the backup outcome to history.db (kind=Backup) + alert on failure.
+// issue #77: detail carries plane=native|compose so history shows backup coverage.
 #[allow(clippy::too_many_arguments)]
 async fn record_outcome(
     store: &HistoryStore,
@@ -667,12 +673,12 @@ async fn record_outcome(
         Err(e) => ("fail", format!("{} backup fail plane={}: {e}", svc, plane)),
     };
     if let Err(e) = store.record_event(svc, "Backup", &detail, now_ts, "backup", "info") {
-        tracing::warn!(svc, err = %e, "backup event write fail (非致命)");
+        tracing::warn!(svc, err = %e, "backup event write failed (non-fatal)");
     }
     if res.is_err() {
         emit_alert(alerter, detail).await;
     }
-    tracing::info!(svc, status, "backup outcome 已记录");
+    tracing::info!(svc, status, "backup outcome recorded");
 }
 
 async fn emit_alert(alerter: &mut Alerter, detail: String) {
@@ -686,15 +692,15 @@ async fn emit_alert(alerter: &mut Alerter, detail: String) {
         .await;
 }
 
-// 解析 FUSION_BACKUP_TARGET: 先进程 env, 再 .env 文件 (compose env_file 路径)。
-// 两处均无 → None (调用方 fail-closed)。
+// Resolve FUSION_BACKUP_TARGET: process env first, then the .env file (compose env_file path).
+// Neither present → None (caller fail-closes).
 pub fn resolve_target() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("FUSION_BACKUP_TARGET")
         && !v.is_empty()
     {
         return Some(PathBuf::from(v));
     }
-    // 兜底: 读 .env (compose env_file 默认 .env)
+    // Fallback: read .env (compose env_file defaults to .env)
     let env_path = PathBuf::from(".env");
     if let Ok(text) = std::fs::read_to_string(&env_path) {
         for line in text.lines() {
@@ -713,8 +719,8 @@ pub fn resolve_target() -> Option<PathBuf> {
     None
 }
 
-// issue #132: 解析 FUSION_BACKUP_ENC_KEY — 进程 env 优先, 再 .env 文件 (与
-// resolve_target 同链)。值绝不落日志/事件。None = 不加密 (旧行为)。
+// issue #132: resolve FUSION_BACKUP_ENC_KEY — process env first, then the .env file (same
+// chain as resolve_target). The value never reaches logs/events. None = no encryption (old behavior).
 pub fn resolve_enc_key() -> Option<String> {
     if let Ok(v) = std::env::var("FUSION_BACKUP_ENC_KEY")
         && !v.is_empty()
@@ -739,11 +745,11 @@ pub fn resolve_enc_key() -> Option<String> {
     None
 }
 
-// issue #132: 文件级静态加密 — openssl enc aes-256-cbc (pbkdf2, 20 万轮)。
-// key 经 stdin 传入 (避开 argv/env 泄漏面), openssl 缺失/失败 → Err (调用方
-// fail-closed 清明文残片)。流式拷贝不经内存整包缓冲。
+// issue #132: file-level at-rest encryption — openssl enc aes-256-cbc (pbkdf2, 200k iterations).
+// key passed out-of-band (avoiding the argv/env leak surface), openssl missing/failure → Err (caller
+// fail-closes and removes plaintext fragments). Streaming copy, no whole-buffer in memory.
 pub fn encrypt_file(src: &Path, dst: &Path, key: &str) -> Result<u64> {
-    // key 走子进程私有 env (-pass env:VAR) — 不进 argv、不进父进程环境、不落盘
+    // key goes through child-private env (-pass env:VAR) — never in argv, never in the parent env, never on disk
     let mut child = std::process::Command::new("openssl")
         .args([
             "enc",
@@ -762,7 +768,7 @@ pub fn encrypt_file(src: &Path, dst: &Path, key: &str) -> Result<u64> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn openssl: {e}"))?;
     let Some(stdout) = child.stdout.take() else {
-        bail!("openssl stdout 不可读");
+        bail!("openssl stdout unreadable");
     };
     let mut out =
         std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
@@ -773,13 +779,13 @@ pub fn encrypt_file(src: &Path, dst: &Path, key: &str) -> Result<u64> {
     let status = child.wait().with_context(|| "wait openssl")?;
     if !status.success() {
         let _ = std::fs::remove_file(dst);
-        bail!("openssl 加密失败: exit {:?}", status.code());
+        bail!("openssl encryption failed: exit {:?}", status.code());
     }
     Ok(n)
 }
 
-// issue #132: 备份文件 date → 自 1970-01-01 天数 (周桶用)。
-// 支持 "YYYYMMDD[-hhmmss]" (取前 8 位) 与遗留 "d{日序号}"。
+// issue #132: backup file date → days since 1970-01-01 (for week bucketing).
+// Supports "YYYYMMDD[-hhmmss]" (first 8 chars) and legacy "d{day-index}".
 fn parse_backup_day(date: &str) -> Option<i64> {
     if let Some(rest) = date.strip_prefix('d') {
         return rest.parse::<i64>().ok();
@@ -797,7 +803,7 @@ fn parse_backup_day(date: &str) -> Option<i64> {
     Some(days_from_civil(y, m, d))
 }
 
-// Howard Hinnant days_from_civil (纯日历算法, 无 chrono 依赖)。
+// Howard Hinnant days_from_civil (pure calendar math, no chrono dependency).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -808,8 +814,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-// 调度判定纯函数 (供 daemon tick 循环 + 测试共用)。
-// now >= last + schedule 即到期; last=0 (首次) 任何 now 到期。
+// Pure scheduling predicate (shared by the daemon tick loop + tests).
+// Due when now >= last + schedule; last=0 (first run) due at any now.
 pub fn backup_due(now_ts: u64, last_backup_ts: u64, schedule_sec: u64) -> bool {
     if last_backup_ts == 0 {
         return true;
@@ -817,27 +823,28 @@ pub fn backup_due(now_ts: u64, last_backup_ts: u64, schedule_sec: u64) -> bool {
     now_ts.saturating_sub(last_backup_ts) >= schedule_sec
 }
 
-// 日期戳 YYYYMMDD。测试无法用 chrono (未加依赖), 用 env FUSION_BACKUP_DATE 覆盖便于测试固定日期。
+// Date stamp YYYYMMDD. Tests cannot use chrono (no dep added); the env FUSION_BACKUP_DATE override pins the date for tests.
 fn date_stamp() -> String {
     if let Ok(v) = std::env::var("FUSION_BACKUP_DATE")
         && !v.is_empty()
     {
         return v;
     }
-    // 简易: 用 SystemTime → 秒。生产环境日期精度足够 (日级备份)。
-    // 用 std 不可靠取年月日, 故回退固定占位由调用方覆盖。测试必须设 FUSION_BACKUP_DATE。
+    // Simple: SystemTime → secs. Date precision is enough for prod (daily backups).
+    // std cannot reliably extract Y/M/D, so fall back to a fixed placeholder overridden by the caller. Tests must set FUSION_BACKUP_DATE.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // 86400s/日, 从 1970-01-01 起算天数 → 拼成 YYYYMMDD 占位用日序号
-    // (真实日期格式由测试 FUSION_BACKUP_DATE 覆盖; 生产可接受日序号唯一标识)
+    // 86400s/day, days since 1970-01-01 → compose a day-index placeholder in the YYYYMMDD slot
+    // (the real date format is overridden by test FUSION_BACKUP_DATE; a day-index unique id is acceptable in prod)
     let day = secs / 86400;
     format!("d{day}")
 }
 
-// issue #113: 文件名时间戳 — env 覆盖时原样返回 (测试确定性), 生产加 UTC 时分秒后缀,
-// 同日多次备份不再原地覆写 (d20766 被孤儿 daemon 覆写成 85MB 残缺实证 2026-11-09)。
+// issue #113: filename timestamp — returned verbatim under env override (test determinism), prod appends a UTC
+// hhmmss suffix so same-day backups no longer overwrite in place (d20766 overwritten to an 85MB truncated file
+// by an orphan daemon, incident 2026-11-09).
 fn run_stamp() -> String {
     let date = date_stamp();
     if std::env::var("FUSION_BACKUP_DATE")
@@ -885,8 +892,8 @@ mod tests {
         Arc::new(move |_svc: &str, _args: &[&str]| Ok((*dump).clone()))
     }
 
-    // issue #115: fake dump_fn — 直接 gzip 写固定 bytes 到 out_path (零 spawn)。
-    // 返回字节数与真实流式语义一致 (压缩后大小不重要, 断言只看文件非空)。
+    // issue #115: fake dump_fn — gzips fixed bytes straight into out_path (zero spawns).
+    // Returned byte count matches real streaming semantics (compressed size irrelevant, asserts only check the file is non-empty).
     fn fake_dump(content: &'static [u8]) -> DumpFn {
         Arc::new(move |_bin: &str, _args: &[&str], out: &Path| {
             let f = std::fs::File::create(out)?;
@@ -901,7 +908,7 @@ mod tests {
         Arc::new(move |_bin: &str, _args: &[&str], _out: &Path| bail!("{}", msg))
     }
 
-    // issue #113: env 覆盖 → run_stamp 原样返回 (测试确定性不破)
+    // issue #113: env override → run_stamp returned verbatim (test determinism intact)
     #[test]
     fn test_run_stamp_env_override_verbatim() {
         let _g = crate::env_map::tests::env_lock();
@@ -909,22 +916,24 @@ mod tests {
         assert_eq!(run_stamp(), "20260903");
     }
 
-    // issue #113: 无覆盖 → date-hhmmss 后缀, 同日多次备份不覆写
+    // issue #113: no override → date-hhmmss suffix, same-day backups do not overwrite
     #[test]
     fn test_run_stamp_time_suffix_when_no_env() {
         let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::remove("FUSION_BACKUP_DATE");
         let s = run_stamp();
-        let (date, tail) = s.rsplit_once('-').expect("stamp 应为 date-hhmmss 形态");
-        assert_eq!(date, date_stamp(), "前缀应与 date_stamp 一致: {s}");
-        assert_eq!(tail.len(), 6, "hhmmss 6 位: {s}");
+        let (date, tail) = s
+            .rsplit_once('-')
+            .expect("stamp should be date-hhmmss shaped");
+        assert_eq!(date, date_stamp(), "prefix should match date_stamp: {s}");
+        assert_eq!(tail.len(), 6, "hhmmss 6 digits: {s}");
         assert!(
             tail.chars().all(|c| c.is_ascii_digit()),
-            "hhmmss 全数字: {s}"
+            "hhmmss all digits: {s}"
         );
     }
 
-    // issue #113: prune 兼容带时分秒的 stamp (词序排序 + qdrant 配对)
+    // issue #113: prune compatible with hhmmss-stamped names (lexicographic sort + qdrant pairing)
     #[test]
     fn test_prune_keeps_stamped_names() {
         let tmp = TempDir::new().unwrap();
@@ -940,7 +949,7 @@ mod tests {
             Arc::new(|_bin: &str, _args: &[&str]| bail!("docker not installed"));
         let runner = BackupRunner::new_native_with_exec(native, Some(target.to_path_buf()), 1);
         runner.prune_old(target).unwrap();
-        // 保留最新 1 份 (153000), 其余删除
+        // Keep the newest copy (153000), delete the rest
         assert!(target.join("fusion-pg-d20766-153000.sql.gz").exists());
         assert!(!target.join("fusion-pg-d20766-101500.sql.gz").exists());
         assert!(!target.join("fusion-pg-d20765.sql.gz").exists());
@@ -949,7 +958,7 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
-        // 持有 env 测试锁 (#134 CI flake): set/remove/恢复全程与其他 env 测试互斥。
+        // Hold the env test lock (#134 CI flake): set/remove/restore is mutually exclusive with other env tests.
         _lock: crate::env_map::tests::EnvLockGuard,
     }
     impl EnvGuard {
@@ -983,13 +992,13 @@ mod tests {
         }
     }
 
-    // test_backup_pg_dump_success: mock exec 返回 dump bytes → 文件写入 target, Backup event 记录, 成功。
+    // test_backup_pg_dump_success: mock exec returns dump bytes → file written to target, Backup event recorded, success.
     #[tokio::test]
-    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
-    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    // issue #31: lock must be held across run().await (date_stamp reads env inside run).
+    // tokio::test defaults to a single-threaded runtime, no concurrent task contention, await-holding safe.
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_pg_dump_success() {
-        // issue #31: env 全局共享, 并行测试 Drop 会移走本测试依赖的 DATE — 共享锁串行
+        // issue #31: env is globally shared, a parallel test's Drop would remove the DATE this test relies on — shared lock serializes
         let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
@@ -1003,17 +1012,21 @@ mod tests {
         )
         .with_dump_fn(fake_dump(b"-- pg dump content --"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
-        // pg 文件存在且非空
+        // pg file exists and is non-empty
         let pg_file = target.join("fusion-pg-20260903.sql.gz");
-        assert!(pg_file.exists(), "pg 备份文件应存在: {}", pg_file.display());
+        assert!(
+            pg_file.exists(),
+            "pg backup file should exist: {}",
+            pg_file.display()
+        );
         assert!(pg_file.metadata().unwrap().len() > 0);
-        // qdrant 目录存在
+        // qdrant dir exists
         let qd_dir = target.join("fusion-qdrant-20260903");
-        assert!(qd_dir.exists(), "qdrant 备份目录应存在");
+        assert!(qd_dir.exists(), "qdrant backup dir should exist");
     }
 
-    // test_dump_tmp_removed_on_failure: dump 中途死掉 (daemon 被杀同类) →
-    // 最终名不存在 + tmp 残片已清, 无假完整备份 (#117)。
+    // test_dump_tmp_removed_on_failure: dump dies mid-stream (same class as daemon killed) →
+    // final name absent + tmp fragment cleaned, no fake complete backup (#117).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_dump_tmp_removed_on_failure() {
@@ -1031,24 +1044,24 @@ mod tests {
             BackupRunner::new_with_exec(fake_exec(Vec::new()), Some(target.clone()), 7)
                 .with_dump_fn(dump_fn);
         let res = runner.run(1000, &store, &mut alerter).await;
-        assert!(res.is_err(), "dump 失败应 bail");
+        assert!(res.is_err(), "dump failure should bail");
         assert!(
             !target.join("fusion-pg-20260903.sql.gz").exists(),
-            "失败后最终名不得存在 (假完整备份)"
+            "final name must not exist after failure (fake complete backup)"
         );
         assert!(
             !target.join("fusion-pg-20260903.sql.gz.tmp").exists(),
-            "失败后 tmp 残片应清理"
+            "tmp fragment should be cleaned after failure"
         );
     }
 
-    // test_backup_fail_closed_no_target: FUSION_BACKUP_TARGET 未设 → 拒绝 + 告警。
+    // test_backup_fail_closed_no_target: FUSION_BACKUP_TARGET unset → refuse + alert.
     #[tokio::test]
-    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
-    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    // issue #31: lock must be held across run().await (date_stamp reads env inside run).
+    // tokio::test defaults to a single-threaded runtime, no concurrent task contention, await-holding safe.
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_fail_closed_no_target() {
-        // issue #31: 同上, env 锁串行 (env_map/supervisor 测试共用同一锁)
+        // issue #31: same as above, env lock serializes (env_map/supervisor tests share the same lock)
         let _g0 = crate::env_map::tests::env_lock();
         let _g1 = EnvGuard::remove("FUSION_BACKUP_TARGET");
         let _g2 = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
@@ -1056,32 +1069,32 @@ mod tests {
         let store = mem_store();
         let mut runner = BackupRunner::new_with_exec(
             fake_exec(b"dump".to_vec()),
-            None, // 无 target
+            None, // no target
             7,
         );
         let res = runner.run(1000, &store, &mut alerter).await;
-        assert!(res.is_err(), "无 target 应 fail-closed 拒绝");
+        assert!(res.is_err(), "no target should fail-closed refuse");
         let msg = res.unwrap_err().to_string();
         assert!(
             msg.contains("FUSION_BACKUP_TARGET"),
-            "err 应点名 target: {msg}"
+            "err should name the target: {msg}"
         );
     }
 
-    // test_backup_retention_prunes_old: 8 份备份 + retention=7 → 最旧被裁剪。
+    // test_backup_retention_prunes_old: 8 backups + retention=7 → oldest pruned.
     #[tokio::test]
-    // issue #31: 锁须跨 run().await (date_stamp 在 run 内读 env)。
-    // tokio::test 默认单线程 runtime, 无并发 task 争锁, await-holding 安全。
+    // issue #31: lock must be held across run().await (date_stamp reads env inside run).
+    // tokio::test defaults to a single-threaded runtime, no concurrent task contention, await-holding safe.
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_retention_prunes_old() {
-        // issue #31: 同上, env 锁串行
+        // issue #31: same as above, env lock serializes
         let _g = crate::env_map::tests::env_lock();
         let _d = EnvGuard::set("FUSION_BACKUP_DATE", "20260903");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().to_path_buf();
-        // 预置 8 份旧 pg 备份 (日期均早于本次 20260903, 按文件名 date 排序裁剪)
+        // Pre-seed 8 old pg backups (dates all earlier than this run's 20260903, pruned by filename date sort)
         for i in 0..8u32 {
-            // 20260820 .. 20260827 (词序=时序, 均早于 20260903)
+            // 20260820 .. 20260827 (lexicographic = chronological, all earlier than 20260903)
             let day = 20 + i;
             let p = target.join(format!("fusion-pg-202608{day}.sql.gz"));
             std::fs::write(&p, b"x").unwrap();
@@ -1092,7 +1105,7 @@ mod tests {
             BackupRunner::new_with_exec(fake_exec(b"dump".to_vec()), Some(target.clone()), 7)
                 .with_dump_fn(fake_dump(b"dump"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
-        // 旧 8 份 + 新 1 份 = 9, retention 7 → 应删 2 份最旧
+        // 8 old + 1 new = 9, retention 7 → the 2 oldest should be deleted
         let pg_files: Vec<_> = std::fs::read_dir(&target)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1106,14 +1119,14 @@ mod tests {
         assert_eq!(
             pg_files.len(),
             7,
-            "retention=7 应剩 7 份 pg 备份 (含本次新增), got {}",
+            "retention=7 should leave 7 pg backups (incl. the new one), got {}",
             pg_files.len()
         );
-        // 本次新增应保留
+        // The new backup should be kept
         assert!(target.join("fusion-pg-20260903.sql.gz").exists());
     }
 
-    // issue #77: native 平面 — pg_dumpall 成功 + docker 不可用 (qdrant 缺席 INFO 跳过)。
+    // issue #77: native plane — pg_dumpall succeeds + docker unavailable (qdrant absence INFO skip).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_pg_success_docker_absent() {
@@ -1123,7 +1136,7 @@ mod tests {
         let target = tmp.path().to_path_buf();
         let mut alerter = Alerter::new(0, String::new());
         let store = mem_store();
-        // native exec: docker → Err (本机无 docker); dump 流式走 fake dump_fn
+        // native exec: docker → Err (no docker on this host); dump streams via fake dump_fn
         let native: NativeExecFn =
             Arc::new(|_bin: &str, _args: &[&str]| bail!("docker not installed"));
         let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
@@ -1132,30 +1145,30 @@ mod tests {
         let pg_file = target.join("fusion-pg-20260930.sql.gz");
         assert!(
             pg_file.exists(),
-            "native pg 备份文件应存在: {}",
+            "native pg backup file should exist: {}",
             pg_file.display()
         );
         assert!(pg_file.metadata().unwrap().len() > 0);
-        // qdrant 缺席: 无目录, 有 INFO skip 事件
+        // qdrant absent: no dir, but an INFO skip event exists
         assert!(
             !target.join("fusion-qdrant-20260930").exists(),
-            "qdrant 目录不应存在"
+            "qdrant dir should not exist"
         );
         let evs = store.recent_events("qdrant", 5).unwrap();
         assert!(
             evs.iter()
                 .any(|e| e.detail.contains("skipped") && e.severity == "info"),
-            "qdrant 缺席应有 INFO skip 事件, got {evs:?}"
+            "qdrant absence should have an INFO skip event, got {evs:?}"
         );
-        // event detail 记录 plane=native (issue #77 验收)
+        // event detail records plane=native (issue #77 acceptance)
         let evs = store.recent_events("postgres", 5).unwrap();
         assert!(
             evs.iter().any(|e| e.detail.contains("plane=native")),
-            "postgres 事件应带 plane=native, got {evs:?}"
+            "postgres event should carry plane=native, got {evs:?}"
         );
     }
 
-    // issue #77: native 平面 — pg_dumpall 缺失 → fail-closed 拒绝 + 告警。
+    // issue #77: native plane — pg_dumpall missing → fail-closed refuse + alert.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_missing_pg_dump_fail_closed() {
@@ -1170,17 +1183,20 @@ mod tests {
         let mut runner = BackupRunner::new_native_with_exec(native, Some(target.clone()), 7)
             .with_dump_fn(fake_dump_err("spawn pg_dumpall: No such file or directory"));
         let res = runner.run(1000, &store, &mut alerter).await;
-        assert!(res.is_err(), "pg_dumpall 缺失应 fail-closed 拒绝");
+        assert!(res.is_err(), "missing pg_dumpall should fail-closed refuse");
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("pg_dumpall"), "err 应点名 pg_dumpall: {msg}");
+        assert!(
+            msg.contains("pg_dumpall"),
+            "err should name pg_dumpall: {msg}"
+        );
         let evs = store.recent_events("postgres", 5).unwrap();
         assert!(
             evs.iter().any(|e| e.detail.contains("fail")),
-            "postgres 失败事件应记录, got {evs:?}"
+            "postgres failure event should be recorded, got {evs:?}"
         );
     }
 
-    // issue #77: native 平面 — 本机存在 qdrant 容器 → docker exec tar 快照写入。
+    // issue #77: native plane — local qdrant container present → docker exec tar snapshot written.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_backup_native_qdrant_container_found() {
@@ -1203,11 +1219,15 @@ mod tests {
             .with_dump_fn(fake_dump(b"dump"));
         runner.run(1000, &store, &mut alerter).await.unwrap();
         let tar = target.join("fusion-qdrant-20260930/storage.tar");
-        assert!(tar.exists(), "qdrant storage.tar 应存在: {}", tar.display());
+        assert!(
+            tar.exists(),
+            "qdrant storage.tar should exist: {}",
+            tar.display()
+        );
         assert_eq!(std::fs::read(&tar).unwrap(), b"tar-bytes");
     }
 
-    // issue #132: date → day index (civil 算法 vs 已知锚点)
+    // issue #132: date → day index (civil algorithm vs known anchors)
     #[test]
     fn test_parse_backup_day() {
         assert_eq!(parse_backup_day("19700101"), Some(0));
@@ -1222,7 +1242,7 @@ mod tests {
         assert_eq!(parse_backup_day("garbage"), None);
     }
 
-    // issue #132: 两层保留 — 日 retention 之外, 候选里每周最新一份留最多 N 周
+    // issue #132: two-tier retention — beyond daily retention, one newest per week kept for up to N weeks
     #[test]
     fn test_prune_weekly_tier() {
         let tmp = TempDir::new().unwrap();
@@ -1240,14 +1260,17 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .count();
-        assert_eq!(left, 18, "14 daily + 4 weekly 应保留 18 份, got {left}");
+        assert_eq!(
+            left, 18,
+            "14 daily + 4 weekly should keep 18 files, got {left}"
+        );
         assert!(
             target.join(format!("fusion-pg-d{d1}.sql.gz")).exists(),
-            "最新日备份应保留"
+            "newest daily backup should be kept"
         );
     }
 
-    // issue #132: weekly=0 → 旧平铺行为
+    // issue #132: weekly=0 → old flat behavior
     #[test]
     fn test_prune_weekly_disabled_flat() {
         let tmp = TempDir::new().unwrap();
@@ -1262,10 +1285,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .count();
-        assert_eq!(left, 7, "weekly=0 应只留 7 份, got {left}");
+        assert_eq!(left, 7, "weekly=0 should keep only 7 files, got {left}");
     }
 
-    // issue #132: .enc 后缀备份同样参与收集与裁剪
+    // issue #132: .enc-suffixed backups also participate in collection and pruning
     #[test]
     fn test_prune_covers_enc_suffix() {
         let tmp = TempDir::new().unwrap();
@@ -1290,7 +1313,7 @@ mod tests {
         assert_eq!(left, 2, "got {left}");
     }
 
-    // issue #132: openssl 静态加密往返 (环境缺 openssl 则跳过)
+    // issue #132: openssl at-rest encryption roundtrip (skipped when openssl is unavailable)
     #[test]
     fn test_encrypt_file_roundtrip() {
         let has = std::process::Command::new("openssl")
@@ -1323,16 +1346,16 @@ mod tests {
         assert_eq!(out.stdout, b"secret-pg-dump-content");
     }
 
-    // test_backup_schedule_triggers: 调度到期 → 触发一次 backup。
-    // 逻辑测试: backup_due 判定 (now >= last + schedule)。
+    // test_backup_schedule_triggers: schedule due → trigger one backup.
+    // Logic test: backup_due predicate (now >= last + schedule).
     #[test]
     fn test_backup_schedule_triggers() {
-        // schedule=100, last=1000 → now=1100 未到期; now=1101 到期
+        // schedule=100, last=1000 → now=1100 not due; now=1101 due
         let schedule: u64 = 100;
         let last: u64 = 1000;
-        assert!(!backup_due(1099, last, schedule), "1099 < 1100 未到期");
-        assert!(backup_due(1100, last, schedule), "1100 >= 1100 到期");
-        // 首次 (last=0) 任何 now>0 到期
-        assert!(backup_due(1, 0, schedule), "首次 last=0 应到期");
+        assert!(!backup_due(1099, last, schedule), "1099 < 1100 not due");
+        assert!(backup_due(1100, last, schedule), "1100 >= 1100 due");
+        // First run (last=0) due at any now>0
+        assert!(backup_due(1, 0, schedule), "first run last=0 should be due");
     }
 }

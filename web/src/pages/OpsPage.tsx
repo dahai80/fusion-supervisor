@@ -46,10 +46,10 @@ function stateToKind(state: string): StatusKind {
 }
 
 const GROUPS: ReadonlyArray<{ id: string; zh: string; en: string }> = [
-    { id: "T0", zh: "核心层 T0", en: "Core T0" },
-    { id: "T1", zh: "平台层 T1", en: "Platform T1" },
-    { id: "T2", zh: "按需层 T2", en: "On-demand T2" },
-    { id: "pinned", zh: "置顶服务", en: "Pinned" },
+    { id: "T0", zh: "核心层 T0", en: "Core T0" }, // i18n: user-facing
+    { id: "T1", zh: "平台层 T1", en: "Platform T1" }, // i18n: user-facing
+    { id: "T2", zh: "按需层 T2", en: "On-demand T2" }, // i18n: user-facing
+    { id: "pinned", zh: "置顶服务", en: "Pinned" }, // i18n: user-facing
 ];
 
 export function OpsPage() {
@@ -84,6 +84,7 @@ export function OpsPage() {
             await bootGroup(g.group, g.action);
             setNotice(
                 t(
+                    // i18n: user-facing
                     `已对 ${g.group} 执行 ${g.action === "up" ? "启动" : "停止"}`,
                     `${g.action} on ${g.group} done`,
                 ),
@@ -103,6 +104,7 @@ export function OpsPage() {
             await bootPin(p.service, p.mode);
             setNotice(
                 t(
+                    // i18n: user-facing
                     `${p.service} 置顶策略已更新为 ${p.mode}`,
                     `${p.service} pin updated to ${p.mode}`,
                 ),
@@ -120,7 +122,7 @@ export function OpsPage() {
         setBusy(true);
         try {
             await mutate("backup");
-            setNotice(t("备份完成", "Backup done"));
+            setNotice(t("备份完成", "Backup done")); // i18n: user-facing
         } catch (e) {
             console.error("[supervisor-web] backup fail:", e);
             setError(e instanceof Error ? e.message : String(e));
@@ -133,7 +135,7 @@ export function OpsPage() {
         return (
             <ErrorState
                 message={error}
-                retryLabel={t("重试", "Retry")}
+                retryLabel={t("重试", "Retry")} // i18n: user-facing
                 onRetry={() => void load()}
             />
         );
@@ -147,47 +149,47 @@ export function OpsPage() {
     const columns: DataTableColumn<BootEntry>[] = [
         {
             key: "name",
-            header: t("服务", "Service"),
+            header: t("服务", "Service"), // i18n: user-facing
             render: (r) => (
                 <span className="font-mono text-sm text-text-primary">
                     {r.name}
                 </span>
             ),
         },
-        { key: "tier", header: t("层级", "Tier") },
+        { key: "tier", header: t("层级", "Tier") }, // i18n: user-facing
         {
             key: "pinned",
-            header: t("置顶", "Pin"),
+            header: t("置顶", "Pin"), // i18n: user-facing
             render: (r) => r.pinned ?? "—",
         },
         {
             key: "state",
-            header: t("状态", "State"),
+            header: t("状态", "State"), // i18n: user-facing
             render: (r) => (
                 <StatusBadge status={stateToKind(r.state)} label={r.state} />
             ),
         },
         {
             key: "pinActions",
-            header: t("置顶操作", "Pin actions"),
+            header: t("置顶操作", "Pin actions"), // i18n: user-facing
             render: (r) => (
                 <div className="flex gap-1">
                     <OpBtn
-                        label={t("常驻", "auto")}
+                        label={t("常驻", "auto")} // i18n: user-facing
                         disabled={busy || r.pinned === "auto"}
                         onClick={() =>
                             setPendingPin({ service: r.name, mode: "auto" })
                         }
                     />
                     <OpBtn
-                        label={t("手动", "manual")}
+                        label={t("手动", "manual")} // i18n: user-facing
                         disabled={busy || r.pinned === "manual"}
                         onClick={() =>
                             setPendingPin({ service: r.name, mode: "manual" })
                         }
                     />
                     <OpBtn
-                        label={t("清除", "clear")}
+                        label={t("清除", "clear")} // i18n: user-facing
                         disabled={busy || !r.pinned}
                         onClick={() =>
                             setPendingPin({ service: r.name, mode: "clear" })
@@ -202,10 +204,10 @@ export function OpsPage() {
         <div className="mx-auto max-w-4xl px-4">
             <div className="mb-3 flex items-center justify-between">
                 <h1 className="text-base text-text-primary">
-                    {t("运维", "Ops")}
+                    {t("运维", "Ops") /* i18n: user-facing */}
                 </h1>
                 <OpBtn
-                    label={t("立即备份", "Backup now")}
+                    label={t("立即备份", "Backup now")} // i18n: user-facing
                     disabled={busy}
                     onClick={() => setBackupConfirm(true)}
                 />
@@ -222,7 +224,7 @@ export function OpsPage() {
             ) : null}
 
             <h2 className="mb-2 mt-4 text-sm text-text-secondary">
-                {t("分级启停", "Boot groups")}
+                {t("分级启停", "Boot groups") /* i18n: user-facing */}
             </h2>
             <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
                 {GROUPS.map((g) => {
@@ -240,12 +242,16 @@ export function OpsPage() {
                                     {t(g.zh, g.en)}
                                 </div>
                                 <div className="text-xs text-text-muted">
-                                    {t(`${count} 个服务`, `${count} services`)}
+                                    {t(
+                                        // i18n: user-facing
+                                        `${count} 个服务`,
+                                        `${count} services`,
+                                    )}
                                 </div>
                             </div>
                             <div className="flex gap-1">
                                 <OpBtn
-                                    label={t("启动", "Up")}
+                                    label={t("启动", "Up")} // i18n: user-facing
                                     disabled={busy}
                                     onClick={() =>
                                         setPendingGroup({
@@ -255,7 +261,7 @@ export function OpsPage() {
                                     }
                                 />
                                 <OpBtn
-                                    label={t("停止", "Down")}
+                                    label={t("停止", "Down")} // i18n: user-facing
                                     danger
                                     disabled={busy}
                                     onClick={() =>
@@ -272,7 +278,7 @@ export function OpsPage() {
             </div>
 
             <h2 className="mb-2 text-sm text-text-secondary">
-                {t("置顶排序", "Boot pins")}
+                {t("置顶排序", "Boot pins") /* i18n: user-facing */}
             </h2>
             <DataTable
                 columns={columns}
@@ -288,6 +294,7 @@ export function OpsPage() {
                 title={
                     pendingGroup
                         ? t(
+                              // i18n: user-facing
                               `确认对 ${pendingGroup.group} 执行${pendingGroup.action === "up" ? "启动" : "停止"}？`,
                               `Confirm ${pendingGroup.action} on ${pendingGroup.group}?`,
                           )
@@ -295,27 +302,30 @@ export function OpsPage() {
                 }
                 description={t(
                     pendingGroup?.action === "down"
-                        ? "停止波会停掉该分级内所有受管服务，需手动或按分级重新拉起。"
-                        : "启动波只拉起未健康的服务（探活跳过已健康）。",
+                        ? // i18n: user-facing
+                          "停止波会停掉该分级内所有受管服务，需手动或按分级重新拉起。"
+                        : // i18n: user-facing
+                          "启动波只拉起未健康的服务（探活跳过已健康）。",
                     pendingGroup?.action === "down"
                         ? "The stop wave stops all managed services in this tier; restart manually or by tier."
                         : "The start wave only starts services that are not healthy (healthy ones are skipped).",
                 )}
-                confirmLabel={t("确认", "Confirm")}
-                cancelLabel={t("取消", "Cancel")}
+                confirmLabel={t("确认", "Confirm")} // i18n: user-facing
+                cancelLabel={t("取消", "Cancel")} // i18n: user-facing
                 onConfirm={() => pendingGroup && runGroup(pendingGroup)}
                 onCancel={() => setPendingGroup(null)}
             />
             <ConfirmDialog
                 open={backupConfirm}
                 danger={false}
-                title={t("确认立即备份？", "Run backup now?")}
+                title={t("确认立即备份？", "Run backup now?")} // i18n: user-facing
                 description={t(
+                    // i18n: user-facing
                     "对 Postgres 与 Qdrant 执行一次性备份到 FUSION_BACKUP_TARGET，并按保留策略裁剪旧备份。",
                     "Runs a one-shot Postgres + Qdrant backup to FUSION_BACKUP_TARGET, then prunes old backups per retention.",
                 )}
-                confirmLabel={t("确认", "Confirm")}
-                cancelLabel={t("取消", "Cancel")}
+                confirmLabel={t("确认", "Confirm")} // i18n: user-facing
+                cancelLabel={t("取消", "Cancel")} // i18n: user-facing
                 onConfirm={runBackup}
                 onCancel={() => setBackupConfirm(false)}
             />
@@ -325,17 +335,19 @@ export function OpsPage() {
                 title={
                     pendingPin
                         ? t(
+                              // i18n: user-facing
                               `确认将 ${pendingPin.service} 置顶策略改为 ${pendingPin.mode}？`,
                               `Confirm ${pendingPin.service} pin -> ${pendingPin.mode}?`,
                           )
                         : ""
                 }
                 description={t(
+                    // i18n: user-facing
                     "置顶决定该服务随哪个分级启停（写入 history.db，重启不丢）。",
                     "Pins decide which tier boot wave covers the service (persisted in history.db).",
                 )}
-                confirmLabel={t("确认", "Confirm")}
-                cancelLabel={t("取消", "Cancel")}
+                confirmLabel={t("确认", "Confirm")} // i18n: user-facing
+                cancelLabel={t("取消", "Cancel")} // i18n: user-facing
                 onConfirm={() => pendingPin && runPin(pendingPin)}
                 onCancel={() => setPendingPin(null)}
             />

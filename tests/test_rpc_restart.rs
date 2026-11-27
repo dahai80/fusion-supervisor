@@ -1,8 +1,8 @@
-// C2: Method::Restart RPC — issue #96 起为真实 stop(验证端口释放)+start 流程
-// (restart_one): 成功返回 {"ok":true,"old_pid":..,"new_pid":..}, state →
-// Starting, policy 复位。Unknown service → -32602. Empty/missing → -32602。
-// 探活注入序列 Healthy→Unhealthy: 停前探活不必 (restart 不探活跳过), stop
-// 验证需要一次非 Healthy 才放行。
+// C2: Method::Restart RPC — since issue #96 a real stop (with port-release verification) + start flow
+// (restart_one): success returns {"ok":true,"old_pid":..,"new_pid":..}, state →
+// Starting, policy reset. Unknown service → -32602. Empty/missing → -32602.
+// Injected probe sequence Healthy→Unhealthy: a pre-stop probe is unnecessary (restart does not
+// probe-skip), but stop verification needs one non-Healthy to pass.
 use fusion_supervisor::manifest::{Layer, ServiceDef};
 use fusion_supervisor::probe::ProbeResult;
 use fusion_supervisor::rpc::client::RpcClient;
@@ -44,8 +44,8 @@ async fn restart_call(client: &mut RpcClient, params: Value, id: i64) -> RpcResp
 
 #[tokio::test]
 async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
-    // issue #96: 探活序列 Healthy(停前)→Unhealthy(stop 验证通过) — 恒 Healthy
-    // 会因旧进程未死而 bail (见 stop_and_verify)
+    // issue #96: probe sequence Healthy(pre-stop)→Unhealthy(stop verification passes) — always-Healthy
+    // would bail because the old process never died (see stop_and_verify)
     let q: Arc<std::sync::Mutex<std::collections::VecDeque<ProbeResult>>> =
         Arc::new(std::sync::Mutex::new(
             [
@@ -69,7 +69,7 @@ async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
         },
         |_, _, _| Ok(()),
     );
-    // 预置: Unhealthy + crash_count=2, restart 应复位 policy 并起重启
+    // preset: Unhealthy + crash_count=2, restart should reset policy and trigger a restart
     let core_arc = Arc::new(tokio::sync::Mutex::new(core));
     {
         let mut c = core_arc.lock().await;
@@ -88,23 +88,27 @@ async fn test_rpc_restart_known_service_returns_ok_and_sets_starting() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let mut client = RpcClient::connect(&sock).await.unwrap();
     let resp = restart_call(&mut client, json!({"service": "fusion-rag"}), 1).await;
-    // issue #96: 结果携带 pid 替换证据 (测试环境无 pidfile → null)
+    // issue #96: result carries pid replacement evidence (no pidfile in tests → null)
     assert_eq!(
         resp.result,
         Some(json!({"ok": true, "old_pid": null, "new_pid": null})),
-        "restart 应返回 ok + pid 字段"
+        "restart should return ok + pid fields"
     );
-    assert!(resp.error.is_none(), "不应有 error");
-    // 验证状态机: restart 应 stop → 验证端口释放 → invoke_start Ok → Starting
-    // 并复位 policy (crash_count 归 0)
+    assert!(resp.error.is_none(), "should have no error");
+    // verify state machine: restart should stop → verify port release → invoke_start Ok → Starting
+    // and reset policy (crash_count back to 0)
     {
         let c = core_arc.lock().await;
         assert!(
             matches!(c.runners[0].state, State::Starting),
-            "restart 后应 Starting, 实测 {:?}",
+            "should be Starting after restart, got {:?}",
             c.runners[0].state
         );
-        assert_eq!(c.runners[0].policy.crash_count(), 0, "policy 应复位");
+        assert_eq!(
+            c.runners[0].policy.crash_count(),
+            0,
+            "policy should be reset"
+        );
     }
     server.abort();
     let _ = std::fs::remove_file(&sock);
@@ -132,7 +136,7 @@ async fn test_rpc_restart_unknown_service_returns_32602() {
     assert_eq!(
         resp.error.map(|e| e.code),
         Some(-32602),
-        "未知服务应 -32602"
+        "unknown service should return -32602"
     );
     assert!(resp.result.is_none());
     server.abort();
@@ -157,19 +161,19 @@ async fn test_rpc_restart_empty_or_missing_service_returns_32602() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let mut client = RpcClient::connect(&sock).await.unwrap();
-    // 空字符串 service
+    // empty-string service
     let resp = restart_call(&mut client, json!({"service": ""}), 3).await;
     assert_eq!(
         resp.error.map(|e| e.code),
         Some(-32602),
-        "空 service 应 -32602"
+        "empty service should return -32602"
     );
-    // 缺 service 字段
+    // missing service field
     let resp = restart_call(&mut client, json!({}), 4).await;
     assert_eq!(
         resp.error.map(|e| e.code),
         Some(-32602),
-        "缺 service 应 -32602"
+        "missing service should return -32602"
     );
     server.abort();
     let _ = std::fs::remove_file(&sock);
