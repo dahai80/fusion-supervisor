@@ -38,6 +38,10 @@ pub enum AlertKind {
     // issue #139: kind label when externally-ingested alerts are re-emitted via webhook (the event itself is
     // persisted directly by the ingest path; only re-emitted here, sink always empty — no duplicate events).
     External,
+    // issue #12: login-latency tripwire — gateway/identity latency above threshold for N consecutive
+    // samples during a CI-runner activity window. Episode-latched at the source (one alert per breach
+    // episode), not deduped here.
+    LoginLatencyBreach,
 }
 
 impl AlertKind {
@@ -57,6 +61,7 @@ impl AlertKind {
             AlertKind::AutoRestart => "AutoRestart",
             AlertKind::JobFailed => "JobFailed",
             AlertKind::External => "External",
+            AlertKind::LoginLatencyBreach => "LoginLatencyBreach",
         }
     }
 }

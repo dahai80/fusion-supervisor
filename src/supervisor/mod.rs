@@ -1927,7 +1927,7 @@ fn spawn_backup_task(
 // issue #37: Alerter event sink — every alert actually emitted (dedup passed) is written to the event table.
 // compose alerts carry a "compose:" service prefix → the prefix is stripped on write + plane=compose
 // (same semantics as the old explicit tick_compose writes, issue #7).
-fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
+pub(crate) fn make_event_sink(store: Arc<HistoryStore>) -> crate::alert::EventSink {
     Arc::new(
         move |service: &str, kind: &str, detail: &str, ts: u64, _plane: &str, severity: &str| {
             let (svc, plane) = match service.strip_prefix("compose:") {

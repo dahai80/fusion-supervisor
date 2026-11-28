@@ -18,3 +18,4 @@ pub mod rpc;
 pub mod start_map;
 pub mod store;
 pub mod supervisor;
+pub mod tripwire;

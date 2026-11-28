@@ -121,6 +121,27 @@ pub struct Config {
     pub log_rotate_keep: u32,
     #[serde(default = "default_log_rotate_paths")]
     pub log_rotate_paths: Vec<String>,
+    // issue #12: login-latency tripwire — during CI-runner activity windows probe the
+    // gateway/identity front doors every tripwire_window_sec; above tripwire_threshold_ms for
+    // tripwire_consecutive consecutive samples fires one alert per breach episode through the
+    // standard alert channel; samples land in history.db tripwire_sample. Idle windows (no
+    // tripwire_ci_process match) skip probing entirely.
+    #[serde(default = "default_tripwire_enabled")]
+    pub tripwire_enabled: bool,
+    #[serde(default = "default_tripwire_window_sec")]
+    pub tripwire_window_sec: u64,
+    #[serde(default = "default_tripwire_threshold_ms")]
+    pub tripwire_threshold_ms: u64,
+    #[serde(default = "default_tripwire_consecutive")]
+    pub tripwire_consecutive: u32,
+    #[serde(default = "default_tripwire_timeout_ms")]
+    pub tripwire_timeout_ms: u64,
+    #[serde(default = "default_tripwire_gateway_url")]
+    pub tripwire_gateway_url: String,
+    #[serde(default = "default_tripwire_identity_url")]
+    pub tripwire_identity_url: String,
+    #[serde(default = "default_tripwire_ci_process")]
+    pub tripwire_ci_process: String,
 }
 
 fn default_log_rotate_max_mb() -> u64 {
@@ -191,6 +212,32 @@ fn validate_jobs(jobs: &[JobConfig]) -> Result<()> {
 
 fn default_startup_grace_secs() -> u64 {
     90
+}
+
+// issue #12: tripwire defaults — policy values from ~/actions-runner/RUNNERS.md (fusion#8 postmortem).
+fn default_tripwire_enabled() -> bool {
+    true
+}
+fn default_tripwire_window_sec() -> u64 {
+    30
+}
+fn default_tripwire_threshold_ms() -> u64 {
+    2000
+}
+fn default_tripwire_consecutive() -> u32 {
+    3
+}
+fn default_tripwire_timeout_ms() -> u64 {
+    5000
+}
+fn default_tripwire_gateway_url() -> String {
+    "http://127.0.0.1:11432/healthz".to_string()
+}
+fn default_tripwire_identity_url() -> String {
+    "http://127.0.0.1:11470/healthz".to_string()
+}
+fn default_tripwire_ci_process() -> String {
+    "Runner.Listener".to_string()
 }
 
 // Compose-plane config. enabled=false (default) → native only, preserving single-node dev behavior.
@@ -350,6 +397,14 @@ impl Default for Config {
             native_extra_path: default_native_extra_path(),
             startup_grace_secs: default_startup_grace_secs(),
             jobs: Vec::new(),
+            tripwire_enabled: default_tripwire_enabled(),
+            tripwire_window_sec: default_tripwire_window_sec(),
+            tripwire_threshold_ms: default_tripwire_threshold_ms(),
+            tripwire_consecutive: default_tripwire_consecutive(),
+            tripwire_timeout_ms: default_tripwire_timeout_ms(),
+            tripwire_gateway_url: default_tripwire_gateway_url(),
+            tripwire_identity_url: default_tripwire_identity_url(),
+            tripwire_ci_process: default_tripwire_ci_process(),
         }
     }
 }
@@ -439,6 +494,28 @@ impl Config {
             cfg.web_dir = None;
         }
         validate_jobs(&cfg.jobs)?;
+        // issue #12: tripwire numeric sanity — a zero window/consecutive would busy-loop or
+        // alert on the first sample; fail-closed like the jobs validation.
+        anyhow::ensure!(
+            cfg.tripwire_window_sec >= 1,
+            "tripwire_window_sec must be >= 1"
+        );
+        anyhow::ensure!(
+            cfg.tripwire_threshold_ms >= 1,
+            "tripwire_threshold_ms must be >= 1"
+        );
+        anyhow::ensure!(
+            cfg.tripwire_consecutive >= 1,
+            "tripwire_consecutive must be >= 1"
+        );
+        anyhow::ensure!(
+            cfg.tripwire_timeout_ms >= 1,
+            "tripwire_timeout_ms must be >= 1"
+        );
+        anyhow::ensure!(
+            !cfg.tripwire_ci_process.trim().is_empty(),
+            "tripwire_ci_process must not be empty"
+        );
         // issue #145: systemd unit name fail-closed validation (prevents shell metacharacter injection into systemctl args)
         for (svc, unit) in &cfg.systemd_units {
             anyhow::ensure!(

@@ -30,6 +30,16 @@ pub struct EventRow {
     pub severity: String,
 }
 
+// issue #12: one probed tripwire window. None latency = probe error (refused/timeout).
+#[derive(Debug, Clone)]
+pub struct TripwireRow {
+    pub ts: u64,
+    pub gateway_ms: Option<u64>,
+    pub identity_ms: Option<u64>,
+    pub ci_active: bool,
+    pub breach: bool,
+}
+
 // PRD app-tiering: per-service boot override. Pin override > registry boot: field;
 // stored in local SQLite, survives restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,6 +92,15 @@ impl HistoryStore {
                  plane TEXT NOT NULL DEFAULT 'native',
                  severity TEXT NOT NULL DEFAULT 'warn'
              );
+             -- issue #12: login-latency tripwire samples — one row per probed window
+             -- (CI-active windows only). Postmortem latency graphs read this table.
+             CREATE TABLE IF NOT EXISTS tripwire_sample (
+                 ts INTEGER PRIMARY KEY,
+                 gateway_ms INTEGER,
+                 identity_ms INTEGER,
+                 ci_active INTEGER NOT NULL,
+                 breach INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS boot_pin (
                  service TEXT PRIMARY KEY,
                  mode TEXT NOT NULL
@@ -92,7 +111,8 @@ impl HistoryStore {
                  value INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_health_svc ON health_check(service, ts);
-             CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);",
+             CREATE INDEX IF NOT EXISTS idx_event_svc ON event(service, ts);
+             CREATE INDEX IF NOT EXISTS idx_tripwire_ts ON tripwire_sample(ts);",
         )?;
         // Migration: old DBs lack the plane column → ALTER ADD COLUMN (idempotent; SQLite
         // has no ADD COLUMN IF NOT EXISTS, so we swallow the duplicate-column error).
@@ -167,6 +187,51 @@ impl HistoryStore {
         Ok(())
     }
 
+    // issue #12: persist one tripwire sample (NULL = probe error for either endpoint).
+    pub fn record_tripwire_sample(
+        &self,
+        ts: u64,
+        gateway_ms: Option<u64>,
+        identity_ms: Option<u64>,
+        ci_active: bool,
+        breach: bool,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO tripwire_sample(ts, gateway_ms, identity_ms, ci_active, breach)
+             VALUES (?,?,?,?,?)",
+            params![
+                ts as i64,
+                gateway_ms.map(|v| v as i64),
+                identity_ms.map(|v| v as i64),
+                ci_active as i64,
+                breach as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    // issue #12: recent tripwire samples, ascending ts — postmortem latency graph data source.
+    pub fn recent_tripwire_samples(&self, limit: u32) -> Result<Vec<TripwireRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, gateway_ms, identity_ms, ci_active, breach FROM (
+                 SELECT ts, gateway_ms, identity_ms, ci_active, breach FROM tripwire_sample
+                 ORDER BY ts DESC LIMIT ?
+             ) ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(TripwireRow {
+                ts: r.get::<_, i64>(0)? as u64,
+                gateway_ms: r.get::<_, Option<i64>>(1)?.map(|v| v.max(0) as u64),
+                identity_ms: r.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                ci_active: r.get::<_, i64>(3)? != 0,
+                breach: r.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     // issue #112: most recent restart-kind event per service (AutoRestart/ManualStart/ManualStop).
     // Data source for the status table's last_restart column — answers "who last started/stopped
     // this service" after the fact. Detail truncated to 80 chars to keep table rows short;
@@ -206,8 +271,19 @@ impl HistoryStore {
             .lock()
             .unwrap()
             .execute("DELETE FROM event WHERE ts <= ?", params![cutoff as i64])?;
-        tracing::info!(cutoff, deleted_health = h, deleted_event = e, "cleanup old");
-        Ok(h + e)
+        // issue #12: tripwire samples follow the same retention window
+        let t = self.conn.lock().unwrap().execute(
+            "DELETE FROM tripwire_sample WHERE ts <= ?",
+            params![cutoff as i64],
+        )?;
+        tracing::info!(
+            cutoff,
+            deleted_health = h,
+            deleted_event = e,
+            deleted_tripwire = t,
+            "cleanup old"
+        );
+        Ok(h + e + t)
     }
 
     pub fn recent_health(&self, service: &str, limit: u32) -> Result<Vec<HealthRow>> {
@@ -518,6 +594,42 @@ mod tests {
         let ev = s.recent_events("fusion-rag", 10).unwrap();
         assert_eq!(ev.len(), 1, "recent event row retained");
         assert_eq!(ev[0].detail, "new");
+    }
+
+    // issue #12: tripwire sample roundtrip (NULL latencies, breach/ci flags, ascending order)
+    // + retention sweep covers the table
+    #[test]
+    fn test_tripwire_sample_roundtrip_and_cleanup() {
+        let now = 1_000_000u64;
+        let base = now - 1000;
+        let s = open_mem();
+        s.record_tripwire_sample(base, Some(16500), Some(4200), true, true)
+            .unwrap();
+        s.record_tripwire_sample(base + 30, None, Some(180), true, true)
+            .unwrap();
+        s.record_tripwire_sample(base + 60, Some(7), Some(3), true, false)
+            .unwrap();
+        let rows = s.recent_tripwire_samples(10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].ts, base);
+        assert_eq!(rows[0].gateway_ms, Some(16500));
+        assert_eq!(rows[0].identity_ms, Some(4200));
+        assert!(rows[0].breach && rows[0].ci_active);
+        assert_eq!(rows[1].gateway_ms, None, "probe error stored as NULL");
+        assert!(!rows[2].breach);
+        // replace on same ts (INSERT OR REPLACE — one row per window)
+        s.record_tripwire_sample(base + 60, Some(9), Some(9), true, true)
+            .unwrap();
+        assert_eq!(s.recent_tripwire_samples(10).unwrap().len(), 3);
+        // retention sweep prunes old tripwire rows too
+        let old = now - (8 * 24 * 3600);
+        s.record_tripwire_sample(old, Some(1), Some(1), true, false)
+            .unwrap();
+        let deleted = s.cleanup_old(now, 7).unwrap();
+        assert_eq!(deleted, 1, "old tripwire row pruned");
+        let kept = s.recent_tripwire_samples(10).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].ts, base);
     }
 
     #[test]
