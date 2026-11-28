@@ -139,6 +139,7 @@ Issue #55 将业务平面扩展到 2026-10-27/28 端口治理批次（全部 `St
 - **历史：** SQLite（`~/.fusion-sv/history.db`，WAL 模式），`health_check` + `event` 表，7 天保留。保留清扫已接线（issue #37）：守护进程 tick 检查 `prune_schedule_sec`（默认每小时），从两张表清除超过 `history_retention_days`（默认 7 天）的旧行；每次清扫记录清除行数并累计进 `fusion_sv_events_pruned_total`。失败的清扫同样推进排期时间戳（无逐 tick 重试风暴——与备份调度同语义）。
 - **告警持久化（issue #37）：** 每条通过去重的告警在 `Alerter::alert` 汇聚点持久化到 `event` 表（kind、detail、ts、plane、severity）——native 与 compose 告警一致（compose 服务去前缀存储并带 `plane="compose"`）。event 表带 `severity` 列（`error` = 容器 crash-loop，`info` = 恢复/drain/备份，`warn` = 其余）；旧库幂等迁移（`ALTER TABLE ... DEFAULT 'warn'`）。web 控制台的 Alerts 页和 `/api/v1/events` 由此回答"上周告过什么警"。`fusion_sv_alerts_total` 统计已发告警数。
 - **告警：** `ServiceDown`（按服务 5 分钟去重）、`ServiceBack`、`RestartFailed`、`RestartCapHit` → 日志 + 可选 webhook。
+- **登录延迟 tripwire（issue #12）：** 自动化 `~/actions-runner/RUNNERS.md` 的手工 tripwire（fusion#8 登录中断复盘：GitHub Actions self-hosted runner 与 fusion-mlx-server 共存时网关 `:11432` 认证延迟劣化到 16-18s）。守护进程派生的常驻循环（与核心锁分离，同备份任务模式）每 `tripwire_window_sec`（默认 30s）用 `pgrep -f tripwire_ci_process`（默认 `Runner.Listener`）检测 CI runner 活动；空闲窗口完全跳过探测（idle/active 切换各记一条 INFO）。活动窗口内测量 `tripwire_gateway_url`（默认 `http://127.0.0.1:11432/healthz`）与 `tripwire_identity_url`（默认 `http://127.0.0.1:11470/healthz`，未认证返回 401——响应时间即认证链前门延迟）的响应耗时，上限 `tripwire_timeout_ms`（默认 5000）；探测错误计为 breach。任一端点超过 `tripwire_threshold_ms`（默认 2000）即为 breach 样本；连续 `tripwire_consecutive`（默认 3）个 breach 样本经标准告警通道发一条 `LoginLatencyBreach` 告警（webhook `alert_url` + event 表，service `login-tripwire`，severity warn）——告警按 episode 闩锁：持续 breach 只告一次，直到出现干净样本才闭合 episode。每个探测样本写入 history.db `tripwire_sample` 表（`ts, gateway_ms, identity_ms, ci_active, breach`；NULL 延迟 = 探测错误）供复盘延迟曲线；保留清扫与其他历史表同步修剪。`fusion-sv tripwire` 可独立运行同一循环（无 daemon 锁、无监督 tick），用于演练与 launchd/cron 托管。见 `src/tripwire.rs`。
 - **停止来源可追溯（issue #82）：** 每次 `down` 记录是谁发起的，与 supervisor 自行检测到的崩溃明确区分。CLI 发送自身 pid + argv（`origin: cli pid=123 argv: fusion-sv down`），HTTP 面打上 `http POST /api/v1/down from 127.0.0.1:xxxxx`，裸 UDS RPC 客户端标注为 origin-unknown。`down <svc>` 记一条 `manual stop (operator intent)` WARN 并写 `kind=ManualStop` 事件；全停（`down` 不带服务）额外在停机波前输出响亮的 5 行横幅并写 `kind=StopAll`（service `*`，severity warn）——事后取证直接从 event 表读来源，而不是靠时间戳关联推断（2026-10-30 22:53 事故）。`boot/group` 停机波的 RPC 日志行同样带来源。手工停机按设计保持停机（#79 时代语义）——无自动恢复；用 `fusion-sv up` 拉回 fleet。
 - **Compose 平面（可选）：** `docker compose` 包在 `ComposeBackend` trait 之后。`up` = sidecar（`--wait`）→ native（按层排序）→ business（`--wait`）；`down` = compose `down --remove-orphans` → native 逆序。`status` 合并 native + 容器行（按 `plane` 标注）；`tick` 对 exited/unhealthy 容器告警（只监控，不崩溃重启——Docker restart policy 管这个）。对 `FUSION_PG_PASSWORD`/`FUSION_CLIENT_KEY` fail-closed。见 `src/compose.rs`。
 - **NAS 备份（issue #10）：** `fusion-sv backup`（CLI 或 RPC）把 Postgres（`pg_dumpall` → gzip）和 Qdrant 快照（`storage` tar）转储到 `FUSION_BACKUP_TARGET`（`{target}/fusion-pg-{date}.sql.gz`、`{target}/fusion-qdrant-{date}/`）。由守护进程 tick 循环经 `backup_schedule_sec` 排期（默认每日）；保留 `backup_retention`（默认 7）份，清理更旧的集合。**Fail-closed：** `FUSION_BACKUP_TARGET` 未设 → 拒绝 + `BackupFailed` 告警（生产安全任务绝不静默跳过）。结果以 `kind=Backup` 记入 history.db。见 `src/backup.rs`。
@@ -215,6 +216,18 @@ native_extra_path = "/opt/homebrew/bin:/usr/local/bin"
 # history.db retention (issue #37) — sweep prunes health_check/event rows older than N days
 history_retention_days = 7
 prune_schedule_sec = 3600          # how often the sweep runs
+
+# 登录延迟 tripwire（issue #12）— CI runner 活动窗口内的网关/身份延迟护栏
+# （策略来源：~/actions-runner/RUNNERS.md，fusion#8 复盘）。样本写入 history.db tripwire_sample；
+# 一个 breach episode 只发一条 LoginLatencyBreach 告警。
+tripwire_enabled = true            # 守护进程常驻循环；false = 关闭
+tripwire_window_sec = 30           # 探测节奏 + CI 活动复检节奏
+tripwire_threshold_ms = 2000       # breach = 端点延迟严格大于该值
+tripwire_consecutive = 3           # 每个告警 episode 所需的连续 breach 样本数
+tripwire_timeout_ms = 5000         # 单次探测超时；探测错误计为 breach
+tripwire_gateway_url = "http://127.0.0.1:11432/healthz"
+tripwire_identity_url = "http://127.0.0.1:11470/healthz"   # 未认证 401 — 以响应时间为准
+tripwire_ci_process = "Runner.Listener"                    # pgrep -f 模式；无匹配 = 空闲，不探测
 
 # Scheduled jobs (issue #137) — one-shot binaries on a supervisor-driven schedule.
 # Exactly one of daily_at (local HH:MM) / every_sec per entry; validation is

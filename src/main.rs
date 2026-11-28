@@ -52,6 +52,10 @@ enum Commands {
     Backup,
     /// Gracefully shut down the daemon (remote shutdown via RPC) — issue #20
     Shutdown,
+    /// Run the login-latency tripwire loop standalone (issue #12): same probes, alerts and
+    /// history writes as the daemon-spawned loop, without the supervision tick or the daemon
+    /// instance lock. For drills and launchd/cron-hosted operation.
+    Tripwire,
 }
 
 #[tokio::main]
@@ -88,7 +92,28 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Rollout { service }) => cli_call_param(cfg, "rollout", service).await,
         Some(Commands::Backup) => cli_call(cfg, "backup").await,
         Some(Commands::Shutdown) => cli_call(cfg, "shutdown").await,
+        Some(Commands::Tripwire) => run_tripwire(cfg).await,
     }
+}
+
+// issue #12: standalone tripwire loop — drills and hosts where the tripwire runs without the
+// supervision daemon. Never returns (Ctrl-C exits); each sample is logged and persisted.
+async fn run_tripwire(cfg: Config) -> anyhow::Result<()> {
+    if !cfg.tripwire_enabled {
+        anyhow::bail!(
+            "tripwire_enabled = false in config; enable it or point FUSION_SV_CONFIG at a config that does"
+        );
+    }
+    let store = Arc::new(fusion_supervisor::store::HistoryStore::open(&cfg.db_path)?);
+    tracing::info!(db = %cfg.db_path.display(), "standalone tripwire starting");
+    fusion_supervisor::tripwire::run_tripwire_loop(
+        fusion_supervisor::tripwire::TripwireConfig::from_config(&cfg),
+        store,
+        cfg.alert_url.clone(),
+        cfg.alert_dedup_sec,
+    )
+    .await;
+    Ok(())
 }
 
 // issue #114: single-instance guard — the file lock is held until process exit (flock,
@@ -206,6 +231,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     };
     let defs = manifest::load_or_empty(&cfg.registry_path);
     let core = supervisor::SupervisorCore::new(defs, cfg.clone())?;
+    // issue #12: clone the history store before the core moves under the daemon Mutex —
+    // the tripwire loop shares it (HistoryStore: Sync) without ever taking the core lock.
+    let tripwire_store = core.store.clone();
     let mut core = core;
     // issue #107 D2: reconcile before opening RPC — surviving processes (after launchd
     // crash-restart) are no longer misreported as Stopped by status. One probe round is
@@ -313,6 +341,22 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             }
         }
     });
+    // issue #12: login-latency tripwire — resident loop detached from the core lock (same
+    // detached pattern as the backup task): probes the gateway/identity front doors only during
+    // CI-runner activity windows, alerts through the standard alert channel, samples into
+    // history.db tripwire_sample. Own Alerter instance; event persistence via the shared sink.
+    let tripwire_handle = if cfg.tripwire_enabled {
+        Some(tokio::spawn(
+            fusion_supervisor::tripwire::run_tripwire_loop(
+                fusion_supervisor::tripwire::TripwireConfig::from_config(&cfg),
+                tripwire_store,
+                cfg.alert_url.clone(),
+                cfg.alert_dedup_sec,
+            ),
+        ))
+    } else {
+        None
+    };
     // issue #22/#26/#25: HTTP face (metrics + read-only status/history/events + web static
     // console + token-checked orchestration ops), third spawn task, shared via core.clone().
     // issue #114: listener already bound at entry (failure was fatal); serve only accepts.
@@ -378,6 +422,9 @@ async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         }
     }
     tick_handle.abort();
+    if let Some(h) = tripwire_handle {
+        h.abort();
+    }
     if let Some(h) = http_handle {
         h.abort();
     }
